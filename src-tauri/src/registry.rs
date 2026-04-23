@@ -1,0 +1,191 @@
+use std::path::{Path, PathBuf};
+
+use schemars::{schema_for, JsonSchema};
+use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
+
+use crate::error::{AppError, AppResult};
+
+/// The user-edited repo registry — Tethys's pointer to which repos exist on
+/// disk and where their worktrees should land.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct RepoRegistry {
+    /// Absolute directory where Tethys creates per-workspace worktrees. Prefer
+    /// a path without spaces; macOS "Application Support" paths in particular
+    /// tend to break naive setup scripts.
+    pub worktree_root: PathBuf,
+
+    /// One entry per repo you want Tethys-managed workspaces to span.
+    ///
+    /// TOML uses `[[repo]]` array-of-tables syntax (singular field name), but
+    /// we serialize back to the frontend as `repos` (plural array).
+    #[serde(default, rename(serialize = "repos", deserialize = "repo"))]
+    #[schemars(rename = "repo")]
+    pub repos: Vec<Repo>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct Repo {
+    /// Short stable id used in `state.json`, workspace paths, and as the
+    /// UI label. Must be unique within the registry. Lowercase + dashes
+    /// recommended.
+    pub key: String,
+
+    /// Git remote URL (e.g. `git@github.com:me/repo.git`). Tethys maintains
+    /// its own clone under `<data_dir>/repos/<key>/` and runs every
+    /// `git worktree add` against that clone — never against any checkout
+    /// you maintain separately.
+    pub remote_url: String,
+
+    /// Shell command run in each new worktree immediately after it's created
+    /// (e.g. `pnpm install`). Optional.
+    #[serde(default)]
+    pub default_setup_script: Option<String>,
+
+    /// Hard timeout for the setup script, in seconds. Defaults to 600.
+    #[serde(default)]
+    pub setup_timeout_secs: Option<u64>,
+}
+
+/// The outcome of loading `repos.toml` at boot.
+///
+/// Held in Tauri-managed state as `Arc<RegistryLoad>`. Commands that need a
+/// valid registry use `require()` to unwrap.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RegistryLoad {
+    Ok {
+        path: PathBuf,
+        registry: RepoRegistry,
+    },
+    Missing {
+        path: PathBuf,
+    },
+    Invalid {
+        path: PathBuf,
+        error: String,
+    },
+}
+
+impl RegistryLoad {
+    pub fn load(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(s) => match toml::from_str::<RepoRegistry>(&s) {
+                Ok(registry) => {
+                    if let Err(e) = validate_worktree_root(&registry.worktree_root) {
+                        warn!(error = %e, "repos.toml loaded but worktree_root is unusable");
+                        return RegistryLoad::Invalid {
+                            path: path.to_path_buf(),
+                            error: format!("worktree_root: {e}"),
+                        };
+                    }
+                    info!(
+                        repos = registry.repos.len(),
+                        worktree_root = %registry.worktree_root.display(),
+                        "repos.toml loaded",
+                    );
+                    RegistryLoad::Ok {
+                        path: path.to_path_buf(),
+                        registry,
+                    }
+                }
+                Err(e) => RegistryLoad::Invalid {
+                    path: path.to_path_buf(),
+                    error: e.to_string(),
+                },
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => RegistryLoad::Missing {
+                path: path.to_path_buf(),
+            },
+            Err(e) => RegistryLoad::Invalid {
+                path: path.to_path_buf(),
+                error: e.to_string(),
+            },
+        }
+    }
+
+    pub fn require(&self) -> AppResult<&RepoRegistry> {
+        match self {
+            RegistryLoad::Ok { registry, .. } => Ok(registry),
+            RegistryLoad::Missing { path } => Err(AppError::Other(format!(
+                "repos.toml is missing at {}",
+                path.display()
+            ))),
+            RegistryLoad::Invalid { path, error } => Err(AppError::Other(format!(
+                "repos.toml at {} is invalid: {error}",
+                path.display()
+            ))),
+        }
+    }
+}
+
+impl RepoRegistry {
+    pub fn find_repo(&self, key: &str) -> Option<&Repo> {
+        self.repos.iter().find(|r| r.key == key)
+    }
+
+    /// `<worktree_root>/<workspace_id>/<repo_key>`
+    pub fn plan_worktree_path(&self, workspace_id: &str, repo_key: &str) -> PathBuf {
+        self.worktree_root.join(workspace_id).join(repo_key)
+    }
+}
+
+/// Ensure `worktree_root` exists as a writable directory. Creates it if missing.
+fn validate_worktree_root(root: &Path) -> AppResult<()> {
+    std::fs::create_dir_all(root).map_err(|e| {
+        AppError::Other(format!(
+            "could not create {}: {e}",
+            root.display()
+        ))
+    })?;
+    if !root.is_dir() {
+        return Err(AppError::Other(format!(
+            "{} exists but is not a directory",
+            root.display()
+        )));
+    }
+    let probe = root.join(".tethys-write-probe");
+    std::fs::write(&probe, b"ok").map_err(|e| {
+        AppError::Other(format!("{} is not writable: {e}", root.display()))
+    })?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
+/// Generate the JSON Schema for `repos.toml` and write it alongside the config
+/// file so editors (Taplo / VS Code "Even Better TOML") pick it up via the
+/// `#:schema` directive in the starter template.
+pub fn write_schema(path: &Path) -> AppResult<()> {
+    let schema = schema_for!(RepoRegistry);
+    let json = serde_json::to_string_pretty(&schema)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, json)?;
+    debug!(?path, "wrote repos.schema.json");
+    Ok(())
+}
+
+/// Starter `repos.toml` content written when the user clicks "Open repos.toml"
+/// and the file doesn't yet exist.
+pub fn starter_template() -> &'static str {
+    r##"#:schema ./repos.schema.json
+# Tethys repo registry. Add one [[repo]] block per repo you want to work on.
+#
+# worktree_root: where Tethys creates per-workspace worktrees. Prefer a path
+# with no spaces (e.g. ~/code/tethys-worktrees) to avoid quoting hazards in
+# setup scripts.
+#
+# Each repo is cloned on first use into <data_dir>/repos/<key>, then every
+# worktree is `git worktree add`ed from that clone — Tethys never touches
+# any checkout you maintain separately.
+
+worktree_root = "CHANGE_ME_TO_AN_ABSOLUTE_PATH"
+
+# [[repo]]
+# key = "frontend"
+# remote_url = "git@github.com:me/frontend.git"
+# default_setup_script = "pnpm install"
+# setup_timeout_secs = 600
+"##
+}

@@ -10,37 +10,39 @@ Legend: `- [ ]` open · `- [x]` done.
 
 **Ships:** a Tauri app you can launch that lets you create/list/delete empty "workspaces" (no git yet). State survives restarts.
 
-- [ ] Scaffold Tauri 2.x app with React + TypeScript (`src/`, `src-tauri/`, `crates/` workspace layout).
-- [ ] Add core Rust deps: `portable-pty`, `tokio`, `serde`, `serde_json`, `toml`, `tracing`, `tracing-appender`, `fs2` (flock), `uuid`.
-- [ ] Rolling log file: `tracing-subscriber` + `tracing-appender` daily-rolling to `<data_dir>/logs/tethys.log`. Install as global subscriber at `main()` entry.
-- [ ] Single-instance `flock` on `<data_dir>/tethys.lock` at boot. On contention: send a "focus" message to the existing instance (named Unix socket or Tauri's built-in single-instance plugin) and exit.
-- [ ] Define `AppState` struct with `serde` derives matching the plan's data model.
-- [ ] `Store`: `Arc<RwLock<AppState>>` + `store.mutate(|s| ...)` helper that emits `workspace:changed` and schedules a debounced (~250ms) flush.
-- [ ] Persistence writer: serialize → `state.json.tmp` → `fsync` → `rename`. Load on boot; create empty state if missing.
-- [ ] Tauri commands: `list_workspaces`, `get_workspace`, `create_workspace` (stub — AppState only, no git), `delete_workspace` (stub), `pause_workspace`, `resume_workspace`.
-- [ ] React UI skeleton: workspace list sidebar, create-workspace dialog (name + branch fields), detail pane placeholder, delete affordance.
-- [ ] Wire `workspace:changed` event → frontend invalidates and re-fetches via `list_workspaces`.
+- [x] Scaffold Tauri 2.x app with React + TypeScript.
+- [x] Add core Rust deps: `tokio`, `serde`, `serde_json`, `tracing`, `tracing-appender`, `uuid`, `chrono`, `anyhow`, `thiserror`. (`portable-pty` deferred to M4; `fs2` deferred to M5 hook lock — app-level single-instance handled by `tauri-plugin-single-instance` instead.)
+- [x] Rolling log file: `tracing-subscriber` + `tracing-appender` daily-rolling to `<data_dir>/logs/tethys.log`.
+- [x] Single-instance plugin (`tauri-plugin-single-instance`): second launch focuses the first window and exits.
+- [x] `AppState` struct with `serde` derives matching the plan's data model (incl. `#[serde(skip)]` on ephemeral session fields + `#[serde(default)]` for forward-compat).
+- [x] `Store`: `Arc<RwLock<AppState>>` + `store.mutate(|s| ...)` helper that nudges a debounced (~250ms) flusher.
+- [x] Persistence writer: serialize → `state.json.tmp` → `fsync` → `rename`. Load on boot; create empty state if missing.
+- [x] Tauri commands: `list_workspaces`, `get_workspace`, `create_workspace`, `delete_workspace`, `pause_workspace`, `resume_workspace`.
+- [x] React UI skeleton: workspace list sidebar, create-workspace dialog (name + branch), detail pane, pause/delete affordances.
+- [x] Wire `workspace:changed` event → frontend re-fetches via `list_workspaces`.
 
 **Verify:** create a workspace, quit the app, relaunch → it's still there. Open two Tethys windows → second one focuses the first and exits.
 
 ---
 
-## Milestone 2 — Repo registry & reconciler
+## Milestone 2 — Repo registry
 
-**Ships:** workspaces bind to real repos from `repos.toml`. Crash-recovery UX for orphaned state.
+**Ships:** workspaces bind to repos declared in `repos.toml`. Create dialog lets you multi-select repos. Empty-state guides the user when the registry is missing/invalid.
 
-- [ ] `RepoRegistry` struct + TOML deserialization. Required `worktree_root` field; `[[repo]]` array with `key`, `display_name`, `origin_path`, `default_setup_script`.
-- [ ] Load `repos.toml` on boot from `<data_dir>/repos.toml`. If missing or invalid: empty-state UI with "open repos.toml" button (shells out to `$EDITOR` or `open`).
-- [ ] Validate `worktree_root`: must exist and be writable. Surface a clear error if not.
-- [ ] `list_repos` command exposes registry entries to the frontend.
-- [ ] Update create-workspace dialog: multi-select from registered repos.
-- [ ] Boot-time worktree reconciler: `ls <worktree_root>/` cross-checked against `AppState.workspaces`.
-  - [ ] Dirs on disk with no workspace → "Orphaned worktree" row in UI with "Remove" action.
-  - [ ] Workspaces in state with missing worktrees → "Worktree missing" row with "Repair" / "Forget" actions.
-- [ ] "Repair" action: re-run `git worktree add` with the stored branch.
-- [ ] "Forget" action: drop the `RepoLink` from state.
+- [x] `RepoRegistry` struct + TOML deserialization. Required `worktree_root` field; `[[repo]]` array with `key`, `display_name`, `origin_path`, `default_setup_script`, optional `setup_timeout_secs`.
+- [x] Load `repos.toml` on boot from `<data_dir>/repos.toml`. Missing or invalid → surfaced to the UI; app boots normally but "New workspace" is disabled.
+- [x] Validate `worktree_root`: `create_dir_all`, then a write-probe to confirm it's writable. Any failure surfaces as an `Invalid` registry status.
+- [x] `list_repos` and `registry_status` commands expose registry state to the frontend.
+- [x] `open_repos_config` command: writes a starter template if `repos.toml` doesn't exist, then shells out to `open` (macOS). User restarts to pick up edits (file-watcher deferred).
+- [x] Update create-workspace dialog: multi-select checkboxes per registered repo; require ≥1 selected.
+- [x] `create_workspace` validates each selected key against the registry and populates `repo_links` with *planned* worktree paths (`<worktree_root>/<workspace_id>/<repo_key>`). Actual `git worktree add` still deferred to M3.
 
-**Verify:** manually `rm -rf` a worktree while the app is closed, reopen → UI flags it and offers repair.
+**Verify:** launch with no `repos.toml` → empty-state card with "Open repos.toml" button. After filling in the template and restarting → create dialog shows repos as checkboxes; creating a workspace populates its detail pane with the planned worktree paths (marked "not created yet").
+
+**Deferred to M3** (these needed worktrees-on-disk to reconcile against, and needed `GitOps` to implement Repair):
+
+- Boot-time worktree reconciler (orphaned dirs, missing worktrees).
+- Repair / Forget actions.
 
 ---
 
@@ -48,8 +50,9 @@ Legend: `- [ ]` open · `- [x]` done.
 
 **Ships:** creating a workspace actually creates git worktrees and runs setup scripts. Deleting cleans up.
 
-- [ ] `GitOps` module: `git worktree add/remove/list` wrappers via `tokio::process::Command`.
-- [ ] `create_workspace` (real): for each selected repo, `git worktree add <worktree_root>/<workspace_id>/<repo_key> -b <branch> <origin_path>`.
+- [ ] `GitOps` module: `git clone`, `git worktree add/remove/list`, `git fetch` wrappers via `tokio::process::Command`.
+- [ ] Per-repo clone-on-first-use: if `<data_dir>/repos/<repo_key>/.git` doesn't exist, `git clone <remote_url>` into it. Stream clone output to the same log pane as setup scripts (first clone of a big repo is slow — show progress).
+- [ ] `create_workspace` (real): for each selected repo, ensure Tethys's clone exists, then `git -C <clone> worktree add <worktree_root>/<workspace_id>/<repo_key> -b <branch>`.
 - [ ] Setup-script runner: async `Command` with piped stdout/stderr.
 - [ ] Stream script output to the frontend (reuse the `tauri::ipc::Channel<Vec<u8>>` pattern we'll codify in M4 — plumb it now so the log pane component is generic over "any streamed process").
 - [ ] Timeout: default 10 min, overridable per-repo in `repos.toml` (`setup_timeout_secs`).

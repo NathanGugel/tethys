@@ -101,16 +101,16 @@ worktree_root = "/Users/ryan/code/tethys-worktrees"
 
 [[repo]]
 key = "frontend"
-display_name = "Frontend"
-origin_path = "/Users/ryan/code/frontend"
+remote_url = "git@github.com:me/frontend.git"
 default_setup_script = "pnpm install"
 
 [[repo]]
 key = "backend"
-display_name = "Backend"
-origin_path = "/Users/ryan/code/backend"
+remote_url = "git@github.com:me/backend.git"
 default_setup_script = "uv sync"
 ```
+
+Each repo is specified by its git remote URL, not a local path. Tethys clones each repo on first use into `<data_dir>/repos/<key>/` and runs every subsequent `git worktree add` against that clone — it never touches any other checkout the user maintains. Keeps Tethys state fully isolated from whatever branch gymnastics the user does in their own workspace, and sidesteps git's "a branch can only be checked out once" restriction.
 
 `worktree_root` is required — Tethys refuses to start a workspace create without it. Deserialized into a read-only `RepoRegistry` held alongside `AppState`. For MVP, edits require an app restart; a file-watcher can come later.
 
@@ -155,7 +155,15 @@ Schema evolution uses `#[serde(default)]` on new fields — no migrations for MV
 
 *Single-instance lock.* On launch, Tethys acquires an advisory `flock` on `<data_dir>/tethys.lock`. If it fails, a second instance is already running — the new process signals the existing one to focus its window and exits. This prevents two processes racing on `state.json` (our persistence model has no inter-process concurrency story).
 
-**GitOps.** Shells out to `git worktree add/remove/list`. On workspace create: one worktree per selected repo, at `<worktree_root>/<workspace>/<repo>` (`worktree_root` from `repos.toml`, picked by the user — avoids the macOS `Application Support` path-with-spaces hazard for setup scripts that don't quote `$PWD` correctly). Runs the repo's setup script after worktree creation. On delete: stops sessions, then `git worktree remove`; prompts for `--force` if dirty.
+**GitOps.** Shells out to `git clone`, `git worktree add/remove/list`, `git fetch`.
+
+*Per-repo clone (first-use).* The first time a workspace wants a worktree for a given repo, Tethys runs `git clone <remote_url> <data_dir>/repos/<repo_key>/`. All subsequent worktrees for that repo come off this clone. This is the isolation layer — the user's own checkouts are never referenced by Tethys, so no shared branch state, no shared `.git`, no `git worktree prune` collateral damage, no branch-collision errors when the user has the same branch checked out somewhere else.
+
+*Worktree create.* For each selected repo in a new workspace: `git -C <tethys_clone> fetch` (quick sanity refresh), then `git -C <tethys_clone> worktree add <worktree_root>/<workspace_id>/<repo_key> -b <branch>`. `worktree_root` comes from `repos.toml` and is user-picked — avoids the macOS `Application Support` path-with-spaces hazard for setup scripts.
+
+*Setup script.* Runs in the new worktree after it's materialized.
+
+*Delete.* Stops sessions, then `git -C <tethys_clone> worktree remove <path>`; prompts for `--force` if dirty.
 
 *Branch naming:* workspace creation takes a single `branch` name (user-supplied in the create dialog) that's used for every repo in the workspace: `git worktree add <path> -b <branch>`. No templating, no per-repo overrides in v1.
 
