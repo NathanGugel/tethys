@@ -48,18 +48,19 @@ Legend: `- [ ]` open · `- [x]` done.
 
 ## Milestone 3 — Worktree & setup-script lifecycle
 
-**Ships:** creating a workspace actually creates git worktrees and runs setup scripts. Deleting cleans up.
+**Ships:** creating a workspace actually creates git worktrees and runs setup scripts. Deleting cleans up. Crash-recovery via a reconciler that diffs state.json against disk.
 
-- [ ] `GitOps` module: `git clone`, `git worktree add/remove/list`, `git fetch` wrappers via `tokio::process::Command`.
-- [ ] Per-repo clone-on-first-use: if `<data_dir>/repos/<repo_key>/.git` doesn't exist, `git clone <remote_url>` into it. Stream clone output to the same log pane as setup scripts (first clone of a big repo is slow — show progress).
-- [ ] `create_workspace` (real): for each selected repo, ensure Tethys's clone exists, then `git -C <clone> worktree add <worktree_root>/<workspace_id>/<repo_key> -b <branch>`.
-- [ ] Setup-script runner: async `Command` with piped stdout/stderr.
-- [ ] Stream script output to the frontend (reuse the `tauri::ipc::Channel<Vec<u8>>` pattern we'll codify in M4 — plumb it now so the log pane component is generic over "any streamed process").
-- [ ] Timeout: default 10 min, overridable per-repo in `repos.toml` (`setup_timeout_secs`).
-- [ ] Cancel: UI button → SIGTERM, then SIGKILL after 5s grace.
-- [ ] Failure path: if any script exits non-zero, tear down all worktrees created for this workspace and roll back `AppState`. Show the failing script's output in the modal.
-- [ ] `delete_workspace`: stop sessions (stubbed for now — there are none yet), then `git worktree remove`. If dirty, refuse and surface the reason (force comes in M7).
-- [ ] Modal log-pane component (reused later for PTY scrollback view and setup-script output).
+- [x] `GitOps` module: `git clone`, `git worktree add/remove` wrappers via `tokio::process::Command`. (`fetch` / `list` not yet needed.)
+- [x] Per-repo clone-on-first-use into `<data_dir>/repos/<repo_key>/`. `git clone --progress` + self-heal (partial clones detected via `git rev-parse HEAD` and wiped).
+- [x] `create_workspace` (real): clone → worktree add → optional setup script per repo, all streamed.
+- [x] Setup-script runner: async `/bin/sh -c <script>`, piped stdio, line-by-line streaming.
+- [x] Stream output via `tauri::ipc::Channel<JobEvent>` — backend-to-frontend over a single typed channel per job. Line reader splits on both `\n` and `\r` so git/yarn progress updates surface.
+- [x] Timeout: default 10 min, per-repo override via `setup_timeout_secs` in `repos.toml`. On timeout: SIGTERM → 5s grace → SIGKILL.
+- [ ] Cancel: UI button → SIGTERM, then SIGKILL after 5s grace. (Deferred — would require a cancel signal threaded through the job.)
+- [x] Failure path: on any per-repo error, tear down every worktree already created for the workspace; workspace is never added to state (atomic success).
+- [x] `delete_workspace`: runs `git worktree remove` for each repo_link, then clears state. (Non-force only; dirty-force → M7.)
+- [x] Modal log-pane component (`JobLogModal`, reused for both create and delete jobs).
+- [x] Boot-time reconciler: `list_discrepancies` command diffs state.json against disk. UI surfaces orphaned worktrees with a Remove button and workspaces-with-missing-worktrees with a Forget button.
 
 **Verify:** create a workspace with a real repo whose setup script `exit 1`s → the partial worktree gets cleaned up and you see why.
 

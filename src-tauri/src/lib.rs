@@ -1,8 +1,12 @@
 mod commands;
 mod error;
+mod git;
+mod job;
 mod logging;
 mod paths;
+mod reconcile;
 mod registry;
+mod setup;
 mod state;
 mod store;
 
@@ -80,6 +84,9 @@ pub fn run() {
             commands::list_repos,
             commands::registry_status,
             commands::open_repos_config,
+            commands::list_discrepancies,
+            commands::remove_orphan_dir,
+            commands::forget_workspace,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

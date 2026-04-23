@@ -4,28 +4,41 @@ import { listen } from "@tauri-apps/api/event";
 
 import type {
   CreateWorkspaceArgs,
+  Discrepancies,
   RegistryStatus,
   Repo,
   Workspace,
   WorkspaceId,
 } from "./types";
+import { JobLogModal } from "./JobLogModal";
 import "./App.css";
+
+type RunningJob = {
+  title: string;
+  command: string;
+  args: Record<string, unknown>;
+  onSuccess?: (result: unknown) => void;
+};
 
 function App() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [registry, setRegistry] = useState<RegistryStatus | null>(null);
+  const [discrepancies, setDiscrepancies] = useState<Discrepancies | null>(null);
   const [selectedId, setSelectedId] = useState<WorkspaceId | null>(null);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [runningJob, setRunningJob] = useState<RunningJob | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const [list, reg] = await Promise.all([
+      const [list, reg, disc] = await Promise.all([
         invoke<Workspace[]>("list_workspaces"),
         invoke<RegistryStatus>("registry_status"),
+        invoke<Discrepancies>("list_discrepancies"),
       ]);
       setWorkspaces(list);
       setRegistry(reg);
+      setDiscrepancies(disc);
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -89,11 +102,22 @@ function App() {
 
       <main className="detail">
         {error && <div className="error-banner">{error}</div>}
-        {registry && !registryOk && <RegistryNotice registry={registry} onChanged={refresh} />}
+        {registry && !registryOk && (
+          <RegistryNotice registry={registry} onChanged={refresh} />
+        )}
+        {discrepancies &&
+          (discrepancies.orphaned_dirs.length > 0 ||
+            discrepancies.missing_worktrees.length > 0) && (
+            <DiscrepancyNotice
+              discrepancies={discrepancies}
+              onChanged={refresh}
+            />
+          )}
         {selected ? (
           <WorkspaceDetail
             workspace={selected}
             onDeleted={() => setSelectedId(null)}
+            onRun={setRunningJob}
           />
         ) : (
           registryOk && (
@@ -108,10 +132,28 @@ function App() {
         <CreateWorkspaceDialog
           repos={registry.registry.repos}
           onClose={() => setCreating(false)}
-          onCreated={(ws) => {
+          onSubmit={(args) => {
             setCreating(false);
-            setSelectedId(ws.id);
+            setRunningJob({
+              title: `Creating ${args.branch}`,
+              command: "create_workspace",
+              args: { args },
+              onSuccess: (result) => {
+                const ws = result as Workspace;
+                setSelectedId(ws.id);
+              },
+            });
           }}
+        />
+      )}
+
+      {runningJob && (
+        <JobLogModal
+          title={runningJob.title}
+          command={runningJob.command}
+          args={runningJob.args}
+          onClose={() => setRunningJob(null)}
+          onSuccess={runningJob.onSuccess}
         />
       )}
     </div>
@@ -128,7 +170,6 @@ function RegistryNotice({
   const openConfig = async () => {
     try {
       await invoke("open_repos_config");
-      // repos.toml edits require restart (per plan) — remind the user.
     } catch (e) {
       alert(String(e));
     }
@@ -141,8 +182,8 @@ function RegistryNotice({
       <h2>Repos not configured</h2>
       {registry.kind === "missing" ? (
         <p>
-          Tethys expects a repo registry at <code>{registry.path}</code>.
-          It doesn't exist yet.
+          Tethys expects a repo registry at <code>{registry.path}</code>. It
+          doesn't exist yet.
         </p>
       ) : (
         <>
@@ -170,12 +211,120 @@ function RegistryNotice({
   );
 }
 
+function DiscrepancyNotice({
+  discrepancies,
+  onChanged,
+}: {
+  discrepancies: Discrepancies;
+  onChanged: () => void;
+}) {
+  const removeOrphan = async (path: string) => {
+    try {
+      await invoke("remove_orphan_dir", { path });
+      onChanged();
+    } catch (e) {
+      alert(String(e));
+    }
+  };
+
+  const forgetWorkspace = async (id: string) => {
+    try {
+      await invoke("forget_workspace", { id });
+      onChanged();
+    } catch (e) {
+      alert(String(e));
+    }
+  };
+
+  // Collapse missing-worktree rows by workspace_id — multiple repos per
+  // workspace would otherwise show redundant Forget buttons.
+  const missingByWorkspace = new Map<
+    string,
+    { branch: string; repos: string[] }
+  >();
+  for (const m of discrepancies.missing_worktrees) {
+    const entry = missingByWorkspace.get(m.workspace_id) ?? {
+      branch: m.branch,
+      repos: [],
+    };
+    entry.repos.push(m.repo_key);
+    missingByWorkspace.set(m.workspace_id, entry);
+  }
+
+  return (
+    <div className="discrepancy-notice">
+      <h2>State / disk mismatch</h2>
+      <p>
+        Tethys found things that don't line up between <code>state.json</code>{" "}
+        and your <code>worktree_root</code>. Usually the result of a crash or
+        manual filesystem surgery.
+      </p>
+
+      {discrepancies.orphaned_dirs.length > 0 && (
+        <>
+          <h3>Orphaned worktrees</h3>
+          <p className="muted">
+            Directories with no matching workspace in state. Safe to remove.
+          </p>
+          <ul className="discrepancy-list">
+            {discrepancies.orphaned_dirs.map((o) => (
+              <li key={o.path}>
+                <code className="discrepancy-path">{o.path}</code>
+                <button
+                  type="button"
+                  className="danger"
+                  onClick={() => removeOrphan(o.path)}
+                >
+                  Remove
+                </button>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+
+      {missingByWorkspace.size > 0 && (
+        <>
+          <h3>Missing worktrees</h3>
+          <p className="muted">
+            Workspaces in state whose worktree directories have vanished. Forget
+            drops the workspace from state; it does not touch disk.
+          </p>
+          <ul className="discrepancy-list">
+            {Array.from(missingByWorkspace.entries()).map(
+              ([id, { branch, repos }]) => (
+                <li key={id}>
+                  <div className="discrepancy-meta">
+                    <code>{branch}</code>{" "}
+                    <span className="muted">
+                      · missing: {repos.join(", ")}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    className="danger"
+                    onClick={() => forgetWorkspace(id)}
+                  >
+                    Forget
+                  </button>
+                </li>
+              ),
+            )}
+          </ul>
+        </>
+      )}
+    </div>
+  );
+}
+
 function WorkspaceDetail({
   workspace,
   onDeleted,
+  onRun,
 }: {
   workspace: Workspace;
   onDeleted: () => void;
+  onRun: (job: RunningJob) => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
@@ -191,15 +340,14 @@ function WorkspaceDetail({
     }
   };
 
-  const performDelete = async () => {
+  const performDelete = () => {
     setConfirmingDelete(false);
-    setBusy(true);
-    try {
-      await invoke("delete_workspace", { id: workspace.id });
-      onDeleted();
-    } finally {
-      setBusy(false);
-    }
+    onRun({
+      title: `Deleting ${workspace.branch}`,
+      command: "delete_workspace",
+      args: { id: workspace.id },
+      onSuccess: () => onDeleted(),
+    });
   };
 
   return (
@@ -227,9 +375,8 @@ function WorkspaceDetail({
           title="Delete workspace?"
           message={
             <>
-              Delete workspace <code>{workspace.branch}</code>? This removes it
-              from Tethys state but does not touch any worktrees on disk (M3
-              will wire that up).
+              Delete workspace <code>{workspace.branch}</code>? This removes
+              every worktree and clears the workspace from Tethys state.
             </>
           }
           confirmLabel="Delete"
@@ -251,8 +398,8 @@ function WorkspaceDetail({
                 <li key={r.repo_key}>
                   <code>{r.repo_key}</code>
                   <span className="repo-link-path">{r.worktree_path}</span>
-                  {r.setup_script_ran_at === null && (
-                    <span className="pending-badge">not created yet</span>
+                  {r.setup_script_ran_at !== null && (
+                    <span className="ok-badge">setup ok</span>
                   )}
                 </li>
               ))}
@@ -277,18 +424,16 @@ function WorkspaceDetail({
 function CreateWorkspaceDialog({
   repos,
   onClose,
-  onCreated,
+  onSubmit,
 }: {
   repos: Repo[];
   onClose: () => void;
-  onCreated: (ws: Workspace) => void;
+  onSubmit: (args: CreateWorkspaceArgs) => void;
 }) {
   const [branch, setBranch] = useState("");
   const [selected, setSelected] = useState<Set<string>>(
     () => new Set(repos.map((r) => r.key)),
   );
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
   const toggle = (key: string) => {
     setSelected((prev) => {
@@ -301,22 +446,12 @@ function CreateWorkspaceDialog({
 
   const canSubmit = branch.trim().length > 0 && selected.size > 0;
 
-  const submit = async (e: React.FormEvent) => {
+  const submit = (e: React.FormEvent) => {
     e.preventDefault();
-    setBusy(true);
-    setError(null);
-    try {
-      const args: CreateWorkspaceArgs = {
-        branch: branch.trim(),
-        repo_selections: Array.from(selected),
-      };
-      const ws = await invoke<Workspace>("create_workspace", { args });
-      onCreated(ws);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
+    onSubmit({
+      branch: branch.trim(),
+      repo_selections: Array.from(selected),
+    });
   };
 
   return (
@@ -362,16 +497,11 @@ function CreateWorkspaceDialog({
             </ul>
           )}
         </div>
-        {error && <div className="error-banner">{error}</div>}
         <div className="modal-actions">
-          <button type="button" onClick={onClose} disabled={busy}>
+          <button type="button" onClick={onClose}>
             Cancel
           </button>
-          <button
-            type="submit"
-            className="primary"
-            disabled={busy || !canSubmit}
-          >
+          <button type="submit" className="primary" disabled={!canSubmit}>
             Create
           </button>
         </div>

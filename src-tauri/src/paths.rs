@@ -37,4 +37,12 @@ impl Paths {
     pub fn repos_schema_file(&self) -> PathBuf {
         self.data_dir.join("repos.schema.json")
     }
+
+    pub fn repos_clone_dir(&self) -> PathBuf {
+        self.data_dir.join("repos")
+    }
+
+    pub fn repo_clone_path(&self, repo_key: &str) -> PathBuf {
+        self.repos_clone_dir().join(repo_key)
+    }
 }

@@ -46,3 +46,25 @@ export type RegistryStatus =
   | { kind: "ok"; path: string; registry: { worktree_root: string; repos: Repo[] } }
   | { kind: "missing"; path: string }
   | { kind: "invalid"; path: string; error: string };
+
+export type JobEvent =
+  | { kind: "status"; message: string; repo?: string }
+  | { kind: "log"; stream: "stdout" | "stderr"; line: string; repo?: string }
+  | { kind: "success" }
+  | { kind: "failed"; error: string };
+
+export interface OrphanedDir {
+  path: string;
+}
+
+export interface MissingWorktree {
+  workspace_id: string;
+  branch: string;
+  repo_key: string;
+  worktree_path: string;
+}
+
+export interface Discrepancies {
+  orphaned_dirs: OrphanedDir[];
+  missing_worktrees: MissingWorktree[];
+}

@@ -1,0 +1,264 @@
+use std::ffi::OsStr;
+use std::path::Path;
+use std::process::Stdio;
+
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Command;
+
+use crate::error::{AppError, AppResult};
+use crate::job::{JobTx, LogStream};
+
+/// Run a child process, streaming each line of stdout/stderr as `JobEvent::Log`
+/// via the provided `JobTx`. Blocks until the child exits. Returns the exit
+/// status so the caller decides what to do on non-zero.
+///
+/// `repo` is attached to each emitted event so the UI can group output by repo.
+pub async fn run_streamed<I, S>(
+    program: &str,
+    args: I,
+    cwd: Option<&Path>,
+    tx: &JobTx,
+    repo: Option<&str>,
+) -> AppResult<std::process::ExitStatus>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.env("GIT_TERMINAL_PROMPT", "0"); // fail fast instead of hanging on auth prompt
+
+    let mut child = cmd.spawn().map_err(|e| {
+        AppError::Other(format!("failed to spawn `{program}`: {e}"))
+    })?;
+
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+
+    let tx_out = tx.clone();
+    let repo_out = repo.map(String::from);
+    let stdout_task = tokio::spawn(async move {
+        drain_lines(stdout, &tx_out, LogStream::Stdout, repo_out.as_deref()).await;
+    });
+
+    let tx_err = tx.clone();
+    let repo_err = repo.map(String::from);
+    let stderr_task = tokio::spawn(async move {
+        drain_lines(stderr, &tx_err, LogStream::Stderr, repo_err.as_deref()).await;
+    });
+
+    let status = child.wait().await?;
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+
+    Ok(status)
+}
+
+/// Probe whether `clone_path` looks like a complete git clone by asking
+/// `git rev-parse HEAD`. A half-finished clone (process killed after `.git/`
+/// was created but before HEAD was written) fails this check.
+async fn is_valid_clone(clone_path: &Path) -> bool {
+    let result = Command::new("git")
+        .arg("-C")
+        .arg(clone_path)
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg("HEAD")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    matches!(result, Ok(s) if s.success())
+}
+
+/// Read from `reader`, split on both `\n` and `\r` (git/yarn/pnpm progress
+/// overwrites the current line with `\r` alone), and emit each segment as
+/// a `JobEvent::Log`. Without splitting on `\r`, progress lines never
+/// surface — the user just sees "Cloning into..." and then nothing for
+/// minutes while the clone runs.
+async fn drain_lines<R: AsyncRead + Unpin>(
+    mut reader: R,
+    tx: &JobTx,
+    stream: LogStream,
+    repo: Option<&str>,
+) {
+    let mut buf = [0u8; 4096];
+    let mut line: Vec<u8> = Vec::with_capacity(256);
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break, // EOF
+            Ok(n) => {
+                for &byte in &buf[..n] {
+                    if byte == b'\n' || byte == b'\r' {
+                        if !line.is_empty() {
+                            tx.log(
+                                stream,
+                                String::from_utf8_lossy(&line).into_owned(),
+                                repo,
+                            );
+                            line.clear();
+                        }
+                    } else {
+                        line.push(byte);
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    if !line.is_empty() {
+        tx.log(stream, String::from_utf8_lossy(&line).into_owned(), repo);
+    }
+}
+
+/// Clone `remote_url` into `clone_path` if it's not already a valid clone.
+/// Partial/broken clones (e.g. from a previous run that was interrupted
+/// mid-fetch) are detected via a `git rev-parse HEAD` probe and wiped so
+/// the re-clone can succeed — otherwise `git clone` refuses to write into
+/// a non-empty directory.
+pub async fn ensure_clone(
+    clone_path: &Path,
+    remote_url: &str,
+    tx: &JobTx,
+    repo: &str,
+) -> AppResult<()> {
+    if clone_path.exists() {
+        if is_valid_clone(clone_path).await {
+            tx.status(
+                format!("clone already present at {}", clone_path.display()),
+                Some(repo),
+            );
+            return Ok(());
+        }
+        tx.status(
+            format!(
+                "clone at {} is incomplete; removing and retrying",
+                clone_path.display()
+            ),
+            Some(repo),
+        );
+        tokio::fs::remove_dir_all(clone_path).await.map_err(|e| {
+            AppError::Other(format!(
+                "failed to remove broken clone at {}: {e}",
+                clone_path.display()
+            ))
+        })?;
+    }
+
+    tx.status(format!("cloning {remote_url}"), Some(repo));
+
+    if let Some(parent) = clone_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let status = run_streamed(
+        "git",
+        [
+            "clone".as_ref(),
+            // Force progress output even when stderr is a pipe (default is
+            // to suppress). Without this users see only "Cloning into..."
+            // and then nothing for the duration of a multi-minute clone.
+            "--progress".as_ref(),
+            remote_url.as_ref(),
+            clone_path.as_os_str(),
+        ],
+        None,
+        tx,
+        Some(repo),
+    )
+    .await?;
+
+    if !status.success() {
+        return Err(AppError::Other(format!(
+            "git clone {remote_url} exited with {:?}",
+            status.code()
+        )));
+    }
+    Ok(())
+}
+
+/// `git -C <clone_path> worktree add <worktree_path> -b <branch>`.
+/// Creates a new branch `<branch>` off the clone's current HEAD.
+pub async fn worktree_add(
+    clone_path: &Path,
+    worktree_path: &Path,
+    branch: &str,
+    tx: &JobTx,
+    repo: &str,
+) -> AppResult<()> {
+    tx.status(
+        format!("creating worktree at {}", worktree_path.display()),
+        Some(repo),
+    );
+
+    if let Some(parent) = worktree_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let status = run_streamed(
+        "git",
+        [
+            "-C".as_ref(),
+            clone_path.as_os_str(),
+            "worktree".as_ref(),
+            "add".as_ref(),
+            worktree_path.as_os_str(),
+            "-b".as_ref(),
+            branch.as_ref(),
+        ],
+        None,
+        tx,
+        Some(repo),
+    )
+    .await?;
+
+    if !status.success() {
+        return Err(AppError::Other(format!(
+            "git worktree add {} exited with {:?}",
+            worktree_path.display(),
+            status.code()
+        )));
+    }
+    Ok(())
+}
+
+/// `git -C <clone_path> worktree remove <worktree_path>`. Returns an error if
+/// the worktree is dirty (caller can retry with `force`).
+pub async fn worktree_remove(
+    clone_path: &Path,
+    worktree_path: &Path,
+    force: bool,
+    tx: &JobTx,
+    repo: &str,
+) -> AppResult<()> {
+    tx.status(
+        format!("removing worktree {}", worktree_path.display()),
+        Some(repo),
+    );
+
+    let mut args: Vec<&OsStr> = vec![
+        "-C".as_ref(),
+        clone_path.as_os_str(),
+        "worktree".as_ref(),
+        "remove".as_ref(),
+    ];
+    if force {
+        args.push("--force".as_ref());
+    }
+    args.push(worktree_path.as_os_str());
+
+    let status = run_streamed("git", args, None, tx, Some(repo)).await?;
+
+    if !status.success() {
+        return Err(AppError::Other(format!(
+            "git worktree remove {} exited with {:?}",
+            worktree_path.display(),
+            status.code()
+        )));
+    }
+    Ok(())
+}
