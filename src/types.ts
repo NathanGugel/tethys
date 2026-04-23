@@ -68,3 +68,11 @@ export interface Discrepancies {
   orphaned_dirs: OrphanedDir[];
   missing_worktrees: MissingWorktree[];
 }
+
+export interface SessionInfo {
+  id: string;
+  workspace_id: string;
+  repo_key: string;
+  cwd: string;
+  running: boolean;
+}

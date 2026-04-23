@@ -7,12 +7,15 @@ use tracing::{info, warn};
 
 use std::path::PathBuf;
 
+use tauri::ipc::InvokeResponseBody;
+
 use crate::error::{AppError, AppResult};
 use crate::git;
 use crate::job::{JobEvent, JobTx};
 use crate::paths::Paths;
 use crate::reconcile::{self, Discrepancies};
 use crate::registry::{starter_template, RegistryLoad, Repo};
+use crate::sessions::{SessionInfo, SessionSupervisor};
 use crate::setup;
 use crate::state::{new_workspace_id, RepoLink, Workspace, WorkspaceId};
 use crate::store::Store;
@@ -372,6 +375,82 @@ async fn set_paused(store: &Arc<Store>, id: &str, paused: bool) -> AppResult<()>
             Ok(())
         })
         .await
+}
+
+#[tauri::command]
+pub fn list_sessions(
+    supervisor: State<'_, Arc<SessionSupervisor>>,
+    workspace_id: WorkspaceId,
+) -> Vec<SessionInfo> {
+    supervisor.list_for_workspace(&workspace_id)
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct StartSessionArgs {
+    pub workspace_id: WorkspaceId,
+    pub repo_key: String,
+}
+
+#[tauri::command]
+pub async fn start_session(
+    supervisor: State<'_, Arc<SessionSupervisor>>,
+    store: State<'_, Arc<Store>>,
+    args: StartSessionArgs,
+) -> AppResult<SessionInfo> {
+    // Look up the worktree path for this workspace + repo from state.
+    let worktree_path = store
+        .read(|s| {
+            s.find_workspace(&args.workspace_id)
+                .and_then(|w| {
+                    w.repo_links
+                        .iter()
+                        .find(|r| r.repo_key == args.repo_key)
+                        .map(|r| r.worktree_path.clone())
+                })
+        })
+        .await
+        .ok_or_else(|| {
+            AppError::Other(format!(
+                "no worktree for {}/{} in state",
+                args.workspace_id, args.repo_key
+            ))
+        })?;
+
+    // M4: spawn the user's login shell. M5 will swap this for `claude`.
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+
+    supervisor.spawn(args.workspace_id, args.repo_key, &worktree_path, &shell)
+}
+
+/// Subscribe to live PTY bytes and return the current scrollback. The
+/// channel carries raw bytes via `InvokeResponseBody::Raw` — no JSON
+/// serialization overhead per chunk.
+#[tauri::command]
+pub fn attach_session(
+    supervisor: State<'_, Arc<SessionSupervisor>>,
+    session_id: String,
+    on_bytes: tauri::ipc::Channel<InvokeResponseBody>,
+) -> AppResult<Vec<u8>> {
+    supervisor.attach(&session_id, on_bytes)
+}
+
+#[tauri::command]
+pub fn send_input(
+    supervisor: State<'_, Arc<SessionSupervisor>>,
+    session_id: String,
+    data: Vec<u8>,
+) -> AppResult<()> {
+    supervisor.send_input(&session_id, &data)
+}
+
+#[tauri::command]
+pub fn resize_session(
+    supervisor: State<'_, Arc<SessionSupervisor>>,
+    session_id: String,
+    cols: u16,
+    rows: u16,
+) -> AppResult<()> {
+    supervisor.resize(&session_id, cols, rows)
 }
 
 fn emit_workspace_changed(app: &AppHandle, workspace_id: &str) {

@@ -70,17 +70,16 @@ Legend: `- [ ]` open · `- [x]` done.
 
 **Ships:** each session tab runs a real shell in its worktree. Tabs remember their output across mount/unmount.
 
-- [ ] `SessionSupervisor` module owning a `HashMap<SessionId, SessionHandle>`.
-- [ ] Spawn `portable-pty` with `cwd = worktree_path`. For M4, run the user's login shell (`$SHELL`), not `claude` — proves the pipeline without Claude in the loop.
-- [ ] Per-session ring buffer (2 MB) holding recent PTY bytes.
-- [ ] `attach_session({ session_id, channel })` command: return scrollback snapshot as the result; register `channel` as a subscriber; subsequent PTY reads fan out to all active subscribers.
-- [ ] `send_input({ session_id, bytes })` writes to the PTY master.
-- [ ] `resize({ session_id, cols, rows })` calls `master.resize()`.
-- [ ] On PTY exit: emit `pty:exit`, drop subscribers, keep metadata in `AppState` until explicitly removed.
-- [ ] Frontend: `SessionTerminal` React component mounts an xterm.js instance (canvas addon + fit + clipboard) on tab activation.
-- [ ] On mount: create `Channel<Uint8Array>`, call `attach_session`, write returned scrollback, then drain the channel into xterm.
-- [ ] On unmount: close channel. Verify PTY keeps running and ring buffer keeps filling.
-- [ ] Fit addon wired to container resize → `resize` command.
+- [x] `SessionSupervisor` module with `HashMap<SessionId, SessionHandle>` guarded by `Mutex`.
+- [x] Spawn `portable-pty` with `cwd = worktree_path`. M4 runs `$SHELL`; M5 swaps the program for `claude`.
+- [x] Per-session ring buffer (2 MB) holding recent PTY bytes.
+- [x] `attach_session({ session_id, on_bytes })` command: returns scrollback as `Vec<u8>` (the command result), registers the `Channel<InvokeResponseBody>` for live fan-out.
+- [x] `send_input({ session_id, data })` writes to the PTY master.
+- [x] `resize_session({ session_id, cols, rows })` calls `master.resize()`.
+- [x] Child watcher thread emits `session:exit` and flips `running=false`; handle stays in the map so scrollback survives for re-attach.
+- [x] `SessionTerminal` component mounts an xterm.js instance (canvas addon + fit + clipboard) and uses raw-bytes `Channel<ArrayBuffer>` for zero JSON-overhead streaming.
+- [x] On mount: scrollback first, then live stream. On unmount: dispose xterm; backend drops the subscriber on its next send.
+- [x] Fit addon wired to a `ResizeObserver` on the container → `resize_session`.
 
 **Verify:** open a tab, `yes | head -10000`, switch tabs, switch back → no gap, scrollback intact. Reload the webview → still intact.
 

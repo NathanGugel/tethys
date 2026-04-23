@@ -490,6 +490,96 @@ button.danger.primary:hover:not(:disabled) {
   font-size: 13px;
 }
 
+.repo-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 16px 0 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.repo-tabs button {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 8px 14px;
+  color: var(--muted);
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.repo-tabs button:hover:not(:disabled) {
+  background: rgba(125, 125, 125, 0.08);
+  color: var(--fg);
+}
+
+.repo-tabs button.active {
+  color: var(--fg);
+  border-bottom-color: var(--accent);
+  font-weight: 500;
+}
+
+.tab-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #2ea043;
+  display: inline-block;
+}
+
+.session-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: calc(100vh - 220px);
+  min-height: 300px;
+}
+
+.session-pane.empty {
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding-top: 16px;
+}
+
+.session-terminal {
+  flex: 1;
+  min-height: 240px;
+  background: #0a0a0a;
+  border-radius: 4px;
+  padding: 6px;
+  overflow: hidden;
+}
+
+.spinner {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  margin-right: 6px;
+  vertical-align: -1px;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.session-exit-banner {
+  background: rgba(125, 125, 125, 0.15);
+  border-left: 3px solid var(--muted);
+  padding: 8px 12px;
+  border-radius: 0 4px 4px 0;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+}
+
 .registry-notice h2 {
   margin: 0 0 8px;
   font-size: 16px;

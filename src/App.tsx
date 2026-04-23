@@ -7,10 +7,12 @@ import type {
   Discrepancies,
   RegistryStatus,
   Repo,
+  SessionInfo,
   Workspace,
   WorkspaceId,
 } from "./types";
 import { JobLogModal } from "./JobLogModal";
+import { SessionTerminal } from "./SessionTerminal";
 import "./App.css";
 
 type RunningJob = {
@@ -218,23 +220,34 @@ function DiscrepancyNotice({
   discrepancies: Discrepancies;
   onChanged: () => void;
 }) {
-  const removeOrphan = async (path: string) => {
+  const [busy, setBusy] = useState<Set<string>>(() => new Set());
+
+  const withBusy = async (key: string, fn: () => Promise<void>) => {
+    setBusy((prev) => new Set(prev).add(key));
     try {
-      await invoke("remove_orphan_dir", { path });
-      onChanged();
+      await fn();
     } catch (e) {
       alert(String(e));
+    } finally {
+      setBusy((prev) => {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
     }
   };
 
-  const forgetWorkspace = async (id: string) => {
-    try {
+  const removeOrphan = (path: string) =>
+    withBusy(`orphan:${path}`, async () => {
+      await invoke("remove_orphan_dir", { path });
+      onChanged();
+    });
+
+  const forgetWorkspace = (id: string) =>
+    withBusy(`forget:${id}`, async () => {
       await invoke("forget_workspace", { id });
       onChanged();
-    } catch (e) {
-      alert(String(e));
-    }
-  };
+    });
 
   // Collapse missing-worktree rows by workspace_id — multiple repos per
   // workspace would otherwise show redundant Forget buttons.
@@ -267,18 +280,28 @@ function DiscrepancyNotice({
             Directories with no matching workspace in state. Safe to remove.
           </p>
           <ul className="discrepancy-list">
-            {discrepancies.orphaned_dirs.map((o) => (
-              <li key={o.path}>
-                <code className="discrepancy-path">{o.path}</code>
-                <button
-                  type="button"
-                  className="danger"
-                  onClick={() => removeOrphan(o.path)}
-                >
-                  Remove
-                </button>
-              </li>
-            ))}
+            {discrepancies.orphaned_dirs.map((o) => {
+              const working = busy.has(`orphan:${o.path}`);
+              return (
+                <li key={o.path}>
+                  <code className="discrepancy-path">{o.path}</code>
+                  <button
+                    type="button"
+                    className="danger"
+                    onClick={() => removeOrphan(o.path)}
+                    disabled={working}
+                  >
+                    {working ? (
+                      <>
+                        <Spinner /> Removing…
+                      </>
+                    ) : (
+                      "Remove"
+                    )}
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         </>
       )}
@@ -292,23 +315,33 @@ function DiscrepancyNotice({
           </p>
           <ul className="discrepancy-list">
             {Array.from(missingByWorkspace.entries()).map(
-              ([id, { branch, repos }]) => (
-                <li key={id}>
-                  <div className="discrepancy-meta">
-                    <code>{branch}</code>{" "}
-                    <span className="muted">
-                      · missing: {repos.join(", ")}
-                    </span>
-                  </div>
-                  <button
-                    type="button"
-                    className="danger"
-                    onClick={() => forgetWorkspace(id)}
-                  >
-                    Forget
-                  </button>
-                </li>
-              ),
+              ([id, { branch, repos }]) => {
+                const working = busy.has(`forget:${id}`);
+                return (
+                  <li key={id}>
+                    <div className="discrepancy-meta">
+                      <code>{branch}</code>{" "}
+                      <span className="muted">
+                        · missing: {repos.join(", ")}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      className="danger"
+                      onClick={() => forgetWorkspace(id)}
+                      disabled={working}
+                    >
+                      {working ? (
+                        <>
+                          <Spinner /> Forgetting…
+                        </>
+                      ) : (
+                        "Forget"
+                      )}
+                    </button>
+                  </li>
+                );
+              },
             )}
           </ul>
         </>
@@ -328,6 +361,34 @@ function WorkspaceDetail({
 }) {
   const [busy, setBusy] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [tab, setTab] = useState<string>("__overview");
+  const [sessions, setSessions] = useState<SessionInfo[]>([]);
+
+  // Reset tab when the selected workspace changes.
+  useEffect(() => {
+    setTab("__overview");
+  }, [workspace.id]);
+
+  const refreshSessions = useCallback(async () => {
+    try {
+      const list = await invoke<SessionInfo[]>("list_sessions", {
+        workspaceId: workspace.id,
+      });
+      setSessions(list);
+    } catch (e) {
+      console.error("list_sessions:", e);
+    }
+  }, [workspace.id]);
+
+  useEffect(() => {
+    refreshSessions();
+    const sc = listen("session:changed", () => refreshSessions());
+    const sx = listen("session:exit", () => refreshSessions());
+    return () => {
+      sc.then((un) => un());
+      sx.then((un) => un());
+    };
+  }, [refreshSessions]);
 
   const togglePause = async () => {
     setBusy(true);
@@ -349,6 +410,12 @@ function WorkspaceDetail({
       onSuccess: () => onDeleted(),
     });
   };
+
+  // First session per repo (M4 UX is one session per repo at a time).
+  const sessionByRepo = new Map<string, SessionInfo>();
+  for (const s of sessions) {
+    if (!sessionByRepo.has(s.repo_key)) sessionByRepo.set(s.repo_key, s);
+  }
 
   return (
     <div className="workspace-detail">
@@ -385,38 +452,142 @@ function WorkspaceDetail({
           onCancel={() => setConfirmingDelete(false)}
         />
       )}
-      <dl className="workspace-fields">
-        <dt>Created</dt>
-        <dd>{new Date(workspace.created_at).toLocaleString()}</dd>
-        <dt>Repos</dt>
-        <dd>
-          {workspace.repo_links.length === 0 ? (
-            "(none)"
-          ) : (
-            <ul className="repo-link-list">
-              {workspace.repo_links.map((r) => (
-                <li key={r.repo_key}>
-                  <code>{r.repo_key}</code>
-                  <span className="repo-link-path">{r.worktree_path}</span>
-                  {r.setup_script_ran_at !== null && (
-                    <span className="ok-badge">setup ok</span>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
-        </dd>
-        <dt>Sessions</dt>
-        <dd>
-          {workspace.sessions.length === 0
-            ? "(none — wiring coming in M4/M5)"
-            : workspace.sessions.map((s) => s.id).join(", ")}
-        </dd>
-        <dt>ID</dt>
-        <dd>
-          <code>{workspace.id}</code>
-        </dd>
-      </dl>
+
+      <nav className="repo-tabs" role="tablist">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "__overview"}
+          className={tab === "__overview" ? "active" : ""}
+          onClick={() => setTab("__overview")}
+        >
+          Overview
+        </button>
+        {workspace.repo_links.map((r) => {
+          const active = sessionByRepo.has(r.repo_key);
+          return (
+            <button
+              key={r.repo_key}
+              type="button"
+              role="tab"
+              aria-selected={tab === r.repo_key}
+              className={tab === r.repo_key ? "active" : ""}
+              onClick={() => setTab(r.repo_key)}
+            >
+              <span>{r.repo_key}</span>
+              {active && <span className="tab-dot" />}
+            </button>
+          );
+        })}
+      </nav>
+
+      {tab === "__overview" && (
+        <dl className="workspace-fields">
+          <dt>Created</dt>
+          <dd>{new Date(workspace.created_at).toLocaleString()}</dd>
+          <dt>Repos</dt>
+          <dd>
+            {workspace.repo_links.length === 0 ? (
+              "(none)"
+            ) : (
+              <ul className="repo-link-list">
+                {workspace.repo_links.map((r) => (
+                  <li key={r.repo_key}>
+                    <code>{r.repo_key}</code>
+                    <span className="repo-link-path">{r.worktree_path}</span>
+                    {r.setup_script_ran_at !== null && (
+                      <span className="ok-badge">setup ok</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </dd>
+          <dt>ID</dt>
+          <dd>
+            <code>{workspace.id}</code>
+          </dd>
+        </dl>
+      )}
+
+      {workspace.repo_links.map((r) =>
+        tab === r.repo_key ? (
+          <RepoSessionPane
+            key={r.repo_key}
+            workspaceId={workspace.id}
+            repoKey={r.repo_key}
+            session={sessionByRepo.get(r.repo_key) ?? null}
+            onStarted={refreshSessions}
+          />
+        ) : null,
+      )}
+    </div>
+  );
+}
+
+function RepoSessionPane({
+  workspaceId,
+  repoKey,
+  session,
+  onStarted,
+}: {
+  workspaceId: string;
+  repoKey: string;
+  session: SessionInfo | null;
+  onStarted: () => void;
+}) {
+  const [starting, setStarting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const start = async () => {
+    setStarting(true);
+    setError(null);
+    try {
+      await invoke("start_session", {
+        args: { workspace_id: workspaceId, repo_key: repoKey },
+      });
+      onStarted();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  if (session) {
+    return (
+      <div className="session-pane">
+        {!session.running && (
+          <div className="session-exit-banner">
+            Session exited. Scrollback preserved below. Start a new one via the
+            button.
+            <button
+              type="button"
+              onClick={start}
+              disabled={starting}
+              style={{ marginLeft: 12 }}
+            >
+              New shell
+            </button>
+          </div>
+        )}
+        <SessionTerminal sessionId={session.id} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="session-pane empty">
+      <p className="muted">No session in this worktree yet.</p>
+      <button
+        type="button"
+        className="primary"
+        onClick={start}
+        disabled={starting}
+      >
+        Start shell in <code>{repoKey}</code>
+      </button>
+      {error && <div className="error-banner">{error}</div>}
     </div>
   );
 }
@@ -550,6 +721,10 @@ function ConfirmDialog({
       </div>
     </div>
   );
+}
+
+function Spinner() {
+  return <span className="spinner" aria-hidden="true" />;
 }
 
 export default App;

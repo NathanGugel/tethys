@@ -6,6 +6,7 @@ mod logging;
 mod paths;
 mod reconcile;
 mod registry;
+mod sessions;
 mod setup;
 mod state;
 mod store;
@@ -17,6 +18,7 @@ use tracing::{error, info};
 
 use crate::paths::Paths;
 use crate::registry::RegistryLoad;
+use crate::sessions::SessionSupervisor;
 use crate::store::Store;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -72,6 +74,9 @@ pub fn run() {
             })?;
 
             app.manage(paths);
+            app.manage::<Arc<SessionSupervisor>>(Arc::new(SessionSupervisor::new(
+                handle.clone(),
+            )));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -87,6 +92,11 @@ pub fn run() {
             commands::list_discrepancies,
             commands::remove_orphan_dir,
             commands::forget_workspace,
+            commands::list_sessions,
+            commands::start_session,
+            commands::attach_session,
+            commands::send_input,
+            commands::resize_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
