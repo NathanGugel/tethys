@@ -53,6 +53,10 @@ impl Paths {
     pub fn claude_settings_lock(&self) -> PathBuf {
         self.data_dir.join("claude-settings.lock")
     }
+
+    pub fn theme_file(&self) -> PathBuf {
+        self.data_dir.join("theme.json")
+    }
 }
 
 /// `~/.claude/settings.json` — user-level Claude Code settings.

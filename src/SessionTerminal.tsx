@@ -4,6 +4,12 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { ClipboardAddon } from "@xterm/addon-clipboard";
 import "@xterm/xterm/css/xterm.css";
+import { themeToXterm, useTheme } from "./theme";
+
+const DEFAULT_XTERM_THEME = {
+  background: "#0a0a0a",
+  foreground: "#e8e8e8",
+};
 
 interface Props {
   sessionId: string;
@@ -22,18 +28,29 @@ export function SessionTerminal({ sessionId }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  const theme = useTheme();
+  // Snapshot the current theme for the mount-time init so the main useEffect
+  // doesn't need `theme` as a dep (which would rebuild xterm on every change).
+  const themeRef = useRef(theme);
+  themeRef.current = theme;
+
+  useEffect(() => {
+    if (!termRef.current) return;
+    const next = theme ? themeToXterm(theme) : DEFAULT_XTERM_THEME;
+    termRef.current.options.theme = next;
+  }, [theme]);
 
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
 
+    const initialTheme = themeRef.current
+      ? themeToXterm(themeRef.current)
+      : DEFAULT_XTERM_THEME;
     const term = new Terminal({
       fontFamily: '"SF Mono", ui-monospace, Menlo, monospace',
       fontSize: 13,
-      theme: {
-        background: "#0a0a0a",
-        foreground: "#e8e8e8",
-      },
+      theme: initialTheme,
       cursorBlink: true,
       scrollback: 10000,
       allowProposedApi: true,

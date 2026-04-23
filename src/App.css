@@ -525,27 +525,25 @@ button.danger.primary:hover:not(:disabled) {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: #2ea043;
+  background: var(--dot-idle, #2ea043);
   display: inline-block;
 }
 
 /*
- * Turn-state colors:
- *   working       — green, Claude is actively doing something
- *   idle          — muted, Claude finished a response, no explicit prompt
- *   waiting_input — amber, Claude wants input now
+ * Turn-state colors map to theme vars. Non-theme fallbacks preserve the
+ * built-in palette when no iTerm theme is loaded.
  */
 .tab-dot.dot-working {
-  background: #2ea043;
+  background: var(--dot-working, #2ea043);
 }
 
 .tab-dot.dot-idle {
-  background: #7a8699;
+  background: var(--dot-idle, #7a8699);
 }
 
 .tab-dot.dot-waiting_input {
-  background: #e2b23a;
-  box-shadow: 0 0 0 2px rgba(226, 178, 58, 0.25);
+  background: var(--dot-waiting, #e2b23a);
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--dot-waiting, #e2b23a) 25%, transparent);
 }
 
 .attention-dot {
@@ -553,15 +551,15 @@ button.danger.primary:hover:not(:disabled) {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: #e2b23a;
-  box-shadow: 0 0 0 2px rgba(226, 178, 58, 0.3);
+  background: var(--dot-waiting, #e2b23a);
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--dot-waiting, #e2b23a) 30%, transparent);
   margin-right: 4px;
   vertical-align: 1px;
 }
 
 .session-chip.urgent {
   border-color: var(--danger);
-  box-shadow: 0 0 0 1px rgba(192, 57, 43, 0.3);
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--danger) 30%, transparent);
 }
 
 .session-pane {

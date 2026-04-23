@@ -85,3 +85,19 @@ export interface TurnChangedEvent {
   runtime_state: SessionRuntimeState;
   notification_type: string | null;
 }
+
+export interface ThemeColors {
+  background: string;
+  foreground: string;
+  cursor: string;
+  cursor_text: string;
+  selection: string;
+  /** 16 ANSI colors, `ansi[0]` = black, `ansi[1]` = red, etc. */
+  ansi: string[];
+}
+
+export interface Theme {
+  name: string;
+  source_path: string;
+  colors: ThemeColors;
+}

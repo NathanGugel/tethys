@@ -44,13 +44,6 @@ pub struct ClaudeSessionMeta {
     pub cwd: PathBuf,
     pub claude_session_id: Option<String>,
     pub transcript_path: Option<PathBuf>,
-
-    #[serde(skip)]
-    pub pid: Option<u32>,
-    #[serde(skip)]
-    pub runtime_state: SessionRuntimeState,
-    #[serde(skip)]
-    pub last_turn_change_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

@@ -15,16 +15,9 @@ use crate::sessions::SessionSupervisor;
 pub struct HookMessage {
     pub event: String,
     pub session_id: Option<String>,
-    pub cwd: Option<String>,
     pub transcript_path: Option<String>,
-    #[serde(default)]
-    pub hook_event_name: Option<String>,
     pub source: Option<String>,
-    pub message: Option<String>,
     pub notification_type: Option<String>,
-    #[serde(default)]
-    pub stop_hook_active: Option<bool>,
-    pub last_assistant_message: Option<String>,
     pub spawn_token: Option<String>,
 }
 

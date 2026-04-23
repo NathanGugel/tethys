@@ -19,6 +19,7 @@ use crate::sessions::{SessionInfo, SessionSupervisor};
 use crate::setup;
 use crate::state::{new_workspace_id, ClaudeSessionMeta, RepoLink, Workspace, WorkspaceId};
 use crate::store::Store;
+use crate::theme::Theme;
 
 #[tauri::command]
 pub async fn list_workspaces(store: State<'_, Arc<Store>>) -> AppResult<Vec<Workspace>> {
@@ -497,9 +498,6 @@ async fn spawn_claude(
         cwd: worktree_path.clone(),
         claude_session_id: None,
         transcript_path: None,
-        pid: None,
-        runtime_state: Default::default(),
-        last_turn_change_at: None,
     };
 
     store
@@ -561,6 +559,11 @@ pub fn resize_session(
     rows: u16,
 ) -> AppResult<()> {
     supervisor.resize(&session_id, cols, rows)
+}
+
+#[tauri::command]
+pub fn get_theme(paths: State<'_, Paths>) -> AppResult<Option<Theme>> {
+    Theme::load_saved(&paths.theme_file())
 }
 
 fn emit_workspace_changed(app: &AppHandle, workspace_id: &str) {

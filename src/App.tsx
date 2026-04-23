@@ -9,12 +9,14 @@ import type {
   Repo,
   SessionInfo,
   SessionRuntimeState,
+  Theme,
   TurnChangedEvent,
   Workspace,
   WorkspaceId,
 } from "./types";
 import { JobLogModal } from "./JobLogModal";
 import { SessionTerminal } from "./SessionTerminal";
+import { applyTheme, ThemeContext } from "./theme";
 import "./App.css";
 
 type RunningJob = {
@@ -40,6 +42,25 @@ function App() {
   const [turnStates, setTurnStates] = useState<
     Map<string, { workspaceId: string; state: SessionRuntimeState }>
   >(new Map());
+  const [theme, setTheme] = useState<Theme | null>(null);
+
+  useEffect(() => {
+    invoke<Theme | null>("get_theme")
+      .then((t) => {
+        setTheme(t);
+        applyTheme(t);
+      })
+      .catch((e) => console.error("get_theme failed:", e));
+
+    const unlisten = listen<Theme | null>("theme:changed", (event) => {
+      const t = event.payload ?? null;
+      setTheme(t);
+      applyTheme(t);
+    });
+    return () => {
+      unlisten.then((un) => un());
+    };
+  }, []);
 
   useEffect(() => {
     const unlisten = listen<TurnChangedEvent>(
@@ -110,6 +131,7 @@ function App() {
   const registryOk = registry?.kind === "ok";
 
   return (
+    <ThemeContext.Provider value={theme}>
     <div className="app">
       <aside className="sidebar">
         <div className="sidebar-header">
@@ -213,6 +235,7 @@ function App() {
         />
       )}
     </div>
+    </ThemeContext.Provider>
   );
 }
 

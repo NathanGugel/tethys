@@ -90,10 +90,6 @@ impl SessionSupervisor {
         }
     }
 
-    fn turn_of(&self, session_id: &str) -> TurnState {
-        self.turn.lock().unwrap().get(session_id).cloned().unwrap_or_default()
-    }
-
     /// Update a session's turn state + emit `session:turn_changed`.
     /// No-op if the new state matches the current one (other than forcing
     /// a notification_type refresh).
@@ -125,22 +121,6 @@ impl SessionSupervisor {
                 "session_id": session_id,
                 "runtime_state": state,
                 "notification_type": notification_type,
-            }),
-        );
-    }
-
-    fn clear_turn(&self, session_id: &str, workspace_id: &str) {
-        {
-            let mut map = self.turn.lock().unwrap();
-            map.remove(session_id);
-        }
-        let _ = self.app.emit(
-            "session:turn_changed",
-            serde_json::json!({
-                "workspace_id": workspace_id,
-                "session_id": session_id,
-                "runtime_state": SessionRuntimeState::Dormant,
-                "notification_type": Option::<String>::None,
             }),
         );
     }
