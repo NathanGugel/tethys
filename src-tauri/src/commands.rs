@@ -546,7 +546,11 @@ pub fn send_input(
     session_id: String,
     data: Vec<u8>,
 ) -> AppResult<()> {
-    supervisor.send_input(&session_id, &data)
+    supervisor.send_input(&session_id, &data)?;
+    // Optimistic flip to Working so the UI reacts on the next keystroke
+    // instead of waiting for Claude to trigger a hook.
+    supervisor.mark_working(&session_id);
+    Ok(())
 }
 
 #[tauri::command]

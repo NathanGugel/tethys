@@ -75,4 +75,13 @@ export interface SessionInfo {
   repo_key: string;
   cwd: string;
   running: boolean;
+  runtime_state: SessionRuntimeState;
+  notification_type: string | null;
+}
+
+export interface TurnChangedEvent {
+  workspace_id: string;
+  session_id: string;
+  runtime_state: SessionRuntimeState;
+  notification_type: string | null;
 }

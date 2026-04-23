@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use crate::hook_listener::HookMessage;
+use crate::state::SessionRuntimeState;
 use crate::store::Store;
 
 const RING_CAPACITY: usize = 2 * 1024 * 1024; // 2 MB scrollback per session
@@ -29,6 +30,10 @@ pub struct SessionInfo {
     pub repo_key: String,
     pub cwd: PathBuf,
     pub running: bool,
+    pub runtime_state: SessionRuntimeState,
+    /// Populated by the last Notification hook (e.g. `permission_prompt`).
+    /// Set to `None` when state transitions away from `WaitingInput`.
+    pub notification_type: Option<String>,
 }
 
 struct SessionHandle {
@@ -53,12 +58,23 @@ struct PendingSpawn {
 
 const PENDING_TTL: Duration = Duration::from_secs(30);
 
+/// Per-session ephemeral UI state (turn + last notification subtype).
+/// Kept in-memory in the supervisor, not persisted — it's reconstructed
+/// from scratch each run via new hook events.
+#[derive(Debug, Default, Clone)]
+struct TurnState {
+    state: SessionRuntimeState,
+    notification_type: Option<String>,
+}
+
 pub struct SessionSupervisor {
     sessions: Mutex<HashMap<SessionId, SessionHandle>>,
     /// Maps the `TETHYS_SPAWN_TOKEN` we set on the PTY env to the
     /// session metadata we need to update once Claude's SessionStart hook
     /// tells us the claude_session_id.
     pending: Mutex<HashMap<String, PendingSpawn>>,
+    /// Per-session turn state. Keyed by Tethys `SessionId`.
+    turn: Mutex<HashMap<SessionId, TurnState>>,
     store: Arc<Store>,
     app: AppHandle,
 }
@@ -68,8 +84,76 @@ impl SessionSupervisor {
         Self {
             sessions: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            turn: Mutex::new(HashMap::new()),
             store,
             app,
+        }
+    }
+
+    fn turn_of(&self, session_id: &str) -> TurnState {
+        self.turn.lock().unwrap().get(session_id).cloned().unwrap_or_default()
+    }
+
+    /// Update a session's turn state + emit `session:turn_changed`.
+    /// No-op if the new state matches the current one (other than forcing
+    /// a notification_type refresh).
+    fn set_turn(
+        &self,
+        session_id: &str,
+        workspace_id: &str,
+        state: SessionRuntimeState,
+        notification_type: Option<String>,
+    ) {
+        let changed = {
+            let mut map = self.turn.lock().unwrap();
+            let current = map.entry(session_id.to_string()).or_default();
+            if current.state == state && current.notification_type == notification_type {
+                false
+            } else {
+                current.state = state;
+                current.notification_type = notification_type.clone();
+                true
+            }
+        };
+        if !changed {
+            return;
+        }
+        let _ = self.app.emit(
+            "session:turn_changed",
+            serde_json::json!({
+                "workspace_id": workspace_id,
+                "session_id": session_id,
+                "runtime_state": state,
+                "notification_type": notification_type,
+            }),
+        );
+    }
+
+    fn clear_turn(&self, session_id: &str, workspace_id: &str) {
+        {
+            let mut map = self.turn.lock().unwrap();
+            map.remove(session_id);
+        }
+        let _ = self.app.emit(
+            "session:turn_changed",
+            serde_json::json!({
+                "workspace_id": workspace_id,
+                "session_id": session_id,
+                "runtime_state": SessionRuntimeState::Dormant,
+                "notification_type": Option::<String>::None,
+            }),
+        );
+    }
+
+    /// Optimistic: called from `send_input` so the UI flips to Working
+    /// immediately without waiting for a hook to confirm Claude woke up.
+    pub fn mark_working(&self, session_id: &str) {
+        let workspace_id = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions.get(session_id).map(|h| h.info.workspace_id.clone())
+        };
+        if let Some(wsid) = workspace_id {
+            self.set_turn(session_id, &wsid, SessionRuntimeState::Working, None);
         }
     }
 
@@ -126,6 +210,8 @@ impl SessionSupervisor {
             repo_key,
             cwd: cwd.to_path_buf(),
             running: true,
+            runtime_state: SessionRuntimeState::Working,
+            notification_type: None,
         };
 
         let ring = Arc::new(Mutex::new(VecDeque::with_capacity(RING_CAPACITY)));
@@ -134,7 +220,13 @@ impl SessionSupervisor {
         let running = Arc::new(Mutex::new(true));
 
         spawn_reader_thread(reader, ring.clone(), subscribers.clone());
-        spawn_child_watcher(child, id.clone(), running.clone(), self.app.clone());
+        spawn_child_watcher(
+            child,
+            id.clone(),
+            workspace_id.clone(),
+            running.clone(),
+            self.app.clone(),
+        );
 
         let handle = SessionHandle {
             info: info.clone(),
@@ -145,7 +237,16 @@ impl SessionSupervisor {
             running,
         };
 
-        self.sessions.lock().unwrap().insert(id, handle);
+        self.sessions.lock().unwrap().insert(id.clone(), handle);
+        // Default to Working — a just-spawned Claude is doing something
+        // (starting up, replaying transcript). Hooks will refine shortly.
+        self.turn.lock().unwrap().insert(
+            id,
+            TurnState {
+                state: SessionRuntimeState::Working,
+                notification_type: None,
+            },
+        );
         let _ = self.app.emit(
             "session:changed",
             serde_json::json!({ "workspace_id": workspace_id }),
@@ -198,16 +299,79 @@ impl SessionSupervisor {
         Ok((info, token))
     }
 
-    /// Dispatch a hook event from `tethys-hook`. For M5 we only act on
-    /// `session-start`; `stop` / `notify` are logged and wired up in M6.
+    /// Dispatch a hook event from `tethys-hook`. Currently handles
+    /// SessionStart (correlation), Stop (turn → Idle), and Notification
+    /// (turn → WaitingInput).
     pub async fn handle_hook_event(&self, msg: HookMessage) {
         match msg.event.as_str() {
             "session-start" => self.handle_session_start(msg).await,
-            "stop" | "notify" => {
-                debug!(event = %msg.event, "hook event (M5 ignore)");
-            }
+            "stop" => self.handle_stop(msg).await,
+            "notify" => self.handle_notify(msg).await,
             other => debug!(event = %other, "unknown hook event"),
         }
+    }
+
+    async fn handle_stop(&self, msg: HookMessage) {
+        let Some(csid) = msg.session_id.as_deref() else {
+            return;
+        };
+        self.set_turn_by_claude_sid(csid, SessionRuntimeState::Idle, None)
+            .await;
+    }
+
+    async fn handle_notify(&self, msg: HookMessage) {
+        let Some(csid) = msg.session_id.as_deref() else {
+            return;
+        };
+        // auth_success / elicitation_dialog don't represent a turn flip —
+        // just log and bail. permission_prompt / idle_prompt both put the
+        // session into WaitingInput; the notification_type is carried on
+        // so the UI can render permission prompts more urgently.
+        let state = match msg.notification_type.as_deref() {
+            Some("permission_prompt") | Some("idle_prompt") => {
+                SessionRuntimeState::WaitingInput
+            }
+            other => {
+                debug!(
+                    notification_type = ?other,
+                    "ignoring Notification hook (non-turn event)"
+                );
+                return;
+            }
+        };
+        self.set_turn_by_claude_sid(csid, state, msg.notification_type.clone())
+            .await;
+    }
+
+    /// Find the Tethys session id that corresponds to a given Claude
+    /// session_id and flip its turn state.
+    async fn set_turn_by_claude_sid(
+        &self,
+        claude_session_id: &str,
+        state: SessionRuntimeState,
+        notification_type: Option<String>,
+    ) {
+        let lookup = self
+            .store
+            .read(|s| {
+                for ws in &s.workspaces {
+                    for sess in &ws.sessions {
+                        if sess.claude_session_id.as_deref() == Some(claude_session_id) {
+                            return Some((ws.id.clone(), sess.id.clone()));
+                        }
+                    }
+                }
+                None
+            })
+            .await;
+        let Some((ws_id, sess_id)) = lookup else {
+            debug!(
+                claude_session_id,
+                "hook for unknown Claude session (not a Tethys-spawned one)"
+            );
+            return;
+        };
+        self.set_turn(&sess_id, &ws_id, state, notification_type);
     }
 
     async fn handle_session_start(&self, msg: HookMessage) {
@@ -323,6 +487,7 @@ impl SessionSupervisor {
     }
 
     pub fn list_for_workspace(&self, workspace_id: &str) -> Vec<SessionInfo> {
+        let turn_map = self.turn.lock().unwrap().clone();
         let sessions = self.sessions.lock().unwrap();
         sessions
             .values()
@@ -330,6 +495,9 @@ impl SessionSupervisor {
             .map(|h| {
                 let mut info = h.info.clone();
                 info.running = *h.running.lock().unwrap();
+                let turn = turn_map.get(&h.info.id).cloned().unwrap_or_default();
+                info.runtime_state = turn.state;
+                info.notification_type = turn.notification_type;
                 info
             })
             .collect()
@@ -388,6 +556,7 @@ fn append_to_ring(ring: &Arc<Mutex<VecDeque<u8>>>, data: &[u8]) {
 fn spawn_child_watcher(
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
     session_id: SessionId,
+    workspace_id: String,
     running: Arc<Mutex<bool>>,
     app: AppHandle,
 ) {
@@ -399,6 +568,17 @@ fn spawn_child_watcher(
         let _ = app.emit(
             "session:exit",
             serde_json::json!({ "session_id": session_id, "code": code }),
+        );
+        // Turn state is stale once the PTY is gone — emit a Dormant
+        // transition so the UI doesn't keep showing Working indefinitely.
+        let _ = app.emit(
+            "session:turn_changed",
+            serde_json::json!({
+                "workspace_id": workspace_id,
+                "session_id": session_id,
+                "runtime_state": SessionRuntimeState::Dormant,
+                "notification_type": Option::<String>::None,
+            }),
         );
     });
 }

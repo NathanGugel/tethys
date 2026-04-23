@@ -8,6 +8,8 @@ import type {
   RegistryStatus,
   Repo,
   SessionInfo,
+  SessionRuntimeState,
+  TurnChangedEvent,
   Workspace,
   WorkspaceId,
 } from "./types";
@@ -30,6 +32,51 @@ function App() {
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [runningJob, setRunningJob] = useState<RunningJob | null>(null);
+  /**
+   * Per-session turn state tracked by listening to `session:turn_changed`
+   * globally. Used for the sidebar attention dot without needing to
+   * fetch sessions for every workspace.
+   */
+  const [turnStates, setTurnStates] = useState<
+    Map<string, { workspaceId: string; state: SessionRuntimeState }>
+  >(new Map());
+
+  useEffect(() => {
+    const unlisten = listen<TurnChangedEvent>(
+      "session:turn_changed",
+      (event) => {
+        const { workspace_id, session_id, runtime_state } = event.payload;
+        setTurnStates((prev) => {
+          const next = new Map(prev);
+          if (runtime_state === "dormant") {
+            next.delete(session_id);
+          } else {
+            next.set(session_id, {
+              workspaceId: workspace_id,
+              state: runtime_state,
+            });
+          }
+          return next;
+        });
+      },
+    );
+    return () => {
+      unlisten.then((un) => un());
+    };
+  }, []);
+
+  const workspaceNeedsAttention = useCallback(
+    (w: Workspace): boolean => {
+      if (w.paused) return false;
+      for (const info of turnStates.values()) {
+        if (info.workspaceId === w.id && info.state === "waiting_input") {
+          return true;
+        }
+      }
+      return false;
+    },
+    [turnStates],
+  );
 
   const refresh = useCallback(async () => {
     try {
@@ -88,6 +135,13 @@ function App() {
               onClick={() => setSelectedId(w.id)}
             >
               <div className="workspace-name">
+                {workspaceNeedsAttention(w) && (
+                  <span
+                    className="attention-dot"
+                    title="A session is waiting for your input"
+                    aria-label="attention needed"
+                  />
+                )}
                 {w.branch}
                 {w.paused && <span className="paused-badge">paused</span>}
               </div>
@@ -384,9 +438,29 @@ function WorkspaceDetail({
     refreshSessions();
     const sc = listen("session:changed", () => refreshSessions());
     const sx = listen("session:exit", () => refreshSessions());
+    const st = listen<TurnChangedEvent>(
+      "session:turn_changed",
+      (event) => {
+        const { session_id, runtime_state, notification_type } = event.payload;
+        // Merge into the session list locally — avoids a full re-fetch
+        // round-trip on every hook event.
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === session_id
+              ? {
+                  ...s,
+                  runtime_state,
+                  notification_type: notification_type ?? null,
+                }
+              : s,
+          ),
+        );
+      },
+    );
     return () => {
       sc.then((un) => un());
       sx.then((un) => un());
+      st.then((un) => un());
     };
   }, [refreshSessions]);
 
@@ -466,9 +540,8 @@ function WorkspaceDetail({
           Overview
         </button>
         {workspace.repo_links.map((r) => {
-          const hasLive = (sessionsByRepo.get(r.repo_key) ?? []).some(
-            (s) => s.running,
-          );
+          const repoSessions = sessionsByRepo.get(r.repo_key) ?? [];
+          const dotState = repoDotState(repoSessions);
           return (
             <button
               key={r.repo_key}
@@ -479,7 +552,7 @@ function WorkspaceDetail({
               onClick={() => setTab(r.repo_key)}
             >
               <span>{r.repo_key}</span>
-              {hasLive && <span className="tab-dot" />}
+              {dotState && <span className={`tab-dot dot-${dotState}`} />}
             </button>
           );
         })}
@@ -630,17 +703,27 @@ function RepoSessionPane({
           const label = m.claude_session_id
             ? m.claude_session_id.slice(0, 8)
             : "pending";
+          const dotState =
+            live?.running && live.runtime_state !== "dormant"
+              ? live.runtime_state
+              : null;
+          const urgent = live?.notification_type === "permission_prompt";
           return (
             <button
               key={m.id}
               type="button"
               className={`session-chip${
                 effectiveSelected === m.id ? " active" : ""
-              }`}
+              }${urgent ? " urgent" : ""}`}
               onClick={() => setSelectedId(m.id)}
+              title={
+                live?.notification_type
+                  ? `notification: ${live.notification_type}`
+                  : undefined
+              }
             >
               <code>{label}</code>
-              {live?.running && <span className="tab-dot" />}
+              {dotState && <span className={`tab-dot dot-${dotState}`} />}
               {live && !live.running && (
                 <span className="chip-state">exited</span>
               )}
@@ -838,6 +921,27 @@ function ConfirmDialog({
 
 function Spinner() {
   return <span className="spinner" aria-hidden="true" />;
+}
+
+/**
+ * Pick a single state to represent a group of sessions for a repo tab dot.
+ * Priority: waiting_input > working > idle > dormant. Null means "no dot".
+ */
+function repoDotState(sessions: SessionInfo[]): SessionRuntimeState | null {
+  let best: SessionRuntimeState | null = null;
+  const rank: Record<SessionRuntimeState, number> = {
+    waiting_input: 3,
+    working: 2,
+    idle: 1,
+    dormant: 0,
+  };
+  for (const s of sessions) {
+    if (!best || rank[s.runtime_state] > rank[best]) {
+      best = s.runtime_state;
+    }
+  }
+  // No dot for Dormant-only repos (nothing live happening).
+  return best === "dormant" || best === null ? null : best;
 }
 
 export default App;

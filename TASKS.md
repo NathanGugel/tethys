@@ -118,21 +118,14 @@ Legend: `- [ ]` open · `- [x]` done.
 
 **Ships:** the core feature — workspaces flag themselves when it's your turn. Pause silences the flag until you revive.
 
-- [ ] `Stop` hook handler: set session state to `Idle`, bump `last_turn_change_at`, emit `session:turn_changed`.
-- [ ] `Notification` hook handler:
-  - [ ] `permission_prompt` → state `WaitingInput` + `notification_type = permission_prompt` (shown distinctly in UI — "needs permission" vs plain "idle").
-  - [ ] `idle_prompt` → state `WaitingInput`.
-  - [ ] `auth_success`, `elicitation_dialog` → log for now; surface later if needed.
-- [ ] Optimistic "working" state: on `send_input`, immediately flip state to `Working` so the UI is responsive without waiting for the next hook fire.
-- [ ] UI indicators:
-  - [ ] Session tab badge (color-coded dot).
-  - [ ] Workspace row badge (rolled up from sessions).
-  - [ ] App dock / menubar badge for total attention-needed count across all workspaces.
-- [ ] `pause_workspace` / `resume_workspace` semantics (MVP):
-  - [ ] Paused workspaces don't contribute to dock badge.
-  - [ ] Paused workspaces don't trigger OS notifications.
-  - [ ] Internal state still updates; unpause immediately reflects current truth.
-- [ ] OS notification on transition to `WaitingInput` (unless paused). Click notification → focus the session tab.
+- [x] `Stop` hook handler: set session state to `Idle`, emit `session:turn_changed`.
+- [x] `Notification` hook handler: `permission_prompt` / `idle_prompt` → `WaitingInput` (carrying `notification_type` so UI can mark permission prompts urgent). `auth_success` / `elicitation_dialog` logged and ignored.
+- [x] Optimistic "working" on `send_input` so the UI reacts on keystroke, not on next hook.
+- [x] Session chip dot color-coded by runtime state; repo tab aggregates to the most-urgent state across its sessions.
+- [x] Workspace row badge in sidebar (amber dot) when any session is `WaitingInput` and the workspace isn't paused.
+- [x] Pause semantics: paused workspaces suppress the sidebar attention dot; internal state keeps updating so unpause shows current truth.
+- [ ] App dock / menubar badge with total attention count. (Deferred.)
+- [ ] OS notification on transition to `WaitingInput`. (Deferred — needs Tauri notification plugin wiring.)
 
 **Verify:** start Claude in two workspaces, ask one a question, wait for it to ask back — that workspace lights up, the other stays calm.
 

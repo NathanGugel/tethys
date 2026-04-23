@@ -56,11 +56,15 @@ pub struct ClaudeSessionMeta {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionRuntimeState {
+    /// PTY not running (session has never been spawned, or was spawned and exited).
     #[default]
     Dormant,
+    /// PTY running and actively processing (Claude is thinking, or user just typed).
     Working,
-    WaitingInput,
+    /// Claude finished responding, no explicit input prompt up — default "nothing pending" state.
     Idle,
+    /// Claude is blocked on user input — either the main prompt or a permission dialog.
+    WaitingInput,
 }
 
 impl AppState {

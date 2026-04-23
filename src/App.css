@@ -529,6 +529,41 @@ button.danger.primary:hover:not(:disabled) {
   display: inline-block;
 }
 
+/*
+ * Turn-state colors:
+ *   working       — green, Claude is actively doing something
+ *   idle          — muted, Claude finished a response, no explicit prompt
+ *   waiting_input — amber, Claude wants input now
+ */
+.tab-dot.dot-working {
+  background: #2ea043;
+}
+
+.tab-dot.dot-idle {
+  background: #7a8699;
+}
+
+.tab-dot.dot-waiting_input {
+  background: #e2b23a;
+  box-shadow: 0 0 0 2px rgba(226, 178, 58, 0.25);
+}
+
+.attention-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #e2b23a;
+  box-shadow: 0 0 0 2px rgba(226, 178, 58, 0.3);
+  margin-right: 4px;
+  vertical-align: 1px;
+}
+
+.session-chip.urgent {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 1px rgba(192, 57, 43, 0.3);
+}
+
 .session-pane {
   display: flex;
   flex-direction: column;
