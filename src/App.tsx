@@ -411,10 +411,12 @@ function WorkspaceDetail({
     });
   };
 
-  // First session per repo (M4 UX is one session per repo at a time).
-  const sessionByRepo = new Map<string, SessionInfo>();
+  // All live sessions grouped by repo.
+  const sessionsByRepo = new Map<string, SessionInfo[]>();
   for (const s of sessions) {
-    if (!sessionByRepo.has(s.repo_key)) sessionByRepo.set(s.repo_key, s);
+    const arr = sessionsByRepo.get(s.repo_key) ?? [];
+    arr.push(s);
+    sessionsByRepo.set(s.repo_key, arr);
   }
 
   return (
@@ -464,7 +466,9 @@ function WorkspaceDetail({
           Overview
         </button>
         {workspace.repo_links.map((r) => {
-          const active = sessionByRepo.has(r.repo_key);
+          const hasLive = (sessionsByRepo.get(r.repo_key) ?? []).some(
+            (s) => s.running,
+          );
           return (
             <button
               key={r.repo_key}
@@ -475,7 +479,7 @@ function WorkspaceDetail({
               onClick={() => setTab(r.repo_key)}
             >
               <span>{r.repo_key}</span>
-              {active && <span className="tab-dot" />}
+              {hasLive && <span className="tab-dot" />}
             </button>
           );
         })}
@@ -514,9 +518,9 @@ function WorkspaceDetail({
         tab === r.repo_key ? (
           <RepoSessionPane
             key={r.repo_key}
-            workspaceId={workspace.id}
+            workspace={workspace}
             repoKey={r.repo_key}
-            session={sessionByRepo.get(r.repo_key) ?? null}
+            liveSessions={sessionsByRepo.get(r.repo_key) ?? []}
             onStarted={refreshSessions}
           />
         ) : null,
@@ -526,68 +530,177 @@ function WorkspaceDetail({
 }
 
 function RepoSessionPane({
-  workspaceId,
+  workspace,
   repoKey,
-  session,
+  liveSessions,
   onStarted,
 }: {
-  workspaceId: string;
+  workspace: Workspace;
   repoKey: string;
-  session: SessionInfo | null;
+  liveSessions: SessionInfo[];
   onStarted: () => void;
 }) {
-  const [starting, setStarting] = useState(false);
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
 
-  const start = async () => {
-    setStarting(true);
+  const metas = workspace.sessions.filter((s) => s.repo_key === repoKey);
+  // Newest first — users care about recent conversations.
+  const ordered = [...metas].reverse();
+  const liveById = new Map(liveSessions.map((s) => [s.id, s]));
+
+  // Effective selection: user's explicit pick if still valid; otherwise
+  // default to the first live session, or the first entry.
+  const effectiveSelected = (() => {
+    if (selectedId && ordered.some((m) => m.id === selectedId))
+      return selectedId;
+    const firstLive = ordered.find((m) => liveById.has(m.id));
+    return firstLive?.id ?? ordered[0]?.id ?? null;
+  })();
+
+  const startFresh = async () => {
+    setBusy(true);
     setError(null);
     try {
-      await invoke("start_session", {
-        args: { workspace_id: workspaceId, repo_key: repoKey },
+      const res = await invoke<SessionInfo>("start_claude_session", {
+        args: { workspace_id: workspace.id, repo_key: repoKey },
       });
+      setSelectedId(res.id);
       onStarted();
     } catch (e) {
       setError(String(e));
     } finally {
-      setStarting(false);
+      setBusy(false);
     }
   };
 
-  if (session) {
+  const resumeMeta = async (metaId: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await invoke<SessionInfo>("resume_claude_session", {
+        args: {
+          workspace_id: workspace.id,
+          repo_key: repoKey,
+          session_meta_id: metaId,
+        },
+      });
+      setSelectedId(res.id);
+      onStarted();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (ordered.length === 0) {
     return (
-      <div className="session-pane">
-        {!session.running && (
-          <div className="session-exit-banner">
-            Session exited. Scrollback preserved below. Start a new one via the
-            button.
-            <button
-              type="button"
-              onClick={start}
-              disabled={starting}
-              style={{ marginLeft: 12 }}
-            >
-              New shell
-            </button>
-          </div>
-        )}
-        <SessionTerminal sessionId={session.id} />
+      <div className="session-pane empty">
+        <p className="muted">No Claude session in this worktree yet.</p>
+        <button
+          type="button"
+          className="primary"
+          onClick={startFresh}
+          disabled={busy}
+        >
+          {busy ? (
+            <>
+              <Spinner /> Starting…
+            </>
+          ) : (
+            <>
+              Start Claude in <code>{repoKey}</code>
+            </>
+          )}
+        </button>
+        {error && <div className="error-banner">{error}</div>}
       </div>
     );
   }
 
+  const selected = ordered.find((m) => m.id === effectiveSelected) ?? null;
+  const selectedLive = selected ? liveById.get(selected.id) ?? null : null;
+
   return (
-    <div className="session-pane empty">
-      <p className="muted">No session in this worktree yet.</p>
-      <button
-        type="button"
-        className="primary"
-        onClick={start}
-        disabled={starting}
-      >
-        Start shell in <code>{repoKey}</code>
-      </button>
+    <div className="session-pane">
+      <div className="session-chip-bar">
+        {ordered.map((m) => {
+          const live = liveById.get(m.id);
+          const label = m.claude_session_id
+            ? m.claude_session_id.slice(0, 8)
+            : "pending";
+          return (
+            <button
+              key={m.id}
+              type="button"
+              className={`session-chip${
+                effectiveSelected === m.id ? " active" : ""
+              }`}
+              onClick={() => setSelectedId(m.id)}
+            >
+              <code>{label}</code>
+              {live?.running && <span className="tab-dot" />}
+              {live && !live.running && (
+                <span className="chip-state">exited</span>
+              )}
+              {!live && <span className="chip-state">dormant</span>}
+            </button>
+          );
+        })}
+        <button
+          type="button"
+          className="session-chip new"
+          onClick={startFresh}
+          disabled={busy}
+          title="Start a new Claude session in this worktree"
+        >
+          {busy ? <Spinner /> : "+"} New
+        </button>
+      </div>
+
       {error && <div className="error-banner">{error}</div>}
+
+      {selected &&
+        (selectedLive ? (
+          <>
+            {!selectedLive.running && (
+              <div className="session-exit-banner">
+                Claude exited. Scrollback preserved below.
+              </div>
+            )}
+            <SessionTerminal sessionId={selectedLive.id} />
+          </>
+        ) : (
+          <div className="session-dormant">
+            <p>
+              This Claude session is dormant. Resume re-opens the conversation
+              with <code>claude --resume</code>.
+            </p>
+            {selected.claude_session_id ? (
+              <button
+                type="button"
+                className="primary"
+                onClick={() => resumeMeta(selected.id)}
+                disabled={busy}
+              >
+                {busy ? (
+                  <>
+                    <Spinner /> Resuming…
+                  </>
+                ) : (
+                  "Resume"
+                )}
+              </button>
+            ) : (
+              <p className="muted">
+                No <code>claude_session_id</code> was captured for this
+                session — can't resume. (If you just started it, wait a
+                second for the SessionStart hook.)
+              </p>
+            )}
+          </div>
+        ))}
     </div>
   );
 }

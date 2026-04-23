@@ -580,6 +580,67 @@ button.danger.primary:hover:not(:disabled) {
   align-items: center;
 }
 
+.session-chip-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 0 8px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 8px;
+}
+
+.session-chip {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.session-chip:hover:not(:disabled) {
+  background: rgba(125, 125, 125, 0.08);
+  color: var(--fg);
+}
+
+.session-chip.active {
+  background: var(--selected-bg);
+  border-color: var(--accent);
+  color: var(--fg);
+}
+
+.session-chip code {
+  font-size: 11px;
+  padding: 0;
+  background: transparent;
+}
+
+.session-chip.new {
+  border-style: dashed;
+}
+
+.chip-state {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.session-dormant {
+  padding: 20px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.session-dormant p {
+  margin: 0;
+}
+
 .registry-notice h2 {
   margin: 0 0 8px;
   font-size: 16px;

@@ -17,7 +17,7 @@ use crate::reconcile::{self, Discrepancies};
 use crate::registry::{starter_template, RegistryLoad, Repo};
 use crate::sessions::{SessionInfo, SessionSupervisor};
 use crate::setup;
-use crate::state::{new_workspace_id, RepoLink, Workspace, WorkspaceId};
+use crate::state::{new_workspace_id, ClaudeSessionMeta, RepoLink, Workspace, WorkspaceId};
 use crate::store::Store;
 
 #[tauri::command]
@@ -386,27 +386,90 @@ pub fn list_sessions(
 }
 
 #[derive(Debug, serde::Deserialize)]
-pub struct StartSessionArgs {
+pub struct StartClaudeArgs {
     pub workspace_id: WorkspaceId,
     pub repo_key: String,
 }
 
+/// Spawn a fresh `claude` session in the given workspace/repo worktree.
+/// Also writes a `ClaudeSessionMeta` into state with `claude_session_id`
+/// left as `None` — it gets filled in by the `SessionStart` hook.
 #[tauri::command]
-pub async fn start_session(
+pub async fn start_claude_session(
+    app: AppHandle,
     supervisor: State<'_, Arc<SessionSupervisor>>,
     store: State<'_, Arc<Store>>,
-    args: StartSessionArgs,
+    claude_bin: State<'_, ClaudeBin>,
+    args: StartClaudeArgs,
 ) -> AppResult<SessionInfo> {
-    // Look up the worktree path for this workspace + repo from state.
+    spawn_claude(&app, &supervisor, &store, &claude_bin, &args, None).await
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ResumeClaudeArgs {
+    pub workspace_id: WorkspaceId,
+    pub repo_key: String,
+    /// The `id` field from an existing `ClaudeSessionMeta` — its
+    /// `claude_session_id` will be passed to `claude --resume`.
+    pub session_meta_id: String,
+}
+
+#[tauri::command]
+pub async fn resume_claude_session(
+    app: AppHandle,
+    supervisor: State<'_, Arc<SessionSupervisor>>,
+    store: State<'_, Arc<Store>>,
+    claude_bin: State<'_, ClaudeBin>,
+    args: ResumeClaudeArgs,
+) -> AppResult<SessionInfo> {
+    // Pull claude_session_id + cwd from the ClaudeSessionMeta we already
+    // persisted on the previous run.
+    let claude_sid = store
+        .read(|s| {
+            s.find_workspace(&args.workspace_id).and_then(|w| {
+                w.sessions
+                    .iter()
+                    .find(|sess| sess.id == args.session_meta_id)
+                    .map(|sess| sess.claude_session_id.clone())
+            })
+        })
+        .await
+        .ok_or_else(|| {
+            AppError::Other(format!(
+                "no session {} in workspace {}",
+                args.session_meta_id, args.workspace_id
+            ))
+        })?;
+
+    let claude_sid = claude_sid.ok_or_else(|| {
+        AppError::Other(
+            "session has no claude_session_id yet — resume not possible".into(),
+        )
+    })?;
+
+    let start = StartClaudeArgs {
+        workspace_id: args.workspace_id,
+        repo_key: args.repo_key,
+    };
+    spawn_claude(&app, &supervisor, &store, &claude_bin, &start, Some(&claude_sid)).await
+}
+
+async fn spawn_claude(
+    app: &AppHandle,
+    supervisor: &Arc<SessionSupervisor>,
+    store: &Arc<Store>,
+    claude_bin: &ClaudeBin,
+    args: &StartClaudeArgs,
+    resume_claude_sid: Option<&str>,
+) -> AppResult<SessionInfo> {
     let worktree_path = store
         .read(|s| {
-            s.find_workspace(&args.workspace_id)
-                .and_then(|w| {
-                    w.repo_links
-                        .iter()
-                        .find(|r| r.repo_key == args.repo_key)
-                        .map(|r| r.worktree_path.clone())
-                })
+            s.find_workspace(&args.workspace_id).and_then(|w| {
+                w.repo_links
+                    .iter()
+                    .find(|r| r.repo_key == args.repo_key)
+                    .map(|r| r.worktree_path.clone())
+            })
         })
         .await
         .ok_or_else(|| {
@@ -416,11 +479,54 @@ pub async fn start_session(
             ))
         })?;
 
-    // M4: spawn the user's login shell. M5 will swap this for `claude`.
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let (info, _token) = supervisor.spawn_claude(
+        args.workspace_id.clone(),
+        args.repo_key.clone(),
+        &worktree_path,
+        &claude_bin.0,
+        resume_claude_sid,
+    )?;
 
-    supervisor.spawn(args.workspace_id, args.repo_key, &worktree_path, &shell)
+    // Persist a ClaudeSessionMeta entry so resume works across restarts.
+    // claude_session_id is filled in by the SessionStart hook once it
+    // arrives. We key on the Tethys-internal `id` (== SessionSupervisor id)
+    // so the UI and supervisor use a shared identifier.
+    let meta = ClaudeSessionMeta {
+        id: info.id.clone(),
+        repo_key: args.repo_key.clone(),
+        cwd: worktree_path.clone(),
+        claude_session_id: None,
+        transcript_path: None,
+        pid: None,
+        runtime_state: Default::default(),
+        last_turn_change_at: None,
+    };
+
+    store
+        .mutate(|s| {
+            let ws = s
+                .find_workspace_mut(&args.workspace_id)
+                .ok_or_else(|| AppError::WorkspaceNotFound(args.workspace_id.clone()))?;
+            // Resuming? Drop the prior meta for this Claude conversation so
+            // we don't accumulate dormant duplicates with the same
+            // claude_session_id across runs.
+            if let Some(csid) = resume_claude_sid {
+                ws.sessions
+                    .retain(|m| m.claude_session_id.as_deref() != Some(csid));
+            }
+            // Defensive: no dupes of the new tethys id either.
+            ws.sessions.retain(|m| m.id != meta.id);
+            ws.sessions.push(meta);
+            Ok(())
+        })
+        .await?;
+
+    emit_workspace_changed(app, &args.workspace_id);
+    Ok(info)
 }
+
+/// Newtype so `claude_bin` can be managed in Tauri state.
+pub struct ClaudeBin(pub std::path::PathBuf);
 
 /// Subscribe to live PTY bytes and return the current scrollback. The
 /// channel carries raw bytes via `InvokeResponseBody::Raw` — no JSON
