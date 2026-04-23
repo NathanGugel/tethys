@@ -6,14 +6,7 @@ Desktop app for managing multiple Claude Code CLI sessions in parallel across gi
 
 ## Stack
 
-Tauri 2.x shell · Rust core (`src-tauri/`) · React + TypeScript frontend (`src/`) · xterm.js (canvas addon) for terminal rendering · `portable-pty` for PTY spawning · JSON file persistence (no SQLite).
-
-## Authoritative docs
-
-- **`PLAN.md`** — architectural decisions, data model, IPC contract, subsystem designs. Update it when you change architecture.
-- **`TASKS.md`** — milestone-scoped checkbox list. Tick boxes as work ships; add to the "Deferred" section if you punt something.
-
-Both files already reflect past conversations — don't re-open decisions they've settled without flagging it first.
+Tauri 2.x shell · Rust core (`src-tauri/`) · React + TypeScript frontend (`src/`) · xterm.js (DOM renderer) for terminal rendering · `portable-pty` for PTY spawning · JSON file persistence (no SQLite) · `tethys-hook` companion binary (`crates/tethys-hook/`) that forwards Claude Code hooks over a Unix socket.
 
 ## Running
 
@@ -21,4 +14,6 @@ Both files already reflect past conversations — don't re-open decisions they'v
 pnpm tauri dev
 ```
 
-State lives at `~/Library/Application Support/app.tethys.dev/` (`state.json`, `logs/`, `repos.toml`, auto-generated `repos.schema.json`).
+State lives at `~/Library/Application Support/app.tethys.dev/` (`state.json`, `logs/`, `repos.toml`, auto-generated `repos.schema.json`, `hook.sock`).
+
+Tethys writes its hook entries into `~/.claude/settings.json` on every boot (keyed by `description: "Tethys session monitor"`). They're idempotent — safe to leave across reinstalls.
