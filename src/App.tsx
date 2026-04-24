@@ -18,6 +18,7 @@ import { GithubChip } from "./GithubChip";
 import { JobLogPane } from "./JobLogPane";
 import { SessionTerminal } from "./SessionTerminal";
 import { applyTheme, ThemeContext } from "./theme";
+import { useBackendJob, type JobDescriptor } from "./useBackendJob";
 import { useTauriEvent } from "./useTauriEvent";
 import { isReadyToArchive } from "./workspaceDerived";
 import "./App.css";
@@ -191,6 +192,53 @@ function App() {
     [workspaces, selectedId],
   );
 
+  const createDescriptor = useMemo<JobDescriptor | null>(
+    () =>
+      pendingCreate
+        ? {
+            key: pendingCreate.tempId,
+            command: "create_workspace",
+            args: { args: pendingCreate.args },
+          }
+        : null,
+    [pendingCreate],
+  );
+  const { events: createEvents, state: createState } = useBackendJob(
+    createDescriptor,
+    {
+      onSuccess: async (_key, result) => {
+        const ws = result as Workspace;
+        // Refresh before swapping selection so WorkspaceDetail has the
+        // workspace available when the pending pane unmounts.
+        await refresh();
+        setSelectedId(ws.id);
+        setPendingCreate(null);
+      },
+    },
+  );
+
+  const deleteDescriptor = useMemo<JobDescriptor | null>(
+    () =>
+      pendingDelete
+        ? {
+            key: pendingDelete.workspaceId,
+            command: "delete_workspace",
+            args: { id: pendingDelete.workspaceId },
+          }
+        : null,
+    [pendingDelete],
+  );
+  const { events: deleteEvents, state: deleteState } = useBackendJob(
+    deleteDescriptor,
+    {
+      onSuccess: () => {
+        setPendingDelete(null);
+        setSelectedId(null);
+        refresh();
+      },
+    },
+  );
+
   const registryOk = registry?.kind === "ok";
 
   return (
@@ -301,16 +349,8 @@ function App() {
         {pendingCreate && selectedId === pendingCreate.tempId ? (
           <JobLogPane
             title={`Creating ${pendingCreate.branch}`}
-            command="create_workspace"
-            args={{ args: pendingCreate.args }}
-            onSuccess={async (result) => {
-              const ws = result as Workspace;
-              // Refresh before swapping selection so WorkspaceDetail has
-              // the workspace available when the pending pane unmounts.
-              await refresh();
-              setSelectedId(ws.id);
-              setPendingCreate(null);
-            }}
+            events={createEvents}
+            state={createState}
             onDismiss={() => {
               setPendingCreate(null);
               setSelectedId(null);
@@ -321,13 +361,8 @@ function App() {
           selected.id === pendingDelete.workspaceId ? (
           <JobLogPane
             title={`Deleting ${pendingDelete.branch}`}
-            command="delete_workspace"
-            args={{ id: pendingDelete.workspaceId }}
-            onSuccess={() => {
-              setPendingDelete(null);
-              setSelectedId(null);
-              refresh();
-            }}
+            events={deleteEvents}
+            state={deleteState}
             onDismiss={() => {
               setPendingDelete(null);
               refresh();

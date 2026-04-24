@@ -1,71 +1,23 @@
-import { useEffect, useRef, useState } from "react";
-import { Channel, invoke } from "@tauri-apps/api/core";
+import { useEffect, useRef } from "react";
 
 import type { JobEvent } from "./types";
+import type { JobState } from "./useBackendJob";
 
 interface Props {
   title: string;
-  command: string;
-  /**
-   * Arguments object for `invoke(command, args)`. An `onEvent` channel is
-   * added automatically — callers should not pre-set it.
-   */
-  args: Record<string, unknown>;
-  /** Fired once the backend resolves successfully. */
-  onSuccess?: (result: unknown) => void;
+  events: JobEvent[];
+  state: JobState;
   /** User-initiated dismiss — only enabled after the job settles. */
   onDismiss: () => void;
 }
 
-type JobState = "running" | "success" | "failed";
-
 /**
- * Inline pane for a streaming backend job (create / delete workspace). Renders
- * the same log stream as the old JobLogModal but without the modal chrome so
- * it can live inside a workspace detail pane or in place of one.
+ * Presentational pane for a streaming backend job (create / delete
+ * workspace). The job itself is driven by `useBackendJob` so that
+ * mount/unmount of this pane cannot start or cancel the underlying work.
  */
-export function JobLogPane({
-  title,
-  command,
-  args,
-  onSuccess,
-  onDismiss,
-}: Props) {
-  const [events, setEvents] = useState<JobEvent[]>([]);
-  const [state, setState] = useState<JobState>("running");
-  const startedRef = useRef(false);
+export function JobLogPane({ title, events, state, onDismiss }: Props) {
   const logRef = useRef<HTMLDivElement | null>(null);
-  const resultRef = useRef<unknown>(null);
-  const onSuccessRef = useRef(onSuccess);
-  onSuccessRef.current = onSuccess;
-
-  useEffect(() => {
-    if (startedRef.current) return;
-    startedRef.current = true;
-
-    const channel = new Channel<JobEvent>();
-    channel.onmessage = (event) => {
-      setEvents((prev) => [...prev, event]);
-      if (event.kind === "success") setState("success");
-      else if (event.kind === "failed") setState("failed");
-    };
-
-    invoke(command, { ...args, onEvent: channel })
-      .then((res) => {
-        resultRef.current = res;
-        setState((s) => (s === "running" ? "success" : s));
-        onSuccessRef.current?.(res);
-      })
-      .catch((e) => {
-        setEvents((prev) => {
-          const last = prev[prev.length - 1];
-          if (last?.kind === "failed") return prev;
-          return [...prev, { kind: "failed", error: String(e) }];
-        });
-        setState((s) => (s === "running" ? "failed" : s));
-      });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   useEffect(() => {
     const el = logRef.current;
