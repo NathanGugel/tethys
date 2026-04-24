@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { ClipboardAddon } from "@xterm/addon-clipboard";
@@ -12,6 +13,15 @@ const DEFAULT_XTERM_THEME = {
   background: "#0a0a0a",
   foreground: "#e8e8e8",
 };
+
+/**
+ * Backslash-escape spaces in a filesystem path. Matches iTerm2's drop
+ * format inside a bracketed paste — Claude Code unescapes `\ ` and resolves
+ * the path, which triggers the `[Image #N]` attachment flow for images.
+ */
+function escapeDroppedPath(p: string): string {
+  return p.replace(/([\\ ])/g, "\\$1");
+}
 
 interface Props {
   sessionId: string;
@@ -90,6 +100,7 @@ export function SessionTerminal({ sessionId }: Props) {
     // has known issues on macOS. DOM is plenty fast for interactive shells.
     term.open(container);
     fit.fit();
+    term.focus();
 
     // macOS-friendly keybindings over and above xterm's defaults.
     // Returning false suppresses xterm's default dispatch for that key;
@@ -188,11 +199,49 @@ export function SessionTerminal({ sessionId }: Props) {
     });
     ro.observe(container);
 
+    // Drag files from Finder onto the window → paste escaped paths into the
+    // active session, like iTerm2. Wrapped in bracketed-paste markers
+    // (`\x1b[200~…\x1b[201~`) so Claude Code recognizes it as a paste and
+    // runs its path-→-image attachment flow, producing `[Image #N]` for
+    // images. The event is window-wide; only one SessionTerminal mounts at
+    // a time, so no per-pane gating is needed.
+    let dragUnlisten: (() => void) | null = null;
+    let dragDisposed = false;
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        if (event.payload.type !== "drop") return;
+        if (event.payload.paths.length === 0) return;
+        const inner =
+          event.payload.paths.map(escapeDroppedPath).join(" ") + " ";
+        const text = `\x1b[200~${inner}\x1b[201~`;
+        const bytes = Array.from(new TextEncoder().encode(text));
+        invoke("send_input", { sessionId, data: bytes }).catch((e) => {
+          console.error("send_input (drag-drop) failed:", e);
+        });
+        term.focus();
+      })
+      .then((fn) => {
+        if (dragDisposed) {
+          try {
+            fn();
+          } catch {}
+        } else {
+          dragUnlisten = fn;
+        }
+      })
+      .catch((e) => {
+        console.error("onDragDropEvent subscribe failed:", e);
+      });
+
     return () => {
       cancelled = true;
       ro.disconnect();
       dataSub.dispose();
       resizeSub.dispose();
+      dragDisposed = true;
+      try {
+        dragUnlisten?.();
+      } catch {}
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
