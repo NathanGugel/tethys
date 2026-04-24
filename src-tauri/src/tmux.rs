@@ -70,13 +70,35 @@ pub fn has_session(tmux_bin: &Path, session_id: &str) -> bool {
 ///   when the pane is on the alternate screen. With it, wheel-up enters
 ///   copy-mode and scrolls tmux's scrollback.
 pub fn server_init_args() -> Vec<String> {
+    // Each inner slice is one tmux command; `;` in between is tmux's
+    // command-chain separator. Tmux is purely a process keeper here —
+    // xterm.js owns scrollback, selection, and mouse handling. Keeping
+    // tmux's `mouse` at the default (off) lets wheel events pass through
+    // to xterm.js for native scrolling of its own buffer.
+    let commands: &[&[&str]] = &[
+        &["set-option", "-g", "window-size", "latest"],
+        &["set-option", "-g", "status", "off"],
+        // Explicitly off — a previous run may have turned it on, and the
+        // tmux server survives across Tethys restarts.
+        &["set-option", "-g", "mouse", "off"],
+        // `capture-pane -S -` is bounded by history-limit; bump it so
+        // cross-restart reattach has plenty of history to replay into
+        // xterm.js.
+        &["set-option", "-g", "history-limit", "50000"],
+        // Strip alt-screen (smcup/rmcup) from every terminal's terminfo.
+        // Without this, tmux-the-client enters alt-screen on xterm.js,
+        // which flips xterm.js into its alternate buffer — and xterm's
+        // default wheel behavior in alt-buffer is "send arrow keys," not
+        // scroll the main-buffer scrollback. Neutering alt-screen keeps
+        // everything in the main buffer so wheel events scroll natively.
+        &[
+            "set-option", "-ga", "terminal-overrides",
+            ",*:smcup@:rmcup@",
+        ],
+    ];
     let mut out = Vec::new();
-    for opts in [
-        ["set-option", "-g", "window-size", "latest"],
-        ["set-option", "-g", "status", "off"],
-        ["set-option", "-g", "mouse", "on"],
-    ] {
-        out.extend(opts.iter().map(|s| s.to_string()));
+    for cmd in commands {
+        out.extend(cmd.iter().map(|s| s.to_string()));
         out.push(";".into());
     }
     out
@@ -86,16 +108,43 @@ pub fn server_init_args() -> Vec<String> {
 /// up from a prior run. Safe to skip failures — `server_init_args()` is
 /// also prepended to every spawn, which covers cold-start.
 pub fn ensure_server_init(tmux_bin: &Path) {
-    for opts in [
-        ["set-option", "-g", "window-size", "latest"],
-        ["set-option", "-g", "status", "off"],
-        ["set-option", "-g", "mouse", "on"],
-    ] {
-        let _ = Command::new(tmux_bin)
-            .args(["-L", SOCKET_LABEL])
-            .args(opts)
-            .status();
+    let _ = Command::new(tmux_bin)
+        .args(["-L", SOCKET_LABEL])
+        .args(server_init_args())
+        .status();
+}
+
+/// Dump a session's pane scrollback + visible buffer, with SGR
+/// preserved. Returns `None` if the session doesn't exist or the command
+/// fails. Output has `\n` converted to `\r\n` for xterm.js, and an SGR
+/// reset appended so lingering attributes don't bleed into the client's
+/// redraw.
+pub fn capture_pane(tmux_bin: &Path, session_id: &str) -> Option<Vec<u8>> {
+    let output = Command::new(tmux_bin)
+        .args([
+            "-L",
+            SOCKET_LABEL,
+            "capture-pane",
+            "-p",       // print to stdout (don't save to buffer)
+            "-e",       // preserve escape sequences (SGR)
+            "-S", "-",  // start at top of history
+            "-t", session_id,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
+    let mut out = Vec::with_capacity(output.stdout.len() + 8);
+    for &b in &output.stdout {
+        if b == b'\n' {
+            out.push(b'\r');
+        }
+        out.push(b);
+    }
+    // Reset SGR so tmux's first real paint starts from a known state.
+    out.extend_from_slice(b"\x1b[0m");
+    Some(out)
 }
 
 /// Return the names of all sessions on the Tethys tmux server. Empty vec

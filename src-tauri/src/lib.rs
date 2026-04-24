@@ -97,17 +97,20 @@ pub fn run() {
 
             // --- tmux binary (claude sessions run inside a tmux server so
             // they survive app restarts until reboot).
-            match tmux::resolve() {
+            let tmux_bin_path = match tmux::resolve() {
                 Ok(path) => {
                     tmux::ensure_server_init(&path);
                     reap_orphan_tmux_sessions(&path, &store);
+                    let p = path.clone();
                     app.manage(TmuxBin(path));
+                    Some(p)
                 }
                 Err(e) => {
                     warn!(error = %e, "tmux binary not resolved at startup");
                     app.manage(TmuxBin(std::path::PathBuf::new()));
+                    None
                 }
-            }
+            };
 
             // --- hook installer (idempotent) --------------------------------
             if let Some(hook_bin) = hook_install::bundled_hook_bin_or_warn() {
@@ -128,6 +131,14 @@ pub fn run() {
             let supervisor: Arc<SessionSupervisor> =
                 Arc::new(SessionSupervisor::new(handle.clone(), store.clone()));
             app.manage(supervisor.clone());
+
+            // Pre-warm live sessions: for every persisted ClaudeSessionMeta
+            // whose tmux pane is still alive, spin up a reattach now so
+            // the UI can flip straight to the terminal when the user
+            // visits the workspace (no "Dormant / Resume" flash).
+            if let Some(path) = tmux_bin_path.as_ref() {
+                prewarm_live_sessions(&supervisor, path, &store);
+            }
 
             let socket_path = paths.hook_socket();
             let sup_for_listener = supervisor.clone();
@@ -210,6 +221,53 @@ pub fn run() {
 }
 
 struct LoggingGuard(#[allow(dead_code)] tracing_appender::non_blocking::WorkerGuard);
+
+/// For every persisted `ClaudeSessionMeta` whose tmux pane is still
+/// alive, spawn a reattach client now. This means `list_sessions` will
+/// return `running: true` for those sessions by the time the frontend
+/// asks, so switching into a workspace shows the terminal immediately
+/// rather than flashing the "Dormant / Resume" state.
+fn prewarm_live_sessions(
+    supervisor: &Arc<SessionSupervisor>,
+    tmux_bin: &std::path::Path,
+    store: &Arc<Store>,
+) {
+    let candidates: Vec<(String, String, String, std::path::PathBuf)> =
+        tauri::async_runtime::block_on(async {
+            store
+                .read(|s| {
+                    let mut out = Vec::new();
+                    for ws in &s.workspaces {
+                        for meta in &ws.sessions {
+                            out.push((
+                                meta.id.clone(),
+                                ws.id.clone(),
+                                meta.repo_key.clone(),
+                                meta.cwd.clone(),
+                            ));
+                        }
+                    }
+                    out
+                })
+                .await
+        });
+
+    for (session_id, workspace_id, repo_key, cwd) in candidates {
+        if !tmux::has_session(tmux_bin, &session_id) {
+            continue;
+        }
+        match supervisor.reattach_tmux(
+            session_id.clone(),
+            workspace_id,
+            repo_key,
+            &cwd,
+            tmux_bin,
+        ) {
+            Ok(_) => info!(%session_id, "pre-warmed live tmux session"),
+            Err(e) => warn!(%session_id, error = %e, "pre-warm reattach failed"),
+        }
+    }
+}
 
 /// Kill any tmux session on our private server whose name isn't a known
 /// `ClaudeSessionMeta.id`. Catches leftovers from app crashes between

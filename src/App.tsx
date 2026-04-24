@@ -50,6 +50,15 @@ function App() {
   const [turnStates, setTurnStates] = useState<
     Map<string, { workspaceId: string; state: SessionRuntimeState }>
   >(new Map());
+  /**
+   * Sessions for every workspace, cached so switching into a workspace
+   * shows the terminal immediately instead of flashing "Dormant" during
+   * the list_sessions round-trip. Populated eagerly on workspace load
+   * and kept in sync via session:* events.
+   */
+  const [sessionsByWorkspace, setSessionsByWorkspace] = useState<
+    Map<WorkspaceId, SessionInfo[]>
+  >(new Map());
   const [theme, setTheme] = useState<Theme | null>(null);
 
   useEffect(() => {
@@ -68,7 +77,8 @@ function App() {
   });
 
   useTauriEvent<TurnChangedEvent>("session:turn_changed", (event) => {
-    const { workspace_id, session_id, runtime_state } = event.payload;
+    const { workspace_id, session_id, runtime_state, notification_type } =
+      event.payload;
     setTurnStates((prev) => {
       const next = new Map(prev);
       if (runtime_state === "dormant") {
@@ -79,6 +89,26 @@ function App() {
           state: runtime_state,
         });
       }
+      return next;
+    });
+    // Keep the cached SessionInfo[] in sync so WorkspaceDetail sees the
+    // new runtime_state without a full re-fetch.
+    setSessionsByWorkspace((prev) => {
+      const list = prev.get(workspace_id);
+      if (!list) return prev;
+      const next = new Map(prev);
+      next.set(
+        workspace_id,
+        list.map((s) =>
+          s.id === session_id
+            ? {
+                ...s,
+                runtime_state,
+                notification_type: notification_type ?? null,
+              }
+            : s,
+        ),
+      );
       return next;
     });
   });
@@ -110,6 +140,21 @@ function App() {
     [turnStates],
   );
 
+  const refreshSessionsFor = useCallback(async (workspaceId: WorkspaceId) => {
+    try {
+      const list = await invoke<SessionInfo[]>("list_sessions", {
+        workspaceId,
+      });
+      setSessionsByWorkspace((prev) => {
+        const next = new Map(prev);
+        next.set(workspaceId, list);
+        return next;
+      });
+    } catch (e) {
+      console.error("list_sessions:", e);
+    }
+  }, []);
+
   const refresh = useCallback(async () => {
     try {
       const [list, reg, disc] = await Promise.all([
@@ -121,16 +166,25 @@ function App() {
       setRegistry(reg);
       setDiscrepancies(disc);
       setError(null);
+      // Pre-load sessions for every workspace so switching in doesn't
+      // render a stale/empty sessions list.
+      await Promise.all(list.map((w) => refreshSessionsFor(w.id)));
     } catch (e) {
       setError(String(e));
     }
-  }, []);
+  }, [refreshSessionsFor]);
 
   useEffect(() => {
     refresh();
   }, [refresh]);
 
   useTauriEvent("workspace:changed", () => refresh());
+  useTauriEvent<{ workspace_id: string }>("session:changed", (event) => {
+    refreshSessionsFor(event.payload.workspace_id);
+  });
+  useTauriEvent<{ workspace_id: string }>("session:exit", (event) => {
+    refreshSessionsFor(event.payload.workspace_id);
+  });
 
   const selected = useMemo(
     () => workspaces.find((w) => w.id === selectedId) ?? null,
@@ -282,6 +336,7 @@ function App() {
         ) : selected ? (
           <WorkspaceDetail
             workspace={selected}
+            sessions={sessionsByWorkspace.get(selected.id) ?? []}
             onRequestDelete={() =>
               setPendingDelete({
                 workspaceId: selected.id,
@@ -505,15 +560,16 @@ function DiscrepancyNotice({
 
 function WorkspaceDetail({
   workspace,
+  sessions,
   onRequestDelete,
 }: {
   workspace: Workspace;
+  sessions: SessionInfo[];
   onRequestDelete: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
-  const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Meta ids we've already auto-resumed this app-run — guards against
@@ -525,40 +581,6 @@ function WorkspaceDetail({
   useEffect(() => {
     setSelectedSessionId(null);
   }, [workspace.id]);
-
-  const refreshSessions = useCallback(async () => {
-    try {
-      const list = await invoke<SessionInfo[]>("list_sessions", {
-        workspaceId: workspace.id,
-      });
-      setSessions(list);
-    } catch (e) {
-      console.error("list_sessions:", e);
-    }
-  }, [workspace.id]);
-
-  useEffect(() => {
-    refreshSessions();
-  }, [refreshSessions]);
-
-  useTauriEvent("session:changed", () => refreshSessions());
-  useTauriEvent("session:exit", () => refreshSessions());
-  useTauriEvent<TurnChangedEvent>("session:turn_changed", (event) => {
-    const { session_id, runtime_state, notification_type } = event.payload;
-    // Merge into the session list locally — avoids a full re-fetch
-    // round-trip on every hook event.
-    setSessions((prev) =>
-      prev.map((s) =>
-        s.id === session_id
-          ? {
-              ...s,
-              runtime_state,
-              notification_type: notification_type ?? null,
-            }
-          : s,
-      ),
-    );
-  });
 
   const togglePause = async () => {
     setBusy(true);
@@ -603,7 +625,7 @@ function WorkspaceDetail({
         args: { workspace_id: workspace.id, repo_key: repoKey },
       });
       setSelectedSessionId(res.id);
-      refreshSessions();
+      // App-level listener on `session:changed` refreshes the cache.
     } catch (e) {
       setError(String(e));
     } finally {
@@ -623,7 +645,6 @@ function WorkspaceDetail({
         },
       });
       setSelectedSessionId(res.id);
-      refreshSessions();
     } catch (e) {
       setError(String(e));
     } finally {

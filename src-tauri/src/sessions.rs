@@ -139,6 +139,7 @@ impl SessionSupervisor {
         program: &Path,
         args: &[String],
         tmux_bin: PathBuf,
+        seed_bytes: &[u8],
     ) -> AppResult<SessionInfo> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -183,6 +184,11 @@ impl SessionSupervisor {
         };
 
         let ring = Arc::new(Mutex::new(VecDeque::with_capacity(RING_CAPACITY)));
+        if !seed_bytes.is_empty() {
+            // Seed the ring before the reader thread starts so the first
+            // attach sees [seed][tmux's fresh redraw] in that order.
+            append_to_ring(&ring, seed_bytes);
+        }
         let subscribers: Arc<Mutex<Vec<Channel<InvokeResponseBody>>>> =
             Arc::new(Mutex::new(Vec::new()));
         let running = Arc::new(Mutex::new(true));
@@ -193,6 +199,7 @@ impl SessionSupervisor {
             id.clone(),
             workspace_id.clone(),
             running.clone(),
+            ring.clone(),
             tmux_bin,
             self.app.clone(),
         );
@@ -278,6 +285,7 @@ impl SessionSupervisor {
             tmux_bin,
             &args,
             tmux_bin.to_path_buf(),
+            &[],
         )?;
 
         // Prune any expired pending correlations while we're here.
@@ -314,6 +322,11 @@ impl SessionSupervisor {
                 "tmux session {session_id} no longer exists"
             )));
         }
+        // Dump the pane's scrollback before the new client attaches —
+        // once the client is attached, tmux will repaint the visible
+        // area and we'd lose the historical context in xterm.js.
+        let seed = tmux::capture_pane(tmux_bin, &session_id).unwrap_or_default();
+
         let mut args: Vec<String> = vec!["-L".into(), tmux::SOCKET_LABEL.into()];
         args.extend(tmux::server_init_args());
         args.extend([
@@ -330,6 +343,7 @@ impl SessionSupervisor {
             tmux_bin,
             &args,
             tmux_bin.to_path_buf(),
+            &seed,
         )
     }
 
@@ -507,6 +521,16 @@ impl SessionSupervisor {
                 .writer
                 .clone()
         };
+        // Trace small writes so we can diagnose stray bytes (e.g. the
+        // mystery newline-on-first-resume). Normal keystrokes are also
+        // small; noisy in logs but useful while we iterate.
+        if data.len() <= 16 {
+            debug!(
+                session_id,
+                bytes = %format_bytes(data),
+                "send_input"
+            );
+        }
         writer
             .lock()
             .unwrap()
@@ -554,6 +578,22 @@ fn new_session_id() -> SessionId {
     Uuid::new_v4().to_string()
 }
 
+/// Hex + ASCII formatter for tracing bytes sent to the PTY. Control
+/// codes show as `\xNN`; printable bytes show as themselves.
+fn format_bytes(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len() * 4);
+    out.push('"');
+    for &b in data {
+        if (0x20..0x7f).contains(&b) && b != b'\\' && b != b'"' {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("\\x{b:02x}"));
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn spawn_reader_thread(
     mut reader: Box<dyn Read + Send>,
     ring: Arc<Mutex<VecDeque<u8>>>,
@@ -585,6 +625,46 @@ fn spawn_reader_thread(
     });
 }
 
+/// Scan the tail of the ring for tmux's detach epilogue
+/// (`[detached (from session …)]` + surrounding CR/LFs) and remove it.
+/// Tmux emits this line to the client's terminal right before the client
+/// exits, so it lands in our buffer via the reader thread. Called from
+/// the child watcher once we've confirmed the session itself is gone.
+fn trim_detach_epilogue(ring: &Arc<Mutex<VecDeque<u8>>>) {
+    let mut ring = ring.lock().unwrap();
+    // Search back at most ~256 bytes — the message is short.
+    let scan_len = ring.len().min(256);
+    if scan_len == 0 {
+        return;
+    }
+    let tail_start = ring.len() - scan_len;
+    let tail: Vec<u8> = ring.iter().skip(tail_start).copied().collect();
+    // Find the last occurrence of "[detached " in the tail.
+    let needle = b"[detached ";
+    let mut idx = None;
+    for i in (0..=tail.len().saturating_sub(needle.len())).rev() {
+        if tail[i..i + needle.len()] == *needle {
+            idx = Some(i);
+            break;
+        }
+    }
+    let Some(i) = idx else {
+        return;
+    };
+    // Truncate from the byte preceding the pattern, walking back over
+    // any trailing CR/LF so we don't leave a blank line either.
+    let mut cut_from = tail_start + i;
+    while cut_from > 0 {
+        let prev = ring[cut_from - 1];
+        if prev == b'\r' || prev == b'\n' {
+            cut_from -= 1;
+        } else {
+            break;
+        }
+    }
+    ring.truncate(cut_from);
+}
+
 fn append_to_ring(ring: &Arc<Mutex<VecDeque<u8>>>, data: &[u8]) {
     let mut ring = ring.lock().unwrap();
     if data.len() >= RING_CAPACITY {
@@ -604,6 +684,7 @@ fn spawn_child_watcher(
     session_id: SessionId,
     workspace_id: String,
     running: Arc<Mutex<bool>>,
+    ring: Arc<Mutex<VecDeque<u8>>>,
     tmux_bin: PathBuf,
     app: AppHandle,
 ) {
@@ -625,10 +706,20 @@ fn spawn_child_watcher(
             return;
         }
 
+        // Session truly gone — tmux client printed `[detached (from
+        // session …)]` to the pty just before exiting. Strip that
+        // trailing line from the ring so it doesn't surface when the
+        // user revisits the workspace.
+        trim_detach_epilogue(&ring);
+
         info!(%session_id, ?code, "session child exited");
         let _ = app.emit(
             "session:exit",
-            serde_json::json!({ "session_id": session_id, "code": code }),
+            serde_json::json!({
+                "workspace_id": workspace_id,
+                "session_id": session_id,
+                "code": code,
+            }),
         );
         // Turn state is stale once the PTY is gone — emit a Dormant
         // transition so the UI doesn't keep showing Working indefinitely.

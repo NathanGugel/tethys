@@ -54,7 +54,11 @@ export function SessionTerminal({ sessionId }: Props) {
       fontSize: 13,
       theme: initialTheme,
       cursorBlink: true,
-      scrollback: 10000,
+      // xterm.js owns scrollback end-to-end. Tmux is only a process
+      // keeper (mouse off, no copy-mode) — wheel events fall through to
+      // xterm.js and scroll its buffer natively. Claude writes to the
+      // main buffer, so the stream naturally populates this scrollback.
+      scrollback: 50000,
       allowProposedApi: true,
       // OSC 8 escape-sequence hyperlinks (Claude Code emits these for PR
       // URLs etc.) default to `window.open` which Tauri's WKWebView blocks
