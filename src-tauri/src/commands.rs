@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use tauri::ipc::InvokeResponseBody;
 
+use crate::claude_local;
 use crate::error::{AppError, AppResult};
 use crate::git;
 use crate::github::poller::{AuthSnapshot, GithubPoller};
@@ -197,6 +198,14 @@ pub async fn create_workspace(
             }
 
             git::worktree_add(&clone_path, &worktree_path, &branch, &tx, &repo.key).await?;
+
+            claude_local::install_symlink(
+                &worktree_path,
+                &paths.repo_shared_claude_local(&repo.key),
+                &tx,
+                &repo.key,
+            )
+            .await?;
 
             let mut link = RepoLink {
                 repo_key: repo.key.clone(),

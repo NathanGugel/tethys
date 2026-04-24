@@ -46,6 +46,16 @@ impl Paths {
         self.repos_clone_dir().join(repo_key)
     }
 
+    pub fn symlinks_dir(&self) -> PathBuf {
+        self.data_dir.join("symlinks")
+    }
+
+    /// Shared `settings.local.json` for a repo — symlinked into each of that
+    /// repo's worktrees so permissions stay in sync across workspaces.
+    pub fn repo_shared_claude_local(&self, repo_key: &str) -> PathBuf {
+        self.symlinks_dir().join(repo_key).join("settings.local.json")
+    }
+
     pub fn hook_socket(&self) -> PathBuf {
         self.data_dir.join("hook.sock")
     }

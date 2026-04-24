@@ -1,4 +1,5 @@
 mod claude;
+mod claude_local;
 mod commands;
 mod error;
 mod git;
