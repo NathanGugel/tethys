@@ -783,6 +783,9 @@ button.danger.primary:hover:not(:disabled) {
   flex: 1;
   min-height: 240px;
   overflow: hidden;
+  margin: 0 -28px -24px;
+  padding: 2px;
+  background: var(--bg);
 }
 
 .spinner {
