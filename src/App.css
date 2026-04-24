@@ -251,7 +251,7 @@ html,
 
 .detail {
   overflow-y: auto;
-  padding: 24px 28px;
+  padding: 24px 2px;
   display: flex;
   flex-direction: column;
 }
@@ -275,7 +275,7 @@ html,
   align-items: baseline;
   border-bottom: 1px solid var(--border);
   padding-bottom: 12px;
-  margin-bottom: 16px;
+  margin-bottom: 8px;
 }
 
 .workspace-detail h2 {
@@ -783,17 +783,17 @@ button.danger.primary:hover:not(:disabled) {
   flex: 1;
   min-height: 240px;
   overflow: hidden;
-  margin: 0 -28px -24px;
-  padding: 2px;
+  margin-bottom: -24px;
   background: var(--bg);
 }
 
 .spinner {
   display: inline-block;
-  width: 10px;
-  height: 10px;
-  border: 1.5px solid currentColor;
-  border-top-color: transparent;
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  border: 1.5px solid color-mix(in oklab, currentColor 25%, transparent);
+  border-top-color: currentColor;
   border-radius: 50%;
   animation: spin 0.7s linear infinite;
   margin-right: 6px;
