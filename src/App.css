@@ -787,11 +787,17 @@ button.danger.primary:hover:not(:disabled) {
   background: var(--bg);
 }
 
+/* Fixed-size inline indicators — never shrink in flex rows.
+   Add new spinner/dot/badge classes to this list. */
+.spinner,
+.turn-dot {
+  flex-shrink: 0;
+}
+
 .spinner {
   display: inline-block;
   width: 12px;
   height: 12px;
-  flex-shrink: 0;
   border: 1.5px solid color-mix(in oklab, currentColor 25%, transparent);
   border-top-color: currentColor;
   border-radius: 50%;
