@@ -268,7 +268,7 @@ html,
   justify-content: space-between;
   align-items: baseline;
   border-bottom: 1px solid var(--border);
-  padding-bottom: 12px;
+  padding: 0 16px 12px;
   margin-bottom: 8px;
 }
 
@@ -820,7 +820,7 @@ button.danger.primary:hover:not(:disabled) {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  padding: 4px 0 8px;
+  padding: 4px 16px 8px;
   border-bottom: 1px solid var(--border);
   margin-bottom: 8px;
 }

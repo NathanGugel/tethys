@@ -680,17 +680,25 @@ function WorkspaceDetail({
   const [busy, setBusy] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
-  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  // Per-workspace selection. Derived on render (no effect), so switching
+  // back to a workspace paints the remembered pick immediately.
+  const [selectedByWorkspace, setSelectedByWorkspace] = useState<
+    Map<string, string>
+  >(new Map());
+  const selectedSessionId = selectedByWorkspace.get(workspace.id) ?? null;
+  const selectSession = (id: string | null) => {
+    setSelectedByWorkspace((prev) => {
+      const next = new Map(prev);
+      if (id) next.set(workspace.id, id);
+      else next.delete(workspace.id);
+      return next;
+    });
+  };
   const [error, setError] = useState<string | null>(null);
   // Meta ids we've already auto-resumed this app-run — guards against
   // retry loops if spawn fails, while still allowing a manual Resume
   // click to try again.
   const autoResumedRef = useRef<Set<string>>(new Set());
-
-  // Reset selection when the selected workspace changes.
-  useEffect(() => {
-    setSelectedSessionId(null);
-  }, [workspace.id]);
 
   const togglePause = async () => {
     setBusy(true);
@@ -734,7 +742,7 @@ function WorkspaceDetail({
       const res = await invoke<SessionInfo>("start_claude_session", {
         args: { workspace_id: workspace.id, repo_key: repoKey },
       });
-      setSelectedSessionId(res.id);
+      selectSession(res.id);
       // App-level listener on `session:changed` refreshes the cache.
     } catch (e) {
       setError(String(e));
@@ -754,7 +762,7 @@ function WorkspaceDetail({
           session_meta_id: metaId,
         },
       });
-      setSelectedSessionId(res.id);
+      selectSession(res.id);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -867,7 +875,7 @@ function WorkspaceDetail({
           liveById={liveById}
           repos={workspace.repo_links}
           selectedId={effectiveSelected}
-          onSelect={setSelectedSessionId}
+          onSelect={selectSession}
           onStartInRepo={startInRepo}
           busy={busy}
         />
