@@ -354,8 +354,10 @@ impl SessionSupervisor {
         match msg.event.as_str() {
             "session-start" => self.handle_session_start(msg).await,
             "user-submit" | "pre-tool" => self.handle_resume_working(msg).await,
-            "stop" => self.handle_stop(msg).await,
+            "stop" | "stop-failure" => self.handle_stop(msg).await,
             "notify" => self.handle_notify(msg).await,
+            "permission-request" => self.handle_permission_request(msg).await,
+            "elicitation" => self.handle_elicitation(msg).await,
             other => debug!(event = %other, "unknown hook event"),
         }
     }
@@ -364,25 +366,16 @@ impl SessionSupervisor {
     /// The latter covers the "user just answered a permission prompt"
     /// case, where Claude proceeds with its tool call.
     async fn handle_resume_working(&self, msg: HookMessage) {
-        let Some(csid) = msg.session_id.as_deref() else {
-            return;
-        };
-        self.set_turn_by_claude_sid(csid, SessionRuntimeState::Working, None)
+        self.set_turn_from_hook(&msg, SessionRuntimeState::Working, None)
             .await;
     }
 
     async fn handle_stop(&self, msg: HookMessage) {
-        let Some(csid) = msg.session_id.as_deref() else {
-            return;
-        };
-        self.set_turn_by_claude_sid(csid, SessionRuntimeState::Idle, None)
+        self.set_turn_from_hook(&msg, SessionRuntimeState::Idle, None)
             .await;
     }
 
     async fn handle_notify(&self, msg: HookMessage) {
-        let Some(csid) = msg.session_id.as_deref() else {
-            return;
-        };
         // auth_success / elicitation_dialog don't represent a turn flip —
         // just log and bail. permission_prompt / idle_prompt both put the
         // session into WaitingInput; the notification_type is carried on
@@ -399,24 +392,67 @@ impl SessionSupervisor {
                 return;
             }
         };
-        self.set_turn_by_claude_sid(csid, state, msg.notification_type.clone())
-            .await;
+        let nt = msg.notification_type.clone();
+        self.set_turn_from_hook(&msg, state, nt).await;
     }
 
-    /// Find the Tethys session id that corresponds to a given Claude
-    /// session_id and flip its turn state.
-    async fn set_turn_by_claude_sid(
+    /// PermissionRequest fires whenever Claude Code shows a permission
+    /// dialog, including sandbox-escape prompts (network / filesystem) that
+    /// Notification doesn't cover.
+    async fn handle_permission_request(&self, msg: HookMessage) {
+        self.set_turn_from_hook(
+            &msg,
+            SessionRuntimeState::WaitingInput,
+            Some("permission_request".to_string()),
+        )
+        .await;
+    }
+
+    /// Elicitation fires when an MCP server requests user input during a
+    /// tool call — same turn semantics as a permission prompt.
+    async fn handle_elicitation(&self, msg: HookMessage) {
+        self.set_turn_from_hook(
+            &msg,
+            SessionRuntimeState::WaitingInput,
+            Some("elicitation".to_string()),
+        )
+        .await;
+    }
+
+    /// Find the Tethys session this hook belongs to and flip its turn state.
+    /// Matches first on `claude_session_id` directly. Falls back to the
+    /// parent session when the hook comes from a subagent — subagent
+    /// transcripts live at `.../<parent-uuid>/subagents/agent-*.jsonl`, so
+    /// the parent's claude_session_id is recoverable from `transcript_path`.
+    async fn set_turn_from_hook(
         &self,
-        claude_session_id: &str,
+        msg: &HookMessage,
         state: SessionRuntimeState,
         notification_type: Option<String>,
     ) {
+        let Some(csid) = msg.session_id.as_deref() else {
+            debug!(
+                event = %msg.event,
+                transcript_path = ?msg.transcript_path,
+                spawn_token = ?msg.spawn_token,
+                "hook missing session_id — cannot correlate",
+            );
+            return;
+        };
+        let parent_csid = msg
+            .transcript_path
+            .as_deref()
+            .and_then(parent_session_from_subagent_path);
         let lookup = self
             .store
             .read(|s| {
                 for ws in &s.workspaces {
                     for sess in &ws.sessions {
-                        if sess.claude_session_id.as_deref() == Some(claude_session_id) {
+                        let tracked = sess.claude_session_id.as_deref();
+                        if tracked == Some(csid)
+                            || (parent_csid.is_some()
+                                && tracked == parent_csid.as_deref())
+                        {
                             return Some((ws.id.clone(), sess.id.clone()));
                         }
                     }
@@ -426,7 +462,8 @@ impl SessionSupervisor {
             .await;
         let Some((ws_id, sess_id)) = lookup else {
             debug!(
-                claude_session_id,
+                claude_session_id = csid,
+                transcript_path = ?msg.transcript_path,
                 "hook for unknown Claude session (not a Tethys-spawned one)"
             );
             return;
@@ -576,6 +613,23 @@ impl SessionSupervisor {
 
 fn new_session_id() -> SessionId {
     Uuid::new_v4().to_string()
+}
+
+/// If `transcript_path` looks like a subagent transcript
+/// (`.../<parent-uuid>/subagents/agent-*.jsonl`), return the parent uuid so
+/// subagent hooks can be routed to the parent session. Returns `None` for
+/// parent-level transcripts or any other shape.
+fn parent_session_from_subagent_path(transcript_path: &str) -> Option<String> {
+    let path = Path::new(transcript_path);
+    let file = path.file_name()?.to_str()?;
+    if !(file.starts_with("agent-") && file.ends_with(".jsonl")) {
+        return None;
+    }
+    let subagents_dir = path.parent()?;
+    if subagents_dir.file_name()?.to_str()? != "subagents" {
+        return None;
+    }
+    Some(subagents_dir.parent()?.file_name()?.to_str()?.to_string())
 }
 
 /// Hex + ASCII formatter for tracing bytes sent to the PTY. Control
@@ -733,4 +787,36 @@ fn spawn_child_watcher(
             }),
         );
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parent_session_from_subagent_path;
+
+    #[test]
+    fn extracts_parent_uuid_from_subagent_transcript() {
+        let parent = "0bd83a02-04d6-4139-b007-388eea214e22";
+        let path = format!(
+            "/Users/ryan/.claude/projects/-Users-ryan-code-worktrees-foo/{parent}/subagents/agent-a9cc54ae168591b32.jsonl"
+        );
+        assert_eq!(
+            parent_session_from_subagent_path(&path).as_deref(),
+            Some(parent)
+        );
+    }
+
+    #[test]
+    fn returns_none_for_parent_level_transcript() {
+        let parent = "0bd83a02-04d6-4139-b007-388eea214e22";
+        let path = format!(
+            "/Users/ryan/.claude/projects/-Users-ryan-code-worktrees-foo/{parent}.jsonl"
+        );
+        assert_eq!(parent_session_from_subagent_path(&path), None);
+    }
+
+    #[test]
+    fn returns_none_for_unrelated_path() {
+        assert_eq!(parent_session_from_subagent_path("/tmp/foo.jsonl"), None);
+        assert_eq!(parent_session_from_subagent_path(""), None);
+    }
 }

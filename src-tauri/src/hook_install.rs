@@ -13,7 +13,15 @@ const EVENTS: &[(&str, &str)] = &[
     ("UserPromptSubmit", "user-submit"),
     ("PreToolUse", "pre-tool"),
     ("Stop", "stop"),
+    // StopFailure fires when a turn dies to an API error — without this
+    // the session would hang in Working forever.
+    ("StopFailure", "stop-failure"),
     ("Notification", "notify"),
+    // PermissionRequest covers sandbox-escape prompts (network / fs) that
+    // Notification doesn't fire for. Elicitation covers MCP user-input
+    // requests with the same semantics.
+    ("PermissionRequest", "permission-request"),
+    ("Elicitation", "elicitation"),
 ];
 
 /// Ensure the Tethys hook entries are present in `settings_path` for all
