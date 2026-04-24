@@ -65,12 +65,6 @@ html,
   gap: 10px;
 }
 
-.sidebar-header h1 {
-  font-size: 18px;
-  margin: 0;
-  letter-spacing: 0.02em;
-}
-
 .sidebar-header button {
   width: 100%;
 }

@@ -144,7 +144,6 @@ function App() {
     <div className="app">
       <aside className="sidebar">
         <div className="sidebar-header">
-          <h1>Tethys</h1>
           <button
             className="primary"
             onClick={() => setCreating(true)}
