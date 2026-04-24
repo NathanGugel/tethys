@@ -226,6 +226,76 @@ pub async fn worktree_add(
     Ok(())
 }
 
+/// `git -C <clone_path> show-ref --verify --quiet refs/heads/<branch>`.
+/// Returns true if the branch exists locally in the clone. Non-zero exit
+/// means the branch doesn't exist — not an error.
+pub async fn branch_exists(clone_path: &Path, branch: &str) -> AppResult<bool> {
+    let refspec = format!("refs/heads/{branch}");
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(clone_path)
+        .arg("show-ref")
+        .arg("--verify")
+        .arg("--quiet")
+        .arg(&refspec)
+        .output()
+        .await
+        .map_err(|e| AppError::Other(format!("git show-ref: {e}")))?;
+    Ok(output.status.success())
+}
+
+/// `git -C <clone_path> worktree prune`. Best-effort: clears stale worktree
+/// registrations for directories that no longer exist. Errors are logged
+/// but not bubbled. Run before `branch -D` so git won't refuse with "branch
+/// in use by prunable worktree".
+pub async fn worktree_prune_best_effort(clone_path: &Path, tx: &JobTx, repo: &str) {
+    let args: [&OsStr; 4] = [
+        "-C".as_ref(),
+        clone_path.as_os_str(),
+        "worktree".as_ref(),
+        "prune".as_ref(),
+    ];
+    match run_streamed("git", args, None, tx, Some(repo)).await {
+        Ok(status) if status.success() => {}
+        Ok(status) => tx.status(
+            format!("worktree prune exited with {:?}", status.code()),
+            Some(repo),
+        ),
+        Err(e) => tx.status(format!("worktree prune failed: {e}"), Some(repo)),
+    }
+}
+
+/// `git -C <clone_path> branch -D <branch>`. Best-effort: a non-zero exit
+/// (e.g. the branch doesn't exist) is logged but not bubbled. Used as
+/// cleanup when a workspace is deleted, so the same branch name can be
+/// reused for a new workspace.
+pub async fn branch_delete_best_effort(
+    clone_path: &Path,
+    branch: &str,
+    tx: &JobTx,
+    repo: &str,
+) {
+    tx.status(format!("deleting branch {branch}"), Some(repo));
+    let args: [&OsStr; 5] = [
+        "-C".as_ref(),
+        clone_path.as_os_str(),
+        "branch".as_ref(),
+        "-D".as_ref(),
+        branch.as_ref(),
+    ];
+    match run_streamed("git", args, None, tx, Some(repo)).await {
+        Ok(status) if status.success() => {}
+        Ok(status) => tx.status(
+            format!("branch -D {branch} exited with {:?} (already gone?)", status.code()),
+            Some(repo),
+        ),
+        Err(e) => tx.status(
+            format!("branch -D {branch} failed: {e}"),
+            Some(repo),
+        ),
+    }
+}
+
 /// `git -C <clone_path> worktree remove <worktree_path>`. Returns an error if
 /// the worktree is dirty (caller can retry with `force`).
 pub async fn worktree_remove(

@@ -7,32 +7,39 @@ interface Props {
   title: string;
   command: string;
   /**
-   * Arguments object for `invoke(command, args)`. The modal automatically
-   * adds an `onEvent` channel to this object — callers should not pre-set it.
+   * Arguments object for `invoke(command, args)`. An `onEvent` channel is
+   * added automatically — callers should not pre-set it.
    */
   args: Record<string, unknown>;
-  onClose: () => void;
+  /** Fired once the backend resolves successfully. */
   onSuccess?: (result: unknown) => void;
+  /** User-initiated dismiss — only enabled after the job settles. */
+  onDismiss: () => void;
 }
 
 type JobState = "running" | "success" | "failed";
 
-export function JobLogModal({
+/**
+ * Inline pane for a streaming backend job (create / delete workspace). Renders
+ * the same log stream as the old JobLogModal but without the modal chrome so
+ * it can live inside a workspace detail pane or in place of one.
+ */
+export function JobLogPane({
   title,
   command,
   args,
-  onClose,
   onSuccess,
+  onDismiss,
 }: Props) {
   const [events, setEvents] = useState<JobEvent[]>([]);
   const [state, setState] = useState<JobState>("running");
   const startedRef = useRef(false);
   const logRef = useRef<HTMLDivElement | null>(null);
   const resultRef = useRef<unknown>(null);
+  const onSuccessRef = useRef(onSuccess);
+  onSuccessRef.current = onSuccess;
 
   useEffect(() => {
-    // StrictMode double-invokes useEffect in dev — guard so we don't start
-    // the job twice.
     if (startedRef.current) return;
     startedRef.current = true;
 
@@ -47,10 +54,9 @@ export function JobLogModal({
       .then((res) => {
         resultRef.current = res;
         setState((s) => (s === "running" ? "success" : s));
+        onSuccessRef.current?.(res);
       })
       .catch((e) => {
-        // If backend didn't already emit Failed, synthesize one so the log
-        // pane shows the error inline.
         setEvents((prev) => {
           const last = prev[prev.length - 1];
           if (last?.kind === "failed") return prev;
@@ -61,55 +67,40 @@ export function JobLogModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Auto-scroll to bottom as events arrive.
   useEffect(() => {
     const el = logRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [events]);
 
-  const handleClose = () => {
-    if (state === "success") onSuccess?.(resultRef.current);
-    onClose();
-  };
-
   return (
-    <div className="modal-backdrop">
-      <div
-        className="modal job-log-modal"
-        onClick={(e) => e.stopPropagation()}
-        role="dialog"
-        aria-modal="true"
-      >
-        <header className="job-log-header">
-          <h3>{title}</h3>
-          <span className={`job-state job-state-${state}`}>
-            {state === "running" ? "running…" : state}
-          </span>
-        </header>
-        <div className="job-log-lines" ref={logRef}>
-          {events.length === 0 && (
-            <div className="job-log-line status muted">
-              Starting…
-            </div>
-          )}
-          {events.map((e, i) => (
-            <JobLogLine key={i} event={e} />
-          ))}
-        </div>
-        <div className="modal-actions">
-          <button
-            type="button"
-            className={state === "success" ? "primary" : ""}
-            onClick={handleClose}
-            disabled={state === "running"}
-          >
-            {state === "running"
-              ? "Running…"
-              : state === "success"
-                ? "Done"
-                : "Close"}
-          </button>
-        </div>
+    <div className="job-log-pane">
+      <header className="job-log-header">
+        <h3>{title}</h3>
+        <span className={`job-state job-state-${state}`}>
+          {state === "running" ? "running…" : state}
+        </span>
+      </header>
+      <div className="job-log-lines" ref={logRef}>
+        {events.length === 0 && (
+          <div className="job-log-line status muted">Starting…</div>
+        )}
+        {events.map((e, i) => (
+          <JobLogLine key={i} event={e} />
+        ))}
+      </div>
+      <div className="job-log-actions">
+        <button
+          type="button"
+          onClick={onDismiss}
+          disabled={state === "running"}
+          autoFocus={state !== "running"}
+        >
+          {state === "running"
+            ? "Running…"
+            : state === "success"
+              ? "Done"
+              : "Close"}
+        </button>
       </div>
     </div>
   );
@@ -134,8 +125,6 @@ function JobLogLine({ event }: { event: JobEvent }) {
     case "success":
       return <div className="job-log-line status ok">✔ done</div>;
     case "failed":
-      return (
-        <div className="job-log-line status err">✘ {event.error}</div>
-      );
+      return <div className="job-log-line status err">✘ {event.error}</div>;
   }
 }

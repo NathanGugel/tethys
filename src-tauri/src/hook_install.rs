@@ -10,6 +10,8 @@ use crate::error::{AppError, AppResult};
 const MARKER: &str = "Tethys session monitor";
 const EVENTS: &[(&str, &str)] = &[
     ("SessionStart", "session-start"),
+    ("UserPromptSubmit", "user-submit"),
+    ("PreToolUse", "pre-tool"),
     ("Stop", "stop"),
     ("Notification", "notify"),
 ];

@@ -11,6 +11,7 @@ use tauri::ipc::InvokeResponseBody;
 
 use crate::error::{AppError, AppResult};
 use crate::git;
+use crate::inprogress::InProgressWorkspaces;
 use crate::job::{JobEvent, JobTx};
 use crate::paths::Paths;
 use crate::reconcile::{self, Discrepancies};
@@ -95,6 +96,7 @@ pub async fn create_workspace(
     store: State<'_, Arc<Store>>,
     registry: State<'_, Arc<RegistryLoad>>,
     paths: State<'_, Paths>,
+    in_progress: State<'_, InProgressWorkspaces>,
     args: CreateWorkspaceArgs,
     on_event: Channel<JobEvent>,
 ) -> AppResult<Workspace> {
@@ -120,6 +122,10 @@ pub async fn create_workspace(
         .collect::<AppResult<Vec<_>>>()?;
 
     let id = new_workspace_id();
+    // Register as in-progress so the reconciler doesn't flag our worktree
+    // dirs as orphans mid-create. Guard removes the entry on drop — normal
+    // return, `?`, panic, or task cancellation.
+    let _in_progress_guard = in_progress.insert(id.clone());
     let tx = spawn_event_forwarder(on_event);
 
     let orchestrate = async {
@@ -129,6 +135,18 @@ pub async fn create_workspace(
             let worktree_path = reg.plan_worktree_path(&id, &repo.key);
 
             git::ensure_clone(&clone_path, &repo.remote_url, &tx, &repo.key).await?;
+
+            // Pre-check: if the branch already exists, git worktree add will
+            // fail with a fatal. We bail here with a clearer message — and
+            // avoid partially-creating worktrees in other repos first.
+            if git::branch_exists(&clone_path, &branch).await? {
+                return Err(AppError::Other(format!(
+                    "branch '{branch}' already exists in {}. Pick a different \
+                     branch name, or delete the stale branch first.",
+                    repo.key
+                )));
+            }
+
             git::worktree_add(&clone_path, &worktree_path, &branch, &tx, &repo.key).await?;
 
             let mut link = RepoLink {
@@ -183,9 +201,9 @@ pub async fn create_workspace(
             tx.status(format!("tearing down partial workspace: {msg}"), None);
 
             // Best-effort teardown of anything we managed to create.
-            // We know the planned paths for every selected repo; some may
-            // not exist (failure hit before that repo ran). Iterate all
-            // in reverse and force-remove whatever's present.
+            // For each repo where the worktree dir exists, we know both the
+            // worktree and the branch are ours to remove (the pre-check
+            // above guarantees we didn't inherit a pre-existing branch).
             for repo in selected.iter().rev() {
                 let clone_path = paths.repo_clone_path(&repo.key);
                 let worktree_path = reg.plan_worktree_path(&id, &repo.key);
@@ -206,6 +224,18 @@ pub async fn create_workspace(
                         Some(&repo.key),
                     );
                 }
+                git::worktree_prune_best_effort(&clone_path, &tx, &repo.key).await;
+                git::branch_delete_best_effort(&clone_path, &branch, &tx, &repo.key)
+                    .await;
+            }
+
+            // Remove the now-empty parent dir so the reconciler doesn't
+            // flag it as an orphan on the next tick.
+            let parent = reg.worktree_root.join(&id);
+            if parent.exists() && reconcile::is_under(&reg.worktree_root, &parent) {
+                if let Err(e) = tokio::fs::remove_dir_all(&parent).await {
+                    warn!(path = %parent.display(), error = %e, "failed to remove partial workspace dir");
+                }
             }
 
             let _ = tx.0.send(JobEvent::Failed { error: msg });
@@ -218,6 +248,7 @@ pub async fn create_workspace(
 pub async fn delete_workspace(
     app: AppHandle,
     store: State<'_, Arc<Store>>,
+    registry: State<'_, Arc<RegistryLoad>>,
     paths: State<'_, Paths>,
     id: WorkspaceId,
     on_event: Channel<JobEvent>,
@@ -256,10 +287,14 @@ pub async fn delete_workspace(
             continue;
         }
 
+        // Always force: the user already confirmed deletion via the UI,
+        // and a git-level dirty-check failure here is useless friction.
+        // The confirmation banner warns that uncommitted changes will
+        // be lost.
         if let Err(e) = git::worktree_remove(
             &clone_path,
             &link.worktree_path,
-            false, // M3: non-force; dirty-force comes in M7
+            true,
             &tx,
             &link.repo_key,
         )
@@ -267,6 +302,33 @@ pub async fn delete_workspace(
         {
             let _ = tx.0.send(JobEvent::Failed { error: e.to_string() });
             return Err(e);
+        }
+
+        // Prune any stale worktree registrations first — otherwise git
+        // refuses to delete a branch whose worktree is "prunable but still
+        // known to git".
+        git::worktree_prune_best_effort(&clone_path, &tx, &link.repo_key).await;
+
+        // Clean up the branch too — otherwise the next workspace created
+        // with the same name fails with "a branch named X already exists".
+        git::branch_delete_best_effort(
+            &clone_path,
+            &workspace.branch,
+            &tx,
+            &link.repo_key,
+        )
+        .await;
+    }
+
+    // `git worktree remove` deletes the per-repo subdir but leaves the
+    // parent `<worktree_root>/<workspace_id>/` behind — that's what the
+    // reconciler flags as an orphan on the next run. Clean it up now.
+    if let Ok(reg) = registry.require() {
+        let parent = reg.worktree_root.join(&id);
+        if parent.exists() && reconcile::is_under(&reg.worktree_root, &parent) {
+            if let Err(e) = tokio::fs::remove_dir_all(&parent).await {
+                warn!(path = %parent.display(), error = %e, "failed to remove workspace dir after delete");
+            }
         }
     }
 
@@ -314,13 +376,15 @@ pub async fn resume_workspace(
 pub async fn list_discrepancies(
     store: State<'_, Arc<Store>>,
     registry: State<'_, Arc<RegistryLoad>>,
+    in_progress: State<'_, InProgressWorkspaces>,
 ) -> AppResult<Discrepancies> {
     let snapshot = store.read(|s| s.clone()).await;
+    let pending = in_progress.snapshot();
     let reg = match &**registry {
         RegistryLoad::Ok { registry, .. } => Some(registry),
         _ => None,
     };
-    Ok(reconcile::scan(&snapshot, reg).await)
+    Ok(reconcile::scan(&snapshot, reg, &pending).await)
 }
 
 /// Delete a directory that the reconciler flagged as orphaned. The path is
@@ -545,9 +609,8 @@ pub fn send_input(
     data: Vec<u8>,
 ) -> AppResult<()> {
     supervisor.send_input(&session_id, &data)?;
-    // Optimistic flip to Working so the UI reacts on the next keystroke
-    // instead of waiting for Claude to trigger a hook.
-    supervisor.mark_working(&session_id);
+    // Turn state is driven by Claude Code's UserPromptSubmit / Stop /
+    // Notification hooks — no optimistic flip needed here.
     Ok(())
 }
 

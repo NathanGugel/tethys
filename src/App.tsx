@@ -1,7 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-
 import type {
   CreateWorkspaceArgs,
   Discrepancies,
@@ -14,16 +12,21 @@ import type {
   Workspace,
   WorkspaceId,
 } from "./types";
-import { JobLogModal } from "./JobLogModal";
+import { JobLogPane } from "./JobLogPane";
 import { SessionTerminal } from "./SessionTerminal";
 import { applyTheme, ThemeContext } from "./theme";
+import { useTauriEvent } from "./useTauriEvent";
 import "./App.css";
 
-type RunningJob = {
-  title: string;
-  command: string;
-  args: Record<string, unknown>;
-  onSuccess?: (result: unknown) => void;
+type PendingCreate = {
+  tempId: string;
+  branch: string;
+  args: CreateWorkspaceArgs;
+};
+
+type PendingDelete = {
+  workspaceId: WorkspaceId;
+  branch: string;
 };
 
 function App() {
@@ -33,7 +36,8 @@ function App() {
   const [selectedId, setSelectedId] = useState<WorkspaceId | null>(null);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [runningJob, setRunningJob] = useState<RunningJob | null>(null);
+  const [pendingCreate, setPendingCreate] = useState<PendingCreate | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<PendingDelete | null>(null);
   /**
    * Per-session turn state tracked by listening to `session:turn_changed`
    * globally. Used for the sidebar attention dot without needing to
@@ -51,48 +55,36 @@ function App() {
         applyTheme(t);
       })
       .catch((e) => console.error("get_theme failed:", e));
-
-    const unlisten = listen<Theme | null>("theme:changed", (event) => {
-      const t = event.payload ?? null;
-      setTheme(t);
-      applyTheme(t);
-    });
-    return () => {
-      unlisten.then((un) => un());
-    };
   }, []);
 
-  useEffect(() => {
-    const unlisten = listen<TurnChangedEvent>(
-      "session:turn_changed",
-      (event) => {
-        const { workspace_id, session_id, runtime_state } = event.payload;
-        setTurnStates((prev) => {
-          const next = new Map(prev);
-          if (runtime_state === "dormant") {
-            next.delete(session_id);
-          } else {
-            next.set(session_id, {
-              workspaceId: workspace_id,
-              state: runtime_state,
-            });
-          }
-          return next;
+  useTauriEvent<Theme | null>("theme:changed", (event) => {
+    const t = event.payload ?? null;
+    setTheme(t);
+    applyTheme(t);
+  });
+
+  useTauriEvent<TurnChangedEvent>("session:turn_changed", (event) => {
+    const { workspace_id, session_id, runtime_state } = event.payload;
+    setTurnStates((prev) => {
+      const next = new Map(prev);
+      if (runtime_state === "dormant") {
+        next.delete(session_id);
+      } else {
+        next.set(session_id, {
+          workspaceId: workspace_id,
+          state: runtime_state,
         });
-      },
-    );
-    return () => {
-      unlisten.then((un) => un());
-    };
-  }, []);
+      }
+      return next;
+    });
+  });
 
-  const workspaceNeedsAttention = useCallback(
+  const workspaceNeedsTurn = useCallback(
     (w: Workspace): boolean => {
       if (w.paused) return false;
       for (const info of turnStates.values()) {
-        if (info.workspaceId === w.id && info.state === "waiting_input") {
-          return true;
-        }
+        if (info.workspaceId !== w.id) continue;
+        if (info.state === "idle" || info.state === "waiting_input") return true;
       }
       return false;
     },
@@ -117,11 +109,9 @@ function App() {
 
   useEffect(() => {
     refresh();
-    const unlistenPromise = listen("workspace:changed", () => refresh());
-    return () => {
-      unlistenPromise.then((un) => un());
-    };
   }, [refresh]);
+
+  useTauriEvent("workspace:changed", () => refresh());
 
   const selected = useMemo(
     () => workspaces.find((w) => w.id === selectedId) ?? null,
@@ -140,41 +130,80 @@ function App() {
             className="primary"
             onClick={() => setCreating(true)}
             type="button"
-            disabled={!registryOk}
-            title={registryOk ? undefined : "Configure repos.toml first"}
+            disabled={!registryOk || pendingCreate !== null}
+            title={
+              !registryOk
+                ? "Configure repos.toml first"
+                : pendingCreate
+                  ? "Another workspace is being created"
+                  : undefined
+            }
           >
             New workspace
           </button>
         </div>
         <ul className="workspace-list">
-          {workspaces.length === 0 && (
+          {workspaces.length === 0 && !pendingCreate && (
             <li className="empty">No workspaces yet.</li>
           )}
-          {workspaces.map((w) => (
+          {pendingCreate && (
             <li
-              key={w.id}
-              className={w.id === selectedId ? "selected" : ""}
-              onClick={() => setSelectedId(w.id)}
+              key={pendingCreate.tempId}
+              className={`pending${
+                pendingCreate.tempId === selectedId ? " selected" : ""
+              }`}
+              onClick={() => setSelectedId(pendingCreate.tempId)}
             >
               <div className="workspace-name">
-                {workspaceNeedsAttention(w) && (
-                  <span
-                    className="attention-dot"
-                    title="A session is waiting for your input"
-                    aria-label="attention needed"
-                  />
-                )}
-                {w.branch}
-                {w.paused && <span className="paused-badge">paused</span>}
+                <Spinner />
+                {pendingCreate.branch}
               </div>
-              {w.repo_links.length > 0 && (
-                <div className="workspace-meta">
-                  {w.repo_links.length}{" "}
-                  {w.repo_links.length === 1 ? "repo" : "repos"}
-                </div>
-              )}
+              <div className="pending-label">creating…</div>
             </li>
-          ))}
+          )}
+          {workspaces.map((w) => {
+            const deleting = pendingDelete?.workspaceId === w.id;
+            const classes = [
+              w.id === selectedId ? "selected" : "",
+              deleting ? "pending" : "",
+              w.paused && !deleting ? "is-paused" : "",
+            ]
+              .filter(Boolean)
+              .join(" ");
+            return (
+              <li
+                key={w.id}
+                className={classes}
+                onClick={() => setSelectedId(w.id)}
+              >
+                <div className="workspace-name">
+                  {deleting ? (
+                    <Spinner />
+                  ) : (
+                    workspaceNeedsTurn(w) && (
+                      <span
+                        className="turn-dot"
+                        title="Your turn"
+                        aria-label="your turn"
+                      />
+                    )
+                  )}
+                  {w.branch}
+                </div>
+                {deleting ? (
+                  <div className="pending-label">deleting…</div>
+                ) : (
+                  w.repo_links.length > 0 && (
+                    <ul className="workspace-repo-list">
+                      {w.repo_links.map((r) => (
+                        <li key={r.repo_key}>{r.repo_key}</li>
+                      ))}
+                    </ul>
+                  )
+                )}
+              </li>
+            );
+          })}
         </ul>
       </aside>
 
@@ -191,11 +220,50 @@ function App() {
               onChanged={refresh}
             />
           )}
-        {selected ? (
+        {pendingCreate && selectedId === pendingCreate.tempId ? (
+          <JobLogPane
+            title={`Creating ${pendingCreate.branch}`}
+            command="create_workspace"
+            args={{ args: pendingCreate.args }}
+            onSuccess={async (result) => {
+              const ws = result as Workspace;
+              // Refresh before swapping selection so WorkspaceDetail has
+              // the workspace available when the pending pane unmounts.
+              await refresh();
+              setSelectedId(ws.id);
+              setPendingCreate(null);
+            }}
+            onDismiss={() => {
+              setPendingCreate(null);
+              setSelectedId(null);
+            }}
+          />
+        ) : pendingDelete &&
+          selected &&
+          selected.id === pendingDelete.workspaceId ? (
+          <JobLogPane
+            title={`Deleting ${pendingDelete.branch}`}
+            command="delete_workspace"
+            args={{ id: pendingDelete.workspaceId }}
+            onSuccess={() => {
+              setPendingDelete(null);
+              setSelectedId(null);
+              refresh();
+            }}
+            onDismiss={() => {
+              setPendingDelete(null);
+              refresh();
+            }}
+          />
+        ) : selected ? (
           <WorkspaceDetail
             workspace={selected}
-            onDeleted={() => setSelectedId(null)}
-            onRun={setRunningJob}
+            onRequestDelete={() =>
+              setPendingDelete({
+                workspaceId: selected.id,
+                branch: selected.branch,
+              })
+            }
           />
         ) : (
           registryOk && (
@@ -212,26 +280,10 @@ function App() {
           onClose={() => setCreating(false)}
           onSubmit={(args) => {
             setCreating(false);
-            setRunningJob({
-              title: `Creating ${args.branch}`,
-              command: "create_workspace",
-              args: { args },
-              onSuccess: (result) => {
-                const ws = result as Workspace;
-                setSelectedId(ws.id);
-              },
-            });
+            const tempId = `pending:${Date.now()}`;
+            setPendingCreate({ tempId, branch: args.branch, args });
+            setSelectedId(tempId);
           }}
-        />
-      )}
-
-      {runningJob && (
-        <JobLogModal
-          title={runningJob.title}
-          command={runningJob.command}
-          args={runningJob.args}
-          onClose={() => setRunningJob(null)}
-          onSuccess={runningJob.onSuccess}
         />
       )}
     </div>
@@ -429,21 +481,21 @@ function DiscrepancyNotice({
 
 function WorkspaceDetail({
   workspace,
-  onDeleted,
-  onRun,
+  onRequestDelete,
 }: {
   workspace: Workspace;
-  onDeleted: () => void;
-  onRun: (job: RunningJob) => void;
+  onRequestDelete: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
-  const [tab, setTab] = useState<string>("__overview");
+  const [showInfo, setShowInfo] = useState(false);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
-  // Reset tab when the selected workspace changes.
+  // Reset selection when the selected workspace changes.
   useEffect(() => {
-    setTab("__overview");
+    setSelectedSessionId(null);
   }, [workspace.id]);
 
   const refreshSessions = useCallback(async () => {
@@ -459,33 +511,26 @@ function WorkspaceDetail({
 
   useEffect(() => {
     refreshSessions();
-    const sc = listen("session:changed", () => refreshSessions());
-    const sx = listen("session:exit", () => refreshSessions());
-    const st = listen<TurnChangedEvent>(
-      "session:turn_changed",
-      (event) => {
-        const { session_id, runtime_state, notification_type } = event.payload;
-        // Merge into the session list locally — avoids a full re-fetch
-        // round-trip on every hook event.
-        setSessions((prev) =>
-          prev.map((s) =>
-            s.id === session_id
-              ? {
-                  ...s,
-                  runtime_state,
-                  notification_type: notification_type ?? null,
-                }
-              : s,
-          ),
-        );
-      },
-    );
-    return () => {
-      sc.then((un) => un());
-      sx.then((un) => un());
-      st.then((un) => un());
-    };
   }, [refreshSessions]);
+
+  useTauriEvent("session:changed", () => refreshSessions());
+  useTauriEvent("session:exit", () => refreshSessions());
+  useTauriEvent<TurnChangedEvent>("session:turn_changed", (event) => {
+    const { session_id, runtime_state, notification_type } = event.payload;
+    // Merge into the session list locally — avoids a full re-fetch
+    // round-trip on every hook event.
+    setSessions((prev) =>
+      prev.map((s) =>
+        s.id === session_id
+          ? {
+              ...s,
+              runtime_state,
+              notification_type: notification_type ?? null,
+            }
+          : s,
+      ),
+    );
+  });
 
   const togglePause = async () => {
     setBusy(true);
@@ -500,21 +545,63 @@ function WorkspaceDetail({
 
   const performDelete = () => {
     setConfirmingDelete(false);
-    onRun({
-      title: `Deleting ${workspace.branch}`,
-      command: "delete_workspace",
-      args: { id: workspace.id },
-      onSuccess: () => onDeleted(),
-    });
+    onRequestDelete();
   };
 
-  // All live sessions grouped by repo.
-  const sessionsByRepo = new Map<string, SessionInfo[]>();
-  for (const s of sessions) {
-    const arr = sessionsByRepo.get(s.repo_key) ?? [];
-    arr.push(s);
-    sessionsByRepo.set(s.repo_key, arr);
-  }
+  const liveById = new Map(sessions.map((s) => [s.id, s]));
+  // Newest first — the most recently started session is usually what you
+  // want to see. `workspace.sessions` is append-ordered on the backend.
+  const ordered = [...workspace.sessions].reverse();
+
+  // Effective selection: user's explicit pick if still valid; otherwise the
+  // first live session, else the newest entry.
+  const effectiveSelected = (() => {
+    if (selectedSessionId && ordered.some((m) => m.id === selectedSessionId))
+      return selectedSessionId;
+    const firstLive = ordered.find((m) => liveById.has(m.id));
+    return firstLive?.id ?? ordered[0]?.id ?? null;
+  })();
+
+  const selected = effectiveSelected
+    ? ordered.find((m) => m.id === effectiveSelected) ?? null
+    : null;
+  const selectedLive = selected ? liveById.get(selected.id) ?? null : null;
+
+  const startInRepo = async (repoKey: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await invoke<SessionInfo>("start_claude_session", {
+        args: { workspace_id: workspace.id, repo_key: repoKey },
+      });
+      setSelectedSessionId(res.id);
+      refreshSessions();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const resumeMeta = async (metaId: string, repoKey: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await invoke<SessionInfo>("resume_claude_session", {
+        args: {
+          workspace_id: workspace.id,
+          repo_key: repoKey,
+          session_meta_id: metaId,
+        },
+      });
+      setSelectedSessionId(res.id);
+      refreshSessions();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <div className="workspace-detail">
@@ -523,6 +610,9 @@ function WorkspaceDetail({
           <code>{workspace.branch}</code>
         </h2>
         <div className="actions">
+          <button type="button" onClick={() => setShowInfo(true)}>
+            Info
+          </button>
           <button type="button" onClick={togglePause} disabled={busy}>
             {workspace.paused ? "Resume" : "Pause"}
           </button>
@@ -537,51 +627,225 @@ function WorkspaceDetail({
         </div>
       </header>
       {confirmingDelete && (
-        <ConfirmDialog
-          title="Delete workspace?"
-          message={
-            <>
-              Delete workspace <code>{workspace.branch}</code>? This removes
-              every worktree and clears the workspace from Tethys state.
-            </>
-          }
-          confirmLabel="Delete"
-          destructive
-          onConfirm={performDelete}
-          onCancel={() => setConfirmingDelete(false)}
+        <div className="inline-confirm" role="alert">
+          <div className="inline-confirm-message">
+            Delete workspace <code>{workspace.branch}</code>? This removes
+            every worktree <strong>including any uncommitted changes</strong>{" "}
+            and clears the workspace from Tethys state.
+          </div>
+          <div className="inline-confirm-actions">
+            <button
+              type="button"
+              onClick={() => setConfirmingDelete(false)}
+              autoFocus
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="danger primary"
+              onClick={performDelete}
+            >
+              Delete
+            </button>
+          </div>
+        </div>
+      )}
+      {showInfo && (
+        <WorkspaceInfoDialog
+          workspace={workspace}
+          onClose={() => setShowInfo(false)}
         />
       )}
 
-      <nav className="repo-tabs" role="tablist">
+      <div className="session-pane">
+        <SessionBar
+          sessions={ordered}
+          liveById={liveById}
+          repos={workspace.repo_links}
+          selectedId={effectiveSelected}
+          onSelect={setSelectedSessionId}
+          onStartInRepo={startInRepo}
+          busy={busy}
+        />
+        {error && <div className="error-banner">{error}</div>}
+        {selected ? (
+          selectedLive ? (
+            <>
+              {!selectedLive.running && (
+                <div className="session-exit-banner">
+                  Claude exited. Scrollback preserved below.
+                </div>
+              )}
+              <SessionTerminal sessionId={selectedLive.id} />
+            </>
+          ) : (
+            <div className="session-dormant">
+              <p>
+                This Claude session is dormant. Resume re-opens the
+                conversation with <code>claude --resume</code>.
+              </p>
+              {selected.claude_session_id ? (
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={() => resumeMeta(selected.id, selected.repo_key)}
+                  disabled={busy}
+                >
+                  {busy ? (
+                    <>
+                      <Spinner /> Resuming…
+                    </>
+                  ) : (
+                    "Resume"
+                  )}
+                </button>
+              ) : (
+                <p className="muted">
+                  No <code>claude_session_id</code> was captured for this
+                  session — can't resume. (If you just started it, wait a
+                  second for the SessionStart hook.)
+                </p>
+              )}
+            </div>
+          )
+        ) : (
+          <div className="session-pane empty">
+            <p className="muted">No Claude sessions in this workspace yet.</p>
+            <p className="muted">
+              Click <strong>+ New</strong> above to start one.
+            </p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SessionBar({
+  sessions,
+  liveById,
+  repos,
+  selectedId,
+  onSelect,
+  onStartInRepo,
+  busy,
+}: {
+  sessions: { id: string; repo_key: string; claude_session_id: string | null }[];
+  liveById: Map<string, SessionInfo>;
+  repos: { repo_key: string }[];
+  selectedId: string | null;
+  onSelect: (id: string) => void;
+  onStartInRepo: (repoKey: string) => void;
+  busy: boolean;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+
+  // Close the "+ New" repo menu on outside click.
+  useEffect(() => {
+    if (!menuOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
+        setMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [menuOpen]);
+
+  const onNewClick = () => {
+    if (repos.length === 0) return;
+    if (repos.length === 1) {
+      onStartInRepo(repos[0].repo_key);
+      return;
+    }
+    setMenuOpen((v) => !v);
+  };
+
+  return (
+    <div className="session-chip-bar">
+      {sessions.map((m) => {
+        const live = liveById.get(m.id);
+        const label = m.id.slice(0, 8);
+        const needsTurn =
+          live?.running &&
+          (live.runtime_state === "idle" ||
+            live.runtime_state === "waiting_input");
+        return (
+          <button
+            key={m.id}
+            type="button"
+            className={`session-chip${selectedId === m.id ? " active" : ""}`}
+            onClick={() => onSelect(m.id)}
+          >
+            <span className="chip-repo">{m.repo_key}</span>
+            <code>{label}</code>
+            {needsTurn && <span className="turn-dot" />}
+            {live && !live.running && (
+              <span className="chip-state">exited</span>
+            )}
+            {!live && <span className="chip-state">dormant</span>}
+          </button>
+        );
+      })}
+      <div className="new-session-wrap" ref={wrapRef}>
         <button
           type="button"
-          role="tab"
-          aria-selected={tab === "__overview"}
-          className={tab === "__overview" ? "active" : ""}
-          onClick={() => setTab("__overview")}
+          className="session-chip new"
+          onClick={onNewClick}
+          disabled={busy || repos.length === 0}
+          title={
+            repos.length === 0
+              ? "No repos in this workspace"
+              : repos.length === 1
+                ? `Start a new Claude session in ${repos[0].repo_key}`
+                : "Start a new Claude session"
+          }
         >
-          Overview
+          {busy ? <Spinner /> : "+"} New
+          {repos.length > 1 && <span className="caret">▾</span>}
         </button>
-        {workspace.repo_links.map((r) => {
-          const repoSessions = sessionsByRepo.get(r.repo_key) ?? [];
-          const dotState = repoDotState(repoSessions);
-          return (
-            <button
-              key={r.repo_key}
-              type="button"
-              role="tab"
-              aria-selected={tab === r.repo_key}
-              className={tab === r.repo_key ? "active" : ""}
-              onClick={() => setTab(r.repo_key)}
-            >
-              <span>{r.repo_key}</span>
-              {dotState && <span className={`tab-dot dot-${dotState}`} />}
-            </button>
-          );
-        })}
-      </nav>
+        {menuOpen && repos.length > 1 && (
+          <div className="new-session-menu" role="menu">
+            {repos.map((r) => (
+              <button
+                key={r.repo_key}
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setMenuOpen(false);
+                  onStartInRepo(r.repo_key);
+                }}
+              >
+                New in <code>{r.repo_key}</code>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
-      {tab === "__overview" && (
+function WorkspaceInfoDialog({
+  workspace,
+  onClose,
+}: {
+  workspace: Workspace;
+  onClose: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div
+        className="modal info-modal"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+      >
+        <h3>
+          Workspace <code>{workspace.branch}</code>
+        </h3>
         <dl className="workspace-fields">
           <dt>Created</dt>
           <dd>{new Date(workspace.created_at).toLocaleString()}</dd>
@@ -608,205 +872,12 @@ function WorkspaceDetail({
             <code>{workspace.id}</code>
           </dd>
         </dl>
-      )}
-
-      {workspace.repo_links.map((r) =>
-        tab === r.repo_key ? (
-          <RepoSessionPane
-            key={r.repo_key}
-            workspace={workspace}
-            repoKey={r.repo_key}
-            liveSessions={sessionsByRepo.get(r.repo_key) ?? []}
-            onStarted={refreshSessions}
-          />
-        ) : null,
-      )}
-    </div>
-  );
-}
-
-function RepoSessionPane({
-  workspace,
-  repoKey,
-  liveSessions,
-  onStarted,
-}: {
-  workspace: Workspace;
-  repoKey: string;
-  liveSessions: SessionInfo[];
-  onStarted: () => void;
-}) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-
-  const metas = workspace.sessions.filter((s) => s.repo_key === repoKey);
-  // Newest first — users care about recent conversations.
-  const ordered = [...metas].reverse();
-  const liveById = new Map(liveSessions.map((s) => [s.id, s]));
-
-  // Effective selection: user's explicit pick if still valid; otherwise
-  // default to the first live session, or the first entry.
-  const effectiveSelected = (() => {
-    if (selectedId && ordered.some((m) => m.id === selectedId))
-      return selectedId;
-    const firstLive = ordered.find((m) => liveById.has(m.id));
-    return firstLive?.id ?? ordered[0]?.id ?? null;
-  })();
-
-  const startFresh = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      const res = await invoke<SessionInfo>("start_claude_session", {
-        args: { workspace_id: workspace.id, repo_key: repoKey },
-      });
-      setSelectedId(res.id);
-      onStarted();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const resumeMeta = async (metaId: string) => {
-    setBusy(true);
-    setError(null);
-    try {
-      const res = await invoke<SessionInfo>("resume_claude_session", {
-        args: {
-          workspace_id: workspace.id,
-          repo_key: repoKey,
-          session_meta_id: metaId,
-        },
-      });
-      setSelectedId(res.id);
-      onStarted();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  if (ordered.length === 0) {
-    return (
-      <div className="session-pane empty">
-        <p className="muted">No Claude session in this worktree yet.</p>
-        <button
-          type="button"
-          className="primary"
-          onClick={startFresh}
-          disabled={busy}
-        >
-          {busy ? (
-            <>
-              <Spinner /> Starting…
-            </>
-          ) : (
-            <>
-              Start Claude in <code>{repoKey}</code>
-            </>
-          )}
-        </button>
-        {error && <div className="error-banner">{error}</div>}
+        <div className="modal-actions">
+          <button type="button" onClick={onClose} autoFocus>
+            Close
+          </button>
+        </div>
       </div>
-    );
-  }
-
-  const selected = ordered.find((m) => m.id === effectiveSelected) ?? null;
-  const selectedLive = selected ? liveById.get(selected.id) ?? null : null;
-
-  return (
-    <div className="session-pane">
-      <div className="session-chip-bar">
-        {ordered.map((m) => {
-          const live = liveById.get(m.id);
-          const label = m.claude_session_id
-            ? m.claude_session_id.slice(0, 8)
-            : "pending";
-          const dotState =
-            live?.running && live.runtime_state !== "dormant"
-              ? live.runtime_state
-              : null;
-          const urgent = live?.notification_type === "permission_prompt";
-          return (
-            <button
-              key={m.id}
-              type="button"
-              className={`session-chip${
-                effectiveSelected === m.id ? " active" : ""
-              }${urgent ? " urgent" : ""}`}
-              onClick={() => setSelectedId(m.id)}
-              title={
-                live?.notification_type
-                  ? `notification: ${live.notification_type}`
-                  : undefined
-              }
-            >
-              <code>{label}</code>
-              {dotState && <span className={`tab-dot dot-${dotState}`} />}
-              {live && !live.running && (
-                <span className="chip-state">exited</span>
-              )}
-              {!live && <span className="chip-state">dormant</span>}
-            </button>
-          );
-        })}
-        <button
-          type="button"
-          className="session-chip new"
-          onClick={startFresh}
-          disabled={busy}
-          title="Start a new Claude session in this worktree"
-        >
-          {busy ? <Spinner /> : "+"} New
-        </button>
-      </div>
-
-      {error && <div className="error-banner">{error}</div>}
-
-      {selected &&
-        (selectedLive ? (
-          <>
-            {!selectedLive.running && (
-              <div className="session-exit-banner">
-                Claude exited. Scrollback preserved below.
-              </div>
-            )}
-            <SessionTerminal sessionId={selectedLive.id} />
-          </>
-        ) : (
-          <div className="session-dormant">
-            <p>
-              This Claude session is dormant. Resume re-opens the conversation
-              with <code>claude --resume</code>.
-            </p>
-            {selected.claude_session_id ? (
-              <button
-                type="button"
-                className="primary"
-                onClick={() => resumeMeta(selected.id)}
-                disabled={busy}
-              >
-                {busy ? (
-                  <>
-                    <Spinner /> Resuming…
-                  </>
-                ) : (
-                  "Resume"
-                )}
-              </button>
-            ) : (
-              <p className="muted">
-                No <code>claude_session_id</code> was captured for this
-                session — can't resume. (If you just started it, wait a
-                second for the SessionStart hook.)
-              </p>
-            )}
-          </div>
-        ))}
     </div>
   );
 }
@@ -900,71 +971,8 @@ function CreateWorkspaceDialog({
   );
 }
 
-function ConfirmDialog({
-  title,
-  message,
-  confirmLabel = "Confirm",
-  destructive = false,
-  onConfirm,
-  onCancel,
-}: {
-  title: string;
-  message: React.ReactNode;
-  confirmLabel?: string;
-  destructive?: boolean;
-  onConfirm: () => void;
-  onCancel: () => void;
-}) {
-  return (
-    <div className="modal-backdrop" onClick={onCancel}>
-      <div
-        className="modal confirm-modal"
-        onClick={(e) => e.stopPropagation()}
-        role="dialog"
-        aria-modal="true"
-      >
-        <h3>{title}</h3>
-        <div className="confirm-message">{message}</div>
-        <div className="modal-actions">
-          <button type="button" onClick={onCancel} autoFocus>
-            Cancel
-          </button>
-          <button
-            type="button"
-            className={destructive ? "danger primary" : "primary"}
-            onClick={onConfirm}
-          >
-            {confirmLabel}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function Spinner() {
   return <span className="spinner" aria-hidden="true" />;
-}
-
-/**
- * Pick a single state to represent a group of sessions for a repo tab dot.
- * Priority: waiting_input > working > idle > dormant. Null means "no dot".
- */
-function repoDotState(sessions: SessionInfo[]): SessionRuntimeState | null {
-  let best: SessionRuntimeState | null = null;
-  const rank: Record<SessionRuntimeState, number> = {
-    waiting_input: 3,
-    working: 2,
-    idle: 1,
-    dormant: 0,
-  };
-  for (const s of sessions) {
-    if (!best || rank[s.runtime_state] > rank[best]) {
-      best = s.runtime_state;
-    }
-  }
-  // No dot for Dormant-only repos (nothing live happening).
-  return best === "dormant" || best === null ? null : best;
 }
 
 export default App;

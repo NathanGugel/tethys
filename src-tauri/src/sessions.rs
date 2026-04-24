@@ -125,18 +125,6 @@ impl SessionSupervisor {
         );
     }
 
-    /// Optimistic: called from `send_input` so the UI flips to Working
-    /// immediately without waiting for a hook to confirm Claude woke up.
-    pub fn mark_working(&self, session_id: &str) {
-        let workspace_id = {
-            let sessions = self.sessions.lock().unwrap();
-            sessions.get(session_id).map(|h| h.info.workspace_id.clone())
-        };
-        if let Some(wsid) = workspace_id {
-            self.set_turn(session_id, &wsid, SessionRuntimeState::Working, None);
-        }
-    }
-
     /// Low-level spawn: launches `program` with `args` in a fresh PTY.
     /// Extra env vars are applied on top of the inherited environment.
     pub fn spawn(
@@ -285,10 +273,22 @@ impl SessionSupervisor {
     pub async fn handle_hook_event(&self, msg: HookMessage) {
         match msg.event.as_str() {
             "session-start" => self.handle_session_start(msg).await,
+            "user-submit" | "pre-tool" => self.handle_resume_working(msg).await,
             "stop" => self.handle_stop(msg).await,
             "notify" => self.handle_notify(msg).await,
             other => debug!(event = %other, "unknown hook event"),
         }
+    }
+
+    /// UserPromptSubmit or PreToolUse → Claude is (re)starting work.
+    /// The latter covers the "user just answered a permission prompt"
+    /// case, where Claude proceeds with its tool call.
+    async fn handle_resume_working(&self, msg: HookMessage) {
+        let Some(csid) = msg.session_id.as_deref() else {
+            return;
+        };
+        self.set_turn_by_claude_sid(csid, SessionRuntimeState::Working, None)
+            .await;
     }
 
     async fn handle_stop(&self, msg: HookMessage) {

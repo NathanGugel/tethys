@@ -73,10 +73,7 @@ export function themeToCssVars(theme: Theme): Record<string, string> {
     "--accent-fg": c.background,
     "--danger": a[1],
     "--selected-bg": c.selection,
-    "--dot-working": a[3],
-    "--dot-idle": a[2],
-    "--dot-waiting": a[1],
-    "--dot-urgent": a[5],
+    "--turn-dot": a[3],
   };
 }
 
@@ -92,10 +89,7 @@ export function applyTheme(theme: Theme | null) {
     "--accent-fg",
     "--danger",
     "--selected-bg",
-    "--dot-working",
-    "--dot-idle",
-    "--dot-waiting",
-    "--dot-urgent",
+    "--turn-dot",
   ];
   if (!theme) {
     for (const k of keys) root.style.removeProperty(k);

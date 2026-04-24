@@ -3,6 +3,8 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { ClipboardAddon } from "@xterm/addon-clipboard";
+import { WebLinksAddon } from "@xterm/addon-web-links";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 import { themeToXterm, useTheme } from "./theme";
 
@@ -54,15 +56,84 @@ export function SessionTerminal({ sessionId }: Props) {
       cursorBlink: true,
       scrollback: 10000,
       allowProposedApi: true,
+      // OSC 8 escape-sequence hyperlinks (Claude Code emits these for PR
+      // URLs etc.) default to `window.open` which Tauri's WKWebView blocks
+      // and routes through dialog.confirm. Route through plugin-opener.
+      linkHandler: {
+        activate: (_ev, uri) => {
+          openUrl(uri).catch((e) => {
+            console.error("openUrl failed:", e);
+          });
+        },
+      },
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.loadAddon(new ClipboardAddon());
+    // Ctrl/Cmd+Click a URL → open in the default browser. We route through
+    // plugin-opener so WKWebView doesn't try to intercept navigation and
+    // prompt via `dialog.confirm` (which isn't in our capability set).
+    term.loadAddon(
+      new WebLinksAddon((event, uri) => {
+        event.preventDefault();
+        openUrl(uri).catch((e) => {
+          console.error("openUrl failed:", e);
+        });
+      }),
+    );
     // Using xterm's default DOM renderer — @xterm/addon-canvas reaches into
     // v5 internals that v6 removed (`_linkifier2`), and WebGL + WKWebView
     // has known issues on macOS. DOM is plenty fast for interactive shells.
     term.open(container);
     fit.fit();
+
+    // macOS-friendly keybindings over and above xterm's defaults.
+    // Returning false suppresses xterm's default dispatch for that key;
+    // we send our own byte sequence via send_input.
+    const sendRaw = (bytes: number[]) => {
+      invoke("send_input", { sessionId, data: bytes }).catch((e) => {
+        console.error("send_input (keybind) failed:", e);
+      });
+    };
+    term.attachCustomKeyEventHandler((ev) => {
+      if (ev.type !== "keydown") return true;
+
+      // Shift+Enter → newline (Option+Enter equivalent in Claude Code).
+      if (
+        ev.key === "Enter" &&
+        ev.shiftKey &&
+        !ev.metaKey &&
+        !ev.altKey &&
+        !ev.ctrlKey
+      ) {
+        ev.preventDefault();
+        sendRaw([0x1b, 0x0d]);
+        return false;
+      }
+
+      // Cmd+Delete (mac "Delete" = Backspace) → delete previous word.
+      if (ev.key === "Backspace" && ev.metaKey && !ev.altKey && !ev.ctrlKey) {
+        ev.preventDefault();
+        sendRaw([0x17]); // Ctrl-W / readline backward-kill-word
+        return false;
+      }
+
+      // Cmd+Left → previous word (Alt-b).
+      if (ev.key === "ArrowLeft" && ev.metaKey && !ev.altKey && !ev.ctrlKey) {
+        ev.preventDefault();
+        sendRaw([0x1b, 0x62]);
+        return false;
+      }
+
+      // Cmd+Right → next word (Alt-f).
+      if (ev.key === "ArrowRight" && ev.metaKey && !ev.altKey && !ev.ctrlKey) {
+        ev.preventDefault();
+        sendRaw([0x1b, 0x66]);
+        return false;
+      }
+
+      return true;
+    });
 
     termRef.current = term;
     fitRef.current = fit;

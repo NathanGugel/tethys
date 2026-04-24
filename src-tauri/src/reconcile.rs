@@ -37,7 +37,15 @@ pub struct MissingWorktree {
 /// Without a loaded registry we can't know `worktree_root`, so orphan
 /// detection is skipped — we still report missing worktrees based on
 /// `AppState.repo_links`.
-pub async fn scan(state: &AppState, registry: Option<&RepoRegistry>) -> Discrepancies {
+///
+/// `in_progress` is the set of workspace IDs currently being created.
+/// Those directories legitimately exist on disk while state.json hasn't
+/// been updated yet, so we skip them to avoid a false-positive orphan.
+pub async fn scan(
+    state: &AppState,
+    registry: Option<&RepoRegistry>,
+    in_progress: &HashSet<String>,
+) -> Discrepancies {
     let mut out = Discrepancies::default();
 
     // Missing worktrees: state says they should exist, disk says they don't.
@@ -76,7 +84,7 @@ pub async fn scan(state: &AppState, registry: Option<&RepoRegistry>) -> Discrepa
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if known_ids.contains(name) {
+        if known_ids.contains(name) || in_progress.contains(name) {
             continue;
         }
         out.orphaned_dirs.push(OrphanedDir {

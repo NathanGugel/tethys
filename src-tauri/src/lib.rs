@@ -4,6 +4,7 @@ mod error;
 mod git;
 mod hook_install;
 mod hook_listener;
+mod inprogress;
 mod job;
 mod logging;
 mod paths;
@@ -32,6 +33,7 @@ use crate::store::Store;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
@@ -118,6 +120,7 @@ pub fn run() {
             });
 
             app.manage(paths);
+            app.manage(inprogress::InProgressWorkspaces::new());
 
             // --- menu (append Theme items under the default View submenu) --
             if let Err(e) = install_menu(&handle) {
