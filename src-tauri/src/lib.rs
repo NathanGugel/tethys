@@ -205,6 +205,7 @@ pub fn run() {
             commands::github_auth_status,
             commands::github_reprobe_auth,
             commands::open_repos_config,
+            commands::open_in_vscode,
             commands::list_discrepancies,
             commands::remove_orphan_dir,
             commands::forget_workspace,

@@ -94,6 +94,38 @@ pub fn open_repos_config(paths: State<'_, Paths>) -> AppResult<()> {
     Ok(())
 }
 
+#[tauri::command]
+pub async fn open_in_vscode(
+    store: State<'_, Arc<Store>>,
+    id: WorkspaceId,
+) -> AppResult<()> {
+    let paths: Vec<PathBuf> = store
+        .read(|s| {
+            s.find_workspace(&id)
+                .map(|w| w.repo_links.iter().map(|r| r.worktree_path.clone()).collect())
+        })
+        .await
+        .ok_or_else(|| AppError::WorkspaceNotFound(id.clone()))?;
+
+    if paths.is_empty() {
+        return Err(AppError::Other(format!(
+            "workspace {id} has no repos to open"
+        )));
+    }
+
+    for path in &paths {
+        std::process::Command::new("open")
+            .args(["-a", "Visual Studio Code"])
+            .arg(path)
+            .status()
+            .map_err(|e| {
+                AppError::Other(format!("failed to open {} in VS Code: {e}", path.display()))
+            })?;
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateWorkspaceArgs {
     pub branch: String,
