@@ -22,6 +22,7 @@ use crate::setup;
 use crate::state::{new_workspace_id, ClaudeSessionMeta, RepoLink, Workspace, WorkspaceId};
 use crate::store::Store;
 use crate::theme::Theme;
+use crate::tmux::{self, TmuxBin};
 
 #[tauri::command]
 pub async fn list_workspaces(store: State<'_, Arc<Store>>) -> AppResult<Vec<Workspace>> {
@@ -267,6 +268,7 @@ pub async fn delete_workspace(
     store: State<'_, Arc<Store>>,
     registry: State<'_, Arc<RegistryLoad>>,
     paths: State<'_, Paths>,
+    tmux_bin: State<'_, TmuxBin>,
     id: WorkspaceId,
     on_event: Channel<JobEvent>,
 ) -> AppResult<()> {
@@ -274,6 +276,14 @@ pub async fn delete_workspace(
         .read(|s| s.find_workspace(&id).cloned())
         .await
         .ok_or_else(|| AppError::WorkspaceNotFound(id.clone()))?;
+
+    // Kill tmux sessions first so we don't leak long-lived claudes
+    // whose worktree is about to vanish from under them.
+    if !tmux_bin.0.as_os_str().is_empty() {
+        for meta in &workspace.sessions {
+            tmux::kill_session(&tmux_bin.0, &meta.id);
+        }
+    }
 
     let tx = spawn_event_forwarder(on_event);
 
@@ -430,8 +440,17 @@ pub async fn remove_orphan_dir(
 pub async fn forget_workspace(
     app: AppHandle,
     store: State<'_, Arc<Store>>,
+    tmux_bin: State<'_, TmuxBin>,
     id: WorkspaceId,
 ) -> AppResult<()> {
+    let session_ids: Vec<String> = store
+        .read(|s| {
+            s.find_workspace(&id)
+                .map(|w| w.sessions.iter().map(|m| m.id.clone()).collect())
+                .unwrap_or_default()
+        })
+        .await;
+
     let removed = store
         .mutate(|s| {
             let before = s.workspaces.len();
@@ -442,6 +461,15 @@ pub async fn forget_workspace(
     if !removed {
         return Err(AppError::WorkspaceNotFound(id));
     }
+
+    // State is gone — kill the tmux sessions too so they don't become
+    // orphans reaped on the next boot.
+    if !tmux_bin.0.as_os_str().is_empty() {
+        for sid in &session_ids {
+            tmux::kill_session(&tmux_bin.0, sid);
+        }
+    }
+
     info!(%id, "forgot workspace (state-only removal)");
     emit_workspace_changed(&app, &id);
     Ok(())
@@ -482,9 +510,19 @@ pub async fn start_claude_session(
     supervisor: State<'_, Arc<SessionSupervisor>>,
     store: State<'_, Arc<Store>>,
     claude_bin: State<'_, ClaudeBin>,
+    tmux_bin: State<'_, TmuxBin>,
     args: StartClaudeArgs,
 ) -> AppResult<SessionInfo> {
-    spawn_claude(&app, &supervisor, &store, &claude_bin, &args, None).await
+    spawn_claude(
+        &app,
+        &supervisor,
+        &store,
+        &claude_bin,
+        &tmux_bin,
+        &args,
+        None,
+    )
+    .await
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -502,17 +540,18 @@ pub async fn resume_claude_session(
     supervisor: State<'_, Arc<SessionSupervisor>>,
     store: State<'_, Arc<Store>>,
     claude_bin: State<'_, ClaudeBin>,
+    tmux_bin: State<'_, TmuxBin>,
     args: ResumeClaudeArgs,
 ) -> AppResult<SessionInfo> {
     // Pull claude_session_id + cwd from the ClaudeSessionMeta we already
     // persisted on the previous run.
-    let claude_sid = store
+    let lookup = store
         .read(|s| {
             s.find_workspace(&args.workspace_id).and_then(|w| {
                 w.sessions
                     .iter()
                     .find(|sess| sess.id == args.session_meta_id)
-                    .map(|sess| sess.claude_session_id.clone())
+                    .map(|sess| (sess.claude_session_id.clone(), sess.cwd.clone()))
             })
         })
         .await
@@ -522,6 +561,28 @@ pub async fn resume_claude_session(
                 args.session_meta_id, args.workspace_id
             ))
         })?;
+    let (claude_sid, cwd) = lookup;
+
+    // If the tmux session from a prior run is still alive, reattach to it
+    // — no claude respawn, no transcript replay. The Tethys SessionId is
+    // the tmux session name, so we can probe directly.
+    if !tmux_bin.0.as_os_str().is_empty()
+        && tmux::has_session(&tmux_bin.0, &args.session_meta_id)
+    {
+        info!(
+            session_id = %args.session_meta_id,
+            "reattaching to live tmux session"
+        );
+        let info = supervisor.reattach_tmux(
+            args.session_meta_id,
+            args.workspace_id.clone(),
+            args.repo_key,
+            &cwd,
+            &tmux_bin.0,
+        )?;
+        emit_workspace_changed(&app, &args.workspace_id);
+        return Ok(info);
+    }
 
     let claude_sid = claude_sid.ok_or_else(|| {
         AppError::Other(
@@ -533,7 +594,16 @@ pub async fn resume_claude_session(
         workspace_id: args.workspace_id,
         repo_key: args.repo_key,
     };
-    spawn_claude(&app, &supervisor, &store, &claude_bin, &start, Some(&claude_sid)).await
+    spawn_claude(
+        &app,
+        &supervisor,
+        &store,
+        &claude_bin,
+        &tmux_bin,
+        &start,
+        Some(&claude_sid),
+    )
+    .await
 }
 
 async fn spawn_claude(
@@ -541,9 +611,16 @@ async fn spawn_claude(
     supervisor: &Arc<SessionSupervisor>,
     store: &Arc<Store>,
     claude_bin: &ClaudeBin,
+    tmux_bin: &TmuxBin,
     args: &StartClaudeArgs,
     resume_claude_sid: Option<&str>,
 ) -> AppResult<SessionInfo> {
+    if tmux_bin.0.as_os_str().is_empty() {
+        return Err(AppError::Other(
+            "tmux not found — install with `brew install tmux` and restart Tethys".into(),
+        ));
+    }
+
     let worktree_path = store
         .read(|s| {
             s.find_workspace(&args.workspace_id).and_then(|w| {
@@ -565,6 +642,7 @@ async fn spawn_claude(
         args.workspace_id.clone(),
         args.repo_key.clone(),
         &worktree_path,
+        &tmux_bin.0,
         &claude_bin.0,
         resume_claude_sid,
     )?;

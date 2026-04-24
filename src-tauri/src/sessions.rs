@@ -15,6 +15,7 @@ use crate::error::{AppError, AppResult};
 use crate::hook_listener::HookMessage;
 use crate::state::SessionRuntimeState;
 use crate::store::Store;
+use crate::tmux;
 
 const RING_CAPACITY: usize = 2 * 1024 * 1024; // 2 MB scrollback per session
 const READ_BUF: usize = 4096;
@@ -125,16 +126,19 @@ impl SessionSupervisor {
         );
     }
 
-    /// Low-level spawn: launches `program` with `args` in a fresh PTY.
-    /// Extra env vars are applied on top of the inherited environment.
-    pub fn spawn(
+    /// Inner spawn: opens a PTY, runs `program args`, wires up reader/
+    /// subscribers/watcher, and stores a `SessionHandle` under `id`. The
+    /// caller provides `id` so it can match an existing tmux session name
+    /// (the tmux session name == Tethys SessionId by convention).
+    fn spawn_with_id(
         &self,
+        id: SessionId,
         workspace_id: String,
         repo_key: String,
         cwd: &Path,
-        program: &str,
+        program: &Path,
         args: &[String],
-        env: &[(String, String)],
+        tmux_bin: PathBuf,
     ) -> AppResult<SessionInfo> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -152,9 +156,6 @@ impl SessionSupervisor {
         }
         cmd.cwd(cwd);
         cmd.env("TERM", "xterm-256color");
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
 
         let child = pair
             .slave
@@ -171,7 +172,6 @@ impl SessionSupervisor {
             .take_writer()
             .map_err(|e| AppError::Other(format!("take writer failed: {e}")))?;
 
-        let id = new_session_id();
         let info = SessionInfo {
             id: id.clone(),
             workspace_id: workspace_id.clone(),
@@ -193,6 +193,7 @@ impl SessionSupervisor {
             id.clone(),
             workspace_id.clone(),
             running.clone(),
+            tmux_bin,
             self.app.clone(),
         );
 
@@ -206,8 +207,9 @@ impl SessionSupervisor {
         };
 
         self.sessions.lock().unwrap().insert(id.clone(), handle);
-        // Default to Working — a just-spawned Claude is doing something
-        // (starting up, replaying transcript). Hooks will refine shortly.
+        // Default to Working — a just-spawned/attached Claude is likely
+        // doing something (starting up, or mid-response after we reattach).
+        // Hooks will refine shortly.
         self.turn.lock().unwrap().insert(
             id,
             TurnState {
@@ -222,33 +224,60 @@ impl SessionSupervisor {
         Ok(info)
     }
 
-    /// Spawn a `claude` process with a correlation token so the SessionStart
-    /// hook can report back which Tethys session it belongs to. Pass
-    /// `resume_claude_session_id` to resume an existing conversation.
+    /// Spawn `claude` inside a fresh tmux session. The tmux server (socket
+    /// label `tethys`) keeps the claude process alive across Tethys
+    /// restarts — it only dies on reboot, explicit kill, or claude itself
+    /// exiting. Pass `resume_claude_session_id` to resume an existing
+    /// conversation (`claude --resume <id>`).
+    ///
+    /// The `TETHYS_SPAWN_TOKEN` correlation var reaches claude via tmux's
+    /// `-e` flag (per-session env), so the SessionStart hook still maps
+    /// back to the right Tethys session.
     pub fn spawn_claude(
         &self,
         workspace_id: String,
         repo_key: String,
         cwd: &Path,
+        tmux_bin: &Path,
         claude_bin: &Path,
         resume_claude_session_id: Option<&str>,
     ) -> AppResult<(SessionInfo, String)> {
         let token = Uuid::new_v4().to_string();
+        let id = new_session_id();
 
-        let mut args: Vec<String> = Vec::new();
-        if let Some(id) = resume_claude_session_id {
+        // Chain: -L <socket> set-option ... ; set-option ... ; new-session ...
+        // The server options are prepended so they apply on cold-start
+        // (when new-session is what boots the server).
+        let mut args: Vec<String> = vec!["-L".into(), tmux::SOCKET_LABEL.into()];
+        args.extend(tmux::server_init_args());
+        args.extend([
+            "new-session".into(),
+            "-A".into(), // attach if a session with this name somehow exists
+            "-D".into(), // ...and detach any other clients on that session
+            "-s".into(),
+            id.clone(),
+            "-e".into(),
+            format!("TETHYS_SPAWN_TOKEN={token}"),
+            "-x".into(),
+            "200".into(),
+            "-y".into(),
+            "50".into(),
+            "--".into(),
+            claude_bin.to_string_lossy().into_owned(),
+        ]);
+        if let Some(csid) = resume_claude_session_id {
             args.push("--resume".into());
-            args.push(id.to_string());
+            args.push(csid.to_string());
         }
 
-        let env = vec![("TETHYS_SPAWN_TOKEN".into(), token.clone())];
-        let info = self.spawn(
+        let info = self.spawn_with_id(
+            id,
             workspace_id.clone(),
             repo_key,
             cwd,
-            &claude_bin.to_string_lossy(),
+            tmux_bin,
             &args,
-            &env,
+            tmux_bin.to_path_buf(),
         )?;
 
         // Prune any expired pending correlations while we're here.
@@ -265,6 +294,43 @@ impl SessionSupervisor {
         );
 
         Ok((info, token))
+    }
+
+    /// Attach a fresh tmux client to an existing session. Used when the
+    /// app restarts and finds the tmux session still alive — claude keeps
+    /// running in the tmux server, we just reconnect a new PTY to it.
+    /// Returns `AppError` if the tmux session doesn't exist (caller should
+    /// fall back to `spawn_claude(..., Some(claude_session_id))`).
+    pub fn reattach_tmux(
+        &self,
+        session_id: SessionId,
+        workspace_id: String,
+        repo_key: String,
+        cwd: &Path,
+        tmux_bin: &Path,
+    ) -> AppResult<SessionInfo> {
+        if !tmux::has_session(tmux_bin, &session_id) {
+            return Err(AppError::Other(format!(
+                "tmux session {session_id} no longer exists"
+            )));
+        }
+        let mut args: Vec<String> = vec!["-L".into(), tmux::SOCKET_LABEL.into()];
+        args.extend(tmux::server_init_args());
+        args.extend([
+            "attach-session".into(),
+            "-d".into(), // detach any other clients
+            "-t".into(),
+            session_id.clone(),
+        ]);
+        self.spawn_with_id(
+            session_id,
+            workspace_id,
+            repo_key,
+            cwd,
+            tmux_bin,
+            &args,
+            tmux_bin.to_path_buf(),
+        )
     }
 
     /// Dispatch a hook event from `tethys-hook`. Currently handles
@@ -538,12 +604,27 @@ fn spawn_child_watcher(
     session_id: SessionId,
     workspace_id: String,
     running: Arc<Mutex<bool>>,
+    tmux_bin: PathBuf,
     app: AppHandle,
 ) {
     std::thread::spawn(move || {
         let status = child.wait();
         *running.lock().unwrap() = false;
         let code = status.ok().map(|s| s.exit_code() as i32);
+
+        // The child here is the tmux *client*. It exits both when claude
+        // truly ends (session disappears) and when the client merely
+        // detaches (app shutdown, another client steals with -D, etc.).
+        // Check has-session to tell them apart.
+        if tmux::has_session(&tmux_bin, &session_id) {
+            info!(
+                %session_id,
+                ?code,
+                "tmux client exited but session still alive (detach)"
+            );
+            return;
+        }
+
         info!(%session_id, ?code, "session child exited");
         let _ = app.emit(
             "session:exit",

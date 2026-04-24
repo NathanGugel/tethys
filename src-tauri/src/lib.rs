@@ -16,6 +16,7 @@ mod setup;
 mod state;
 mod store;
 mod theme;
+mod tmux;
 
 use std::sync::Arc;
 
@@ -30,6 +31,7 @@ use crate::paths::Paths;
 use crate::registry::RegistryLoad;
 use crate::sessions::SessionSupervisor;
 use crate::store::Store;
+use crate::tmux::TmuxBin;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -90,6 +92,20 @@ pub fn run() {
                     // Still manage a placeholder so commands can surface
                     // the error at spawn time rather than panicking.
                     app.manage(ClaudeBin(std::path::PathBuf::new()));
+                }
+            }
+
+            // --- tmux binary (claude sessions run inside a tmux server so
+            // they survive app restarts until reboot).
+            match tmux::resolve() {
+                Ok(path) => {
+                    tmux::ensure_server_init(&path);
+                    reap_orphan_tmux_sessions(&path, &store);
+                    app.manage(TmuxBin(path));
+                }
+                Err(e) => {
+                    warn!(error = %e, "tmux binary not resolved at startup");
+                    app.manage(TmuxBin(std::path::PathBuf::new()));
                 }
             }
 
@@ -194,6 +210,31 @@ pub fn run() {
 }
 
 struct LoggingGuard(#[allow(dead_code)] tracing_appender::non_blocking::WorkerGuard);
+
+/// Kill any tmux session on our private server whose name isn't a known
+/// `ClaudeSessionMeta.id`. Catches leftovers from app crashes between
+/// spawn and state.json flush, and from workspaces that were deleted
+/// while their tmux sessions were still alive.
+fn reap_orphan_tmux_sessions(tmux_bin: &std::path::Path, store: &Arc<Store>) {
+    let known: std::collections::HashSet<String> = tauri::async_runtime::block_on(async {
+        store
+            .read(|s| {
+                s.workspaces
+                    .iter()
+                    .flat_map(|w| w.sessions.iter().map(|sess| sess.id.clone()))
+                    .collect::<std::collections::HashSet<_>>()
+            })
+            .await
+    });
+
+    for name in tmux::list_sessions(tmux_bin) {
+        if known.contains(&name) {
+            continue;
+        }
+        warn!(session = %name, "killing orphaned tmux session");
+        tmux::kill_session(tmux_bin, &name);
+    }
+}
 
 /// Build the default OS menu, then append Theme items under the View submenu.
 /// If the layout of the default menu changes upstream and "View" isn't found,
