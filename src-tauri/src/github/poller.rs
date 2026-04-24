@@ -306,39 +306,54 @@ fn build_query(targets: &[Target]) -> (String, BTreeMap<String, String>) {
     let mut var_decls = Vec::new();
     let mut body = String::new();
 
+    // Shared selection set for a PR node — same shape whether we found it via
+    // the branch ref or via the merged-PRs fallback.
+    const PR_FIELDS: &str = r#"number
+          url
+          state
+          isDraft
+          reviewDecision
+          reviewThreads(first: 50) { nodes { isResolved } }
+          commits(last: 1) {
+            nodes {
+              commit {
+                oid
+                statusCheckRollup { state }
+              }
+            }
+          }"#;
+
     for (i, t) in targets.iter().enumerate() {
         let ow = format!("q{i}_owner");
         let nm = format!("q{i}_name");
         let br = format!("q{i}_branch");
+        let bn = format!("q{i}_branch_name");
         vars.insert(ow.clone(), t.slug.owner.clone());
         vars.insert(nm.clone(), t.slug.name.clone());
         vars.insert(br.clone(), format!("refs/heads/{}", t.branch));
+        vars.insert(bn.clone(), t.branch.clone());
         var_decls.push(format!(
-            "${ow}: String!, ${nm}: String!, ${br}: String!",
+            "${ow}: String!, ${nm}: String!, ${br}: String!, ${bn}: String!",
             ow = ow,
             nm = nm,
             br = br,
+            bn = bn,
         ));
+        // `mergedPrs` is the fallback for when the branch has been deleted
+        // post-merge: GitHub nulls the `ref`, but the PR record persists and
+        // is queryable by headRefName.
         body.push_str(&format!(
             r#"q{i}: repository(owner: ${ow}, name: ${nm}) {{
     ref(qualifiedName: ${br}) {{
       associatedPullRequests(first: 1, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
         nodes {{
-          number
-          url
-          state
-          isDraft
-          reviewDecision
-          reviewThreads(first: 50) {{ nodes {{ isResolved }} }}
-          commits(last: 1) {{
-            nodes {{
-              commit {{
-                oid
-                statusCheckRollup {{ state }}
-              }}
-            }}
-          }}
+          {PR_FIELDS}
         }}
+      }}
+    }}
+    mergedPrs: pullRequests(headRefName: ${bn}, states: [MERGED, CLOSED], first: 1, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
+      nodes {{
+        {PR_FIELDS}
       }}
     }}
   }}
@@ -347,6 +362,8 @@ fn build_query(targets: &[Target]) -> (String, BTreeMap<String, String>) {
             ow = ow,
             nm = nm,
             br = br,
+            bn = bn,
+            PR_FIELDS = PR_FIELDS,
         ));
     }
 
@@ -370,12 +387,21 @@ fn parse_response(targets: &[Target], data: &Value) -> Vec<(WorkspaceId, String,
 }
 
 fn parse_repo_node(repo: &Value) -> Option<GithubPrStatus> {
-    let pr = repo
-        .get("ref")?
-        .get("associatedPullRequests")?
-        .get("nodes")?
-        .as_array()?
-        .first()?;
+    // Prefer the PR associated with the live branch ref. If the branch was
+    // deleted on merge, `ref` will be null — fall back to the most recent
+    // merged/closed PR for that branch name.
+    let assoc = repo
+        .get("ref")
+        .and_then(|r| r.get("associatedPullRequests"))
+        .and_then(|a| a.get("nodes"))
+        .and_then(|n| n.as_array())
+        .and_then(|arr| arr.first());
+    let merged_fallback = repo
+        .get("mergedPrs")
+        .and_then(|m| m.get("nodes"))
+        .and_then(|n| n.as_array())
+        .and_then(|arr| arr.first());
+    let pr = assoc.or(merged_fallback)?;
 
     let number = pr.get("number")?.as_u64()? as u32;
     let url = pr.get("url")?.as_str()?.to_string();
@@ -522,9 +548,12 @@ mod tests {
         let (q, vars) = build_query(&targets);
         assert!(q.contains("q0: repository(owner: $q0_owner"));
         assert!(q.contains("q1: repository(owner: $q1_owner"));
+        assert!(q.contains("mergedPrs: pullRequests(headRefName: $q0_branch_name"));
         assert_eq!(vars.get("q0_owner").unwrap(), "rynobax");
         assert_eq!(vars.get("q0_branch").unwrap(), "refs/heads/feat/foo-0");
+        assert_eq!(vars.get("q0_branch_name").unwrap(), "feat/foo-0");
         assert_eq!(vars.get("q1_branch").unwrap(), "refs/heads/feat/foo-1");
+        assert_eq!(vars.get("q1_branch_name").unwrap(), "feat/foo-1");
     }
 
     #[test]
@@ -582,6 +611,74 @@ mod tests {
         assert_eq!(status.checks, ChecksRollup::Failure);
         assert_eq!(status.unresolved_threads, 2);
         assert_eq!(status.head_sha, "abc123");
+    }
+
+    #[test]
+    fn parse_falls_back_to_merged_prs_when_ref_null() {
+        // Branch deleted post-merge: GitHub returns `ref: null`, but the PR
+        // record is still reachable via pullRequests(headRefName:).
+        let data = json!({
+            "q0": {
+                "ref": null,
+                "mergedPrs": {
+                    "nodes": [{
+                        "number": 99,
+                        "url": "https://github.com/x/y/pull/99",
+                        "state": "MERGED",
+                        "isDraft": false,
+                        "reviewThreads": { "nodes": [] },
+                        "commits": {
+                            "nodes": [{"commit": {"oid": "deadbeef", "statusCheckRollup": null}}]
+                        }
+                    }]
+                }
+            }
+        });
+        let status = parse_response(&[mk_target(0)], &data)[0]
+            .2
+            .clone()
+            .expect("should fall back to mergedPrs");
+        assert_eq!(status.pr_number, 99);
+        assert_eq!(status.state, PrState::Merged);
+    }
+
+    #[test]
+    fn parse_prefers_ref_over_merged_prs_fallback() {
+        // Branch still live with an open PR — ignore any older merged PRs
+        // that happen to share the branch name.
+        let data = json!({
+            "q0": {
+                "ref": {
+                    "associatedPullRequests": {
+                        "nodes": [{
+                            "number": 5,
+                            "url": "u",
+                            "state": "OPEN",
+                            "isDraft": false,
+                            "reviewThreads": {"nodes": []},
+                            "commits": {
+                                "nodes": [{"commit": {"oid": "o", "statusCheckRollup": null}}]
+                            }
+                        }]
+                    }
+                },
+                "mergedPrs": {
+                    "nodes": [{
+                        "number": 3,
+                        "url": "u",
+                        "state": "MERGED",
+                        "isDraft": false,
+                        "reviewThreads": {"nodes": []},
+                        "commits": {
+                            "nodes": [{"commit": {"oid": "o", "statusCheckRollup": null}}]
+                        }
+                    }]
+                }
+            }
+        });
+        let status = parse_response(&[mk_target(0)], &data)[0].2.clone().unwrap();
+        assert_eq!(status.pr_number, 5);
+        assert_eq!(status.state, PrState::Open);
     }
 
     #[test]

@@ -517,6 +517,10 @@ function WorkspaceDetail({
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Meta ids we've already auto-resumed this app-run — guards against
+  // retry loops if spawn fails, while still allowing a manual Resume
+  // click to try again.
+  const autoResumedRef = useRef<Set<string>>(new Set());
 
   // Reset selection when the selected workspace changes.
   useEffect(() => {
@@ -627,6 +631,18 @@ function WorkspaceDetail({
       setBusy(false);
     }
   };
+
+  // Auto-resume the selected session when it's dormant but has a
+  // claude_session_id. `autoResumedRef` prevents a retry loop if the
+  // spawn fails — the user can still click Resume manually below.
+  useEffect(() => {
+    if (!selected || selectedLive) return;
+    if (!selected.claude_session_id) return;
+    if (autoResumedRef.current.has(selected.id)) return;
+    autoResumedRef.current.add(selected.id);
+    void resumeMeta(selected.id, selected.repo_key);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected?.id, selectedLive?.id, selected?.claude_session_id]);
 
   return (
     <div className="workspace-detail">
