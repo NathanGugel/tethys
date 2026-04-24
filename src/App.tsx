@@ -882,6 +882,27 @@ function WorkspaceInfoDialog({
   );
 }
 
+const LAST_REPO_SELECTION_KEY = "tethys.createWorkspace.lastRepoSelection";
+
+function loadLastRepoSelection(repos: Repo[]): Set<string> {
+  const available = new Set(repos.map((r) => r.key));
+  try {
+    const raw = localStorage.getItem(LAST_REPO_SELECTION_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        const restored = parsed.filter(
+          (k): k is string => typeof k === "string" && available.has(k),
+        );
+        if (restored.length > 0) return new Set(restored);
+      }
+    }
+  } catch {
+    // fall through to default
+  }
+  return available;
+}
+
 function CreateWorkspaceDialog({
   repos,
   onClose,
@@ -892,8 +913,8 @@ function CreateWorkspaceDialog({
   onSubmit: (args: CreateWorkspaceArgs) => void;
 }) {
   const [branch, setBranch] = useState("");
-  const [selected, setSelected] = useState<Set<string>>(
-    () => new Set(repos.map((r) => r.key)),
+  const [selected, setSelected] = useState<Set<string>>(() =>
+    loadLastRepoSelection(repos),
   );
 
   const toggle = (key: string) => {
@@ -909,9 +930,18 @@ function CreateWorkspaceDialog({
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
+    const repoSelections = Array.from(selected);
+    try {
+      localStorage.setItem(
+        LAST_REPO_SELECTION_KEY,
+        JSON.stringify(repoSelections),
+      );
+    } catch {
+      // non-fatal: preference just won't persist
+    }
     onSubmit({
       branch: branch.trim(),
-      repo_selections: Array.from(selected),
+      repo_selections: repoSelections,
     });
   };
 
