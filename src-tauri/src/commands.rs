@@ -11,6 +11,7 @@ use tauri::ipc::InvokeResponseBody;
 
 use crate::error::{AppError, AppResult};
 use crate::git;
+use crate::github::poller::{AuthSnapshot, GithubPoller};
 use crate::inprogress::InProgressWorkspaces;
 use crate::job::{JobEvent, JobTx};
 use crate::paths::Paths;
@@ -47,6 +48,21 @@ pub fn list_repos(registry: State<'_, Arc<RegistryLoad>>) -> AppResult<Vec<Repo>
 #[tauri::command]
 pub fn registry_status(registry: State<'_, Arc<RegistryLoad>>) -> RegistryLoad {
     (**registry).clone()
+}
+
+#[tauri::command]
+pub async fn github_auth_status(
+    poller: State<'_, Arc<GithubPoller>>,
+) -> AppResult<AuthSnapshot> {
+    Ok(poller.auth_snapshot().await)
+}
+
+#[tauri::command]
+pub async fn github_reprobe_auth(
+    poller: State<'_, Arc<GithubPoller>>,
+) -> AppResult<AuthSnapshot> {
+    poller.probe_login().await;
+    Ok(poller.auth_snapshot().await)
 }
 
 #[tauri::command]
@@ -153,6 +169,7 @@ pub async fn create_workspace(
                 repo_key: repo.key.clone(),
                 worktree_path: worktree_path.clone(),
                 setup_script_ran_at: None,
+                github: None,
             };
 
             if let Some(script) = repo.default_setup_script.as_ref().filter(|s| !s.trim().is_empty()) {

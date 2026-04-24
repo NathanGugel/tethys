@@ -2,6 +2,7 @@ mod claude;
 mod commands;
 mod error;
 mod git;
+mod github;
 mod hook_install;
 mod hook_listener;
 mod inprogress;
@@ -19,11 +20,12 @@ mod theme;
 use std::sync::Arc;
 
 use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
-use tauri::Manager;
+use tauri::{Manager, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
 use tracing::{error, info, warn};
 
 use crate::commands::ClaudeBin;
+use crate::github::GithubPoller;
 use crate::paths::Paths;
 use crate::registry::RegistryLoad;
 use crate::sessions::SessionSupervisor;
@@ -119,6 +121,23 @@ pub fn run() {
                 }
             });
 
+            // --- github poller ---------------------------------------------
+            let registry_for_poller: Arc<RegistryLoad> = app.state::<Arc<RegistryLoad>>().inner().clone();
+            let poller = Arc::new(GithubPoller::new(
+                store.clone(),
+                registry_for_poller,
+                handle.clone(),
+            ));
+            app.manage(poller.clone());
+            let poller_for_probe = poller.clone();
+            tauri::async_runtime::spawn(async move {
+                match poller_for_probe.probe_login().await {
+                    Some(login) => info!(login, "gh authenticated"),
+                    None => info!("gh auth probe failed — polling will retry"),
+                }
+            });
+            tauri::async_runtime::spawn(poller.clone().run());
+
             app.manage(paths);
             app.manage(inprogress::InProgressWorkspaces::new());
 
@@ -132,6 +151,19 @@ pub fn run() {
                 _ => {}
             });
 
+            // --- window focus → force-tick the github poller ---------------
+            if let Some(window) = app.get_webview_window("main") {
+                let poller_for_focus = poller.clone();
+                window.on_window_event(move |event| {
+                    if let WindowEvent::Focused(true) = event {
+                        let p = poller_for_focus.clone();
+                        tauri::async_runtime::spawn(async move {
+                            p.request_tick().await;
+                        });
+                    }
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -143,6 +175,8 @@ pub fn run() {
             commands::resume_workspace,
             commands::list_repos,
             commands::registry_status,
+            commands::github_auth_status,
+            commands::github_reprobe_auth,
             commands::open_repos_config,
             commands::list_discrepancies,
             commands::remove_orphan_dir,

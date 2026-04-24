@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::error::{AppError, AppResult};
+use crate::github::{parse_github_remote, GithubSlug};
 
 /// The user-edited repo registry — Tethys's pointer to which repos exist on
 /// disk and where their worktrees should land.
@@ -45,6 +46,12 @@ pub struct Repo {
     /// Hard timeout for the setup script, in seconds. Defaults to 600.
     #[serde(default)]
     pub setup_timeout_secs: Option<u64>,
+
+    /// Populated at registry load time by parsing `remote_url`. `None` means
+    /// the remote isn't on github.com and GitHub sync should skip this repo.
+    #[serde(skip, default)]
+    #[schemars(skip)]
+    pub github_slug: Option<GithubSlug>,
 }
 
 /// The outcome of loading `repos.toml` at boot.
@@ -71,7 +78,7 @@ impl RegistryLoad {
     pub fn load(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
             Ok(s) => match toml::from_str::<RepoRegistry>(&s) {
-                Ok(registry) => {
+                Ok(mut registry) => {
                     if let Err(e) = validate_worktree_root(&registry.worktree_root) {
                         warn!(error = %e, "repos.toml loaded but worktree_root is unusable");
                         return RegistryLoad::Invalid {
@@ -79,6 +86,7 @@ impl RegistryLoad {
                             error: format!("worktree_root: {e}"),
                         };
                     }
+                    populate_github_slugs(&mut registry);
                     info!(
                         repos = registry.repos.len(),
                         worktree_root = %registry.worktree_root.display(),
@@ -127,6 +135,21 @@ impl RepoRegistry {
     /// `<worktree_root>/<workspace_id>/<repo_key>`
     pub fn plan_worktree_path(&self, workspace_id: &str, repo_key: &str) -> PathBuf {
         self.worktree_root.join(workspace_id).join(repo_key)
+    }
+}
+
+/// Parse each repo's remote URL into an `owner/name` slug, logging a single
+/// info line per non-GitHub repo so the user knows why they won't see PR data.
+fn populate_github_slugs(registry: &mut RepoRegistry) {
+    for repo in &mut registry.repos {
+        repo.github_slug = parse_github_remote(&repo.remote_url);
+        if repo.github_slug.is_none() {
+            info!(
+                key = %repo.key,
+                remote = %repo.remote_url,
+                "repo has non-GitHub remote; skipping GitHub sync for this repo",
+            );
+        }
     }
 }
 

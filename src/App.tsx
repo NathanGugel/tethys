@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   CreateWorkspaceArgs,
   Discrepancies,
+  GithubStatusChangedEvent,
   RegistryStatus,
   Repo,
   SessionInfo,
@@ -12,10 +13,13 @@ import type {
   Workspace,
   WorkspaceId,
 } from "./types";
+import { GithubAuthFooter } from "./GithubAuthFooter";
+import { GithubChip } from "./GithubChip";
 import { JobLogPane } from "./JobLogPane";
 import { SessionTerminal } from "./SessionTerminal";
 import { applyTheme, ThemeContext } from "./theme";
 import { useTauriEvent } from "./useTauriEvent";
+import { isReadyToArchive } from "./workspaceDerived";
 import "./App.css";
 
 type PendingCreate = {
@@ -77,6 +81,21 @@ function App() {
       }
       return next;
     });
+  });
+
+  useTauriEvent<GithubStatusChangedEvent>("github:status_changed", (event) => {
+    const { workspace_id, repo_key, status } = event.payload;
+    setWorkspaces((prev) =>
+      prev.map((w) => {
+        if (w.id !== workspace_id) return w;
+        return {
+          ...w,
+          repo_links: w.repo_links.map((r) =>
+            r.repo_key === repo_key ? { ...r, github: status } : r,
+          ),
+        };
+      }),
+    );
   });
 
   const workspaceNeedsTurn = useCallback(
@@ -196,7 +215,12 @@ function App() {
                   w.repo_links.length > 0 && (
                     <ul className="workspace-repo-list">
                       {w.repo_links.map((r) => (
-                        <li key={r.repo_key}>{r.repo_key}</li>
+                        <li key={r.repo_key}>
+                          <span className="repo-key">{r.repo_key}</span>
+                          {r.github && (
+                            <GithubChip status={r.github} linkable={false} />
+                          )}
+                        </li>
                       ))}
                     </ul>
                   )
@@ -205,6 +229,7 @@ function App() {
             );
           })}
         </ul>
+        <GithubAuthFooter />
       </aside>
 
       <main className="detail">
@@ -608,6 +633,9 @@ function WorkspaceDetail({
       <header>
         <h2>
           <code>{workspace.branch}</code>
+          {workspace.repo_links.map(
+            (r) => r.github && <GithubChip key={r.repo_key} status={r.github} />,
+          )}
         </h2>
         <div className="actions">
           <button type="button" onClick={() => setShowInfo(true)}>
@@ -649,6 +677,23 @@ function WorkspaceDetail({
               Delete
             </button>
           </div>
+        </div>
+      )}
+      {!confirmingDelete && isReadyToArchive(workspace) && (
+        <div className="archive-banner">
+          <div>
+            <strong>Ready to archive.</strong>{" "}
+            <span className="muted">
+              Every linked PR for <code>{workspace.branch}</code> is merged.
+            </span>
+          </div>
+          <button
+            type="button"
+            className="primary"
+            onClick={() => setConfirmingDelete(true)}
+          >
+            Delete workspace
+          </button>
         </div>
       )}
       {showInfo && (

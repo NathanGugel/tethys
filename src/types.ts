@@ -7,10 +7,39 @@ export type SessionRuntimeState =
   | "waiting_input"
   | "idle";
 
+export type PrState = "open" | "merged" | "closed";
+
+export type ChecksRollup =
+  | "none"
+  | "pending"
+  | "success"
+  | "failure"
+  | "neutral";
+
+export type ReviewDecision =
+  | "none"
+  | "approved"
+  | "changes_requested"
+  | "review_required";
+
+export interface GithubPrStatus {
+  pr_number: number;
+  url: string;
+  state: PrState;
+  is_draft: boolean;
+  checks: ChecksRollup;
+  review_decision: ReviewDecision;
+  unresolved_threads: number;
+  head_sha: string;
+  fetched_at: string;
+  last_error: string | null;
+}
+
 export interface RepoLink {
   repo_key: string;
   worktree_path: string;
   setup_script_ran_at: string | null;
+  github: GithubPrStatus | null;
 }
 
 export interface ClaudeSessionMeta {
@@ -84,6 +113,24 @@ export interface TurnChangedEvent {
   session_id: string;
   runtime_state: SessionRuntimeState;
   notification_type: string | null;
+}
+
+export interface GithubStatusChangedEvent {
+  workspace_id: string;
+  repo_key: string;
+  /** null when the PR no longer exists (branch unpushed or deleted). */
+  status: GithubPrStatus | null;
+}
+
+export type GithubAuthState =
+  | "unknown"
+  | "authenticated"
+  | "not_authenticated"
+  | "disabled";
+
+export interface GithubAuthSnapshot {
+  state: GithubAuthState;
+  login: string | null;
 }
 
 export interface ThemeColors {

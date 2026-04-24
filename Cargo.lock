@@ -4129,6 +4129,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "chrono",
+ "fastrand",
  "fs2",
  "plist",
  "portable-pty",
