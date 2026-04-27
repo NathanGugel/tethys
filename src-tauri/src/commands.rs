@@ -5,7 +5,7 @@ use serde::Deserialize;
 use tauri::{ipc::Channel, AppHandle, Emitter, State};
 use tracing::{info, warn};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tauri::ipc::InvokeResponseBody;
 
@@ -17,7 +17,7 @@ use crate::inprogress::InProgressWorkspaces;
 use crate::job::{JobEvent, JobTx};
 use crate::paths::Paths;
 use crate::reconcile::{self, Discrepancies};
-use crate::registry::{starter_template, RegistryLoad, Repo};
+use crate::registry::{self, starter_template, RegistryLoad, Repo};
 use crate::sessions::{SessionInfo, SessionSupervisor};
 use crate::setup;
 use crate::state::{new_workspace_id, ClaudeSessionMeta, RepoLink, Workspace, WorkspaceId};
@@ -172,19 +172,32 @@ pub async fn create_workspace(
         .collect::<AppResult<Vec<_>>>()?;
 
     let id = new_workspace_id();
+    let workspace_dir = registry::sanitize_branch_for_dir(&branch);
+    // Block collisions before we start cloning/fetching. Two workspaces with
+    // the same branch on different repo sets would otherwise share a parent
+    // dir, and deleting one would clobber the other on the `rm -rf` step.
+    let workspace_root = reg.worktree_root.join(&workspace_dir);
+    if workspace_root.exists() {
+        return Err(AppError::Other(format!(
+            "a worktree directory already exists at {}. Pick a different \
+             branch name, or remove the existing directory first.",
+            workspace_root.display()
+        )));
+    }
     // Register as in-progress so the reconciler doesn't flag our worktree
     // dirs as orphans mid-create. Guard removes the entry on drop — normal
     // return, `?`, panic, or task cancellation.
-    let _in_progress_guard = in_progress.insert(id.clone());
+    let _in_progress_guard = in_progress.insert(workspace_dir.clone());
     let tx = spawn_event_forwarder(on_event);
 
     let orchestrate = async {
         let mut created: Vec<RepoLink> = Vec::new();
         for repo in &selected {
             let clone_path = paths.repo_clone_path(&repo.key);
-            let worktree_path = reg.plan_worktree_path(&id, &repo.key);
+            let worktree_path = reg.plan_worktree_path(&workspace_dir, &repo.key);
 
             git::ensure_clone(&clone_path, &repo.remote_url, &tx, &repo.key).await?;
+            git::pull_clone_best_effort(&clone_path, &tx, &repo.key).await;
 
             // Pre-check: if the branch already exists, git worktree add will
             // fail with a fatal. We bail here with a clearer message — and
@@ -265,7 +278,7 @@ pub async fn create_workspace(
             // above guarantees we didn't inherit a pre-existing branch).
             for repo in selected.iter().rev() {
                 let clone_path = paths.repo_clone_path(&repo.key);
-                let worktree_path = reg.plan_worktree_path(&id, &repo.key);
+                let worktree_path = reg.plan_worktree_path(&workspace_dir, &repo.key);
                 if !worktree_path.exists() {
                     continue;
                 }
@@ -290,7 +303,7 @@ pub async fn create_workspace(
 
             // Remove the now-empty parent dir so the reconciler doesn't
             // flag it as an orphan on the next tick.
-            let parent = reg.worktree_root.join(&id);
+            let parent = reg.worktree_root.join(&workspace_dir);
             if parent.exists() && reconcile::is_under(&reg.worktree_root, &parent) {
                 if let Err(e) = tokio::fs::remove_dir_all(&parent).await {
                     warn!(path = %parent.display(), error = %e, "failed to remove partial workspace dir");
@@ -389,13 +402,21 @@ pub async fn delete_workspace(
     }
 
     // `git worktree remove` deletes the per-repo subdir but leaves the
-    // parent `<worktree_root>/<workspace_id>/` behind — that's what the
+    // parent `<worktree_root>/<workspace_dir>/` behind — that's what the
     // reconciler flags as an orphan on the next run. Clean it up now.
+    // Derive the parent from a stored worktree_path so this works for both
+    // legacy UUID-named dirs and new branch-named dirs.
     if let Ok(reg) = registry.require() {
-        let parent = reg.worktree_root.join(&id);
-        if parent.exists() && reconcile::is_under(&reg.worktree_root, &parent) {
-            if let Err(e) = tokio::fs::remove_dir_all(&parent).await {
-                warn!(path = %parent.display(), error = %e, "failed to remove workspace dir after delete");
+        if let Some(parent) = workspace
+            .repo_links
+            .first()
+            .and_then(|l| l.worktree_path.parent())
+            .map(Path::to_path_buf)
+        {
+            if parent.exists() && reconcile::is_under(&reg.worktree_root, &parent) {
+                if let Err(e) = tokio::fs::remove_dir_all(&parent).await {
+                    warn!(path = %parent.display(), error = %e, "failed to remove workspace dir after delete");
+                }
             }
         }
     }

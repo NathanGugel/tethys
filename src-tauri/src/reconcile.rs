@@ -68,8 +68,22 @@ pub async fn scan(
     let Some(reg) = registry else {
         return out;
     };
-    let known_ids: HashSet<&str> =
-        state.workspaces.iter().map(|w| w.id.as_str()).collect();
+    // Derive each workspace's directory name from its stored worktree paths.
+    // Older workspaces use the workspace UUID as the dir name, newer ones use
+    // a sanitized branch name — reading from the stored path covers both.
+    let mut known_dirs: HashSet<String> = HashSet::new();
+    for ws in &state.workspaces {
+        for link in &ws.repo_links {
+            if let Some(name) = link
+                .worktree_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+            {
+                known_dirs.insert(name.to_string());
+            }
+        }
+    }
 
     let mut entries = match tokio::fs::read_dir(&reg.worktree_root).await {
         Ok(e) => e,
@@ -84,7 +98,7 @@ pub async fn scan(
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if known_ids.contains(name) || in_progress.contains(name) {
+        if known_dirs.contains(name) || in_progress.contains(name) {
             continue;
         }
         out.orphaned_dirs.push(OrphanedDir {

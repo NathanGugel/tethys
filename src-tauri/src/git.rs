@@ -181,6 +181,35 @@ pub async fn ensure_clone(
     Ok(())
 }
 
+/// `git -C <clone_path> pull --ff-only`. Best-effort: nothing in tethys ever
+/// modifies the clone's working tree or checked-out branch, so a fast-forward
+/// pull should always succeed when online. If it fails (offline, network
+/// hiccup, force-pushed default branch), we log and continue — the caller
+/// will branch off whatever the clone currently has, which is at worst stale.
+pub async fn pull_clone_best_effort(clone_path: &Path, tx: &JobTx, repo: &str) {
+    tx.status("updating clone from origin".to_string(), Some(repo));
+    let args: [&OsStr; 4] = [
+        "-C".as_ref(),
+        clone_path.as_os_str(),
+        "pull".as_ref(),
+        "--ff-only".as_ref(),
+    ];
+    match run_streamed("git", args, None, tx, Some(repo)).await {
+        Ok(status) if status.success() => {}
+        Ok(status) => tx.status(
+            format!(
+                "git pull --ff-only exited with {:?}; continuing with current clone state",
+                status.code()
+            ),
+            Some(repo),
+        ),
+        Err(e) => tx.status(
+            format!("git pull --ff-only failed: {e}; continuing with current clone state"),
+            Some(repo),
+        ),
+    }
+}
+
 /// `git -C <clone_path> worktree add <worktree_path> -b <branch>`.
 /// Creates a new branch `<branch>` off the clone's current HEAD.
 pub async fn worktree_add(

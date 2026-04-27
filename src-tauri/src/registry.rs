@@ -132,10 +132,21 @@ impl RepoRegistry {
         self.repos.iter().find(|r| r.key == key)
     }
 
-    /// `<worktree_root>/<workspace_id>/<repo_key>`
-    pub fn plan_worktree_path(&self, workspace_id: &str, repo_key: &str) -> PathBuf {
-        self.worktree_root.join(workspace_id).join(repo_key)
+    /// `<worktree_root>/<workspace_dir>/<repo_key>`. `workspace_dir` is the
+    /// per-workspace directory name — historically a UUID, now derived from
+    /// the branch via `sanitize_branch_for_dir`.
+    pub fn plan_worktree_path(&self, workspace_dir: &str, repo_key: &str) -> PathBuf {
+        self.worktree_root.join(workspace_dir).join(repo_key)
     }
+}
+
+/// Convert a branch name into something safe to use as a single path
+/// component. Git refs disallow most path-unsafe characters (`:`, `\`, `*`,
+/// `?`, `[`, `~`, `^`, space, control chars), so the only character we have
+/// to translate in practice is `/`, which git uses as a hierarchy separator
+/// inside refs (`feat/foo`).
+pub fn sanitize_branch_for_dir(branch: &str) -> String {
+    branch.replace('/', "-")
 }
 
 /// Parse each repo's remote URL into an `owner/name` slug, logging a single
