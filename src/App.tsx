@@ -404,7 +404,9 @@ function App() {
                         <li key={r.repo_key}>
                           <span className="repo-key">{r.repo_key}</span>
                           {r.github && (
-                            <GithubChip status={r.github} linkable={false} />
+                            <div className="repo-gh-footer">
+                              <GithubChip status={r.github} linkable={false} />
+                            </div>
                           )}
                         </li>
                       ))}

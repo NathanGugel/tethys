@@ -137,19 +137,27 @@ html,
 }
 
 .workspace-repo-list li {
-  padding: 1px 0;
+  padding: 2px 0;
   line-height: 1.3;
   display: flex;
-  align-items: center;
-  gap: 6px;
-  white-space: nowrap;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 3px;
   min-width: 0;
 }
 
 .workspace-repo-list .repo-key {
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
   min-width: 0;
+}
+
+.repo-gh-footer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 0;
 }
 
 .gh-chip {
@@ -172,10 +180,13 @@ html,
 
 .gh-chip.gh-chip-static {
   cursor: inherit;
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
 }
 
 .gh-chip.gh-chip-static:hover {
-  background: rgba(125, 125, 125, 0.18);
+  background: transparent;
 }
 
 .gh-chip.gh-stale {
@@ -187,36 +198,56 @@ html,
   font-size: 10px;
 }
 
-.gh-icon {
-  width: 12px;
-  height: 12px;
-  flex-shrink: 0;
-  display: inline-block;
+.gh-squares {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
 }
 
-.gh-icon-check,
-.gh-icon-person {
+.gh-sq {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+.gh-sq-icon {
+  width: 11px;
+  height: 11px;
+  display: block;
+}
+
+.gh-sq-tone-green {
+  background: rgba(46, 160, 67, 0.2);
   color: #2ea043;
 }
 
-.gh-icon-x {
-  color: var(--danger);
+.gh-sq-tone-yellow {
+  background: rgba(214, 178, 91, 0.22);
+  color: #c69327;
 }
 
-.workspace-detail h2 .gh-icon {
-  width: 14px;
-  height: 14px;
+.gh-sq-tone-red {
+  background: rgba(248, 81, 73, 0.18);
+  color: #e5534b;
 }
 
-.gh-unresolved {
-  background: #d6b25b;
-  color: #1a1a1a;
-  font-size: 9px;
-  font-weight: 600;
-  padding: 0 4px;
-  border-radius: 8px;
-  min-width: 12px;
-  text-align: center;
+.gh-sq-tone-gray {
+  background: rgba(125, 125, 125, 0.15);
+  color: var(--muted);
+}
+
+.workspace-detail h2 .gh-sq {
+  width: 18px;
+  height: 18px;
+}
+
+.workspace-detail h2 .gh-sq-icon {
+  width: 12px;
+  height: 12px;
 }
 
 .gh-merged-badge {
@@ -239,7 +270,8 @@ html,
   font-weight: 600;
 }
 
-.workspace-list > li.is-paused {
+.workspace-list > li.is-paused .workspace-name,
+.workspace-list > li.is-paused .repo-key {
   opacity: 0.45;
 }
 

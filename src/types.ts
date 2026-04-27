@@ -28,6 +28,8 @@ export interface GithubPrStatus {
   state: PrState;
   is_draft: boolean;
   checks: ChecksRollup;
+  /** Cursor Bugbot's check, split out from `checks` for its own indicator. */
+  bugbot: ChecksRollup;
   review_decision: ReviewDecision;
   unresolved_threads: number;
   head_sha: string;

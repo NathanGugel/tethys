@@ -318,7 +318,23 @@ fn build_query(targets: &[Target]) -> (String, BTreeMap<String, String>) {
             nodes {
               commit {
                 oid
-                statusCheckRollup { state }
+                statusCheckRollup {
+                  state
+                  contexts(first: 100) {
+                    nodes {
+                      __typename
+                      ... on CheckRun {
+                        name
+                        status
+                        conclusion
+                      }
+                      ... on StatusContext {
+                        context
+                        state
+                      }
+                    }
+                  }
+                }
               }
             }
           }"#;
@@ -453,22 +469,39 @@ fn parse_repo_node(repo: &Value) -> Option<GithubPrStatus> {
         .and_then(|o| o.as_str())
         .unwrap_or("")
         .to_string();
-    let checks = commit
-        .and_then(|c| c.get("statusCheckRollup"))
-        .and_then(|r| {
-            if r.is_null() {
-                None
-            } else {
-                r.get("state").and_then(|s| s.as_str())
+    let rollup = commit.and_then(|c| c.get("statusCheckRollup"));
+    let rollup_state = rollup
+        .and_then(|r| if r.is_null() { None } else { r.get("state") })
+        .and_then(|s| s.as_str())
+        .map(rollup_state_from_str);
+    let context_nodes = rollup
+        .and_then(|r| r.get("contexts"))
+        .and_then(|c| c.get("nodes"))
+        .and_then(|n| n.as_array());
+
+    // Split bugbot out of the rollup. If we have per-context data, recompute
+    // the non-bugbot aggregate so the CI indicator isn't poisoned by bugbot's
+    // result. Otherwise fall back to the top-level rollup state.
+    let (checks, bugbot) = match context_nodes {
+        Some(nodes) => {
+            let mut non_bugbot = Vec::new();
+            let mut bugbot_states = Vec::new();
+            for node in nodes {
+                let Some(state) = context_state(node) else {
+                    continue;
+                };
+                if context_is_bugbot(node) {
+                    bugbot_states.push(state);
+                } else {
+                    non_bugbot.push(state);
+                }
             }
-        })
-        .map(|s| match s {
-            "SUCCESS" => ChecksRollup::Success,
-            "FAILURE" | "ERROR" => ChecksRollup::Failure,
-            "PENDING" | "EXPECTED" => ChecksRollup::Pending,
-            _ => ChecksRollup::Neutral,
-        })
-        .unwrap_or(ChecksRollup::None);
+            let checks = aggregate_rollup(non_bugbot.into_iter());
+            let bugbot = aggregate_rollup(bugbot_states.into_iter());
+            (checks, bugbot)
+        }
+        None => (rollup_state.unwrap_or(ChecksRollup::None), ChecksRollup::None),
+    };
 
     Some(GithubPrStatus {
         pr_number: number,
@@ -476,12 +509,91 @@ fn parse_repo_node(repo: &Value) -> Option<GithubPrStatus> {
         state,
         is_draft,
         checks,
+        bugbot,
         review_decision,
         unresolved_threads,
         head_sha,
         fetched_at: Utc::now(),
         last_error: None,
     })
+}
+
+fn rollup_state_from_str(s: &str) -> ChecksRollup {
+    match s {
+        "SUCCESS" => ChecksRollup::Success,
+        "FAILURE" | "ERROR" => ChecksRollup::Failure,
+        "PENDING" | "EXPECTED" => ChecksRollup::Pending,
+        _ => ChecksRollup::Neutral,
+    }
+}
+
+fn context_is_bugbot(node: &Value) -> bool {
+    let name = node
+        .get("name")
+        .and_then(|v| v.as_str())
+        .or_else(|| node.get("context").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    name.to_lowercase().contains("bugbot")
+}
+
+/// Map a single check-run / status-context node to a rollup-style state.
+/// Mirrors GitHub's own aggregation: any incomplete check is `Pending`;
+/// completed checks use their `conclusion`.
+fn context_state(node: &Value) -> Option<ChecksRollup> {
+    let typename = node.get("__typename").and_then(|v| v.as_str())?;
+    match typename {
+        "CheckRun" => {
+            let status = node.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            if status != "COMPLETED" {
+                return Some(ChecksRollup::Pending);
+            }
+            match node.get("conclusion").and_then(|c| c.as_str()) {
+                Some("SUCCESS") => Some(ChecksRollup::Success),
+                Some("FAILURE")
+                | Some("TIMED_OUT")
+                | Some("STARTUP_FAILURE")
+                | Some("ACTION_REQUIRED")
+                | Some("CANCELLED")
+                | Some("STALE") => Some(ChecksRollup::Failure),
+                Some("NEUTRAL") | Some("SKIPPED") => Some(ChecksRollup::Neutral),
+                _ => None,
+            }
+        }
+        "StatusContext" => match node.get("state").and_then(|s| s.as_str()) {
+            Some("SUCCESS") => Some(ChecksRollup::Success),
+            Some("FAILURE") | Some("ERROR") => Some(ChecksRollup::Failure),
+            Some("PENDING") | Some("EXPECTED") => Some(ChecksRollup::Pending),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn aggregate_rollup(states: impl Iterator<Item = ChecksRollup>) -> ChecksRollup {
+    let mut has_failure = false;
+    let mut has_pending = false;
+    let mut has_success = false;
+    let mut has_neutral = false;
+    for s in states {
+        match s {
+            ChecksRollup::Failure => has_failure = true,
+            ChecksRollup::Pending => has_pending = true,
+            ChecksRollup::Success => has_success = true,
+            ChecksRollup::Neutral => has_neutral = true,
+            ChecksRollup::None => {}
+        }
+    }
+    if has_failure {
+        ChecksRollup::Failure
+    } else if has_pending {
+        ChecksRollup::Pending
+    } else if has_success {
+        ChecksRollup::Success
+    } else if has_neutral {
+        ChecksRollup::Neutral
+    } else {
+        ChecksRollup::None
+    }
 }
 
 /// Apply parsed results to `AppState`, returning the set of changes to emit.
@@ -518,6 +630,7 @@ fn is_meaningful_change(old: Option<&GithubPrStatus>, new: Option<&GithubPrStatu
                 || a.state != b.state
                 || a.is_draft != b.is_draft
                 || a.checks != b.checks
+                || a.bugbot != b.bugbot
                 || a.review_decision != b.review_decision
                 || a.unresolved_threads != b.unresolved_threads
                 || a.head_sha != b.head_sha
@@ -748,6 +861,7 @@ mod tests {
             state: PrState::Open,
             is_draft: false,
             checks: ChecksRollup::Success,
+            bugbot: ChecksRollup::None,
             review_decision: ReviewDecision::None,
             unresolved_threads: 0,
             head_sha: "sha".into(),
@@ -765,6 +879,103 @@ mod tests {
         let mut approved = base.clone();
         approved.review_decision = ReviewDecision::Approved;
         assert!(is_meaningful_change(Some(&base), Some(&approved)));
+    }
+
+    #[test]
+    fn parse_splits_bugbot_from_checks_rollup() {
+        // Bugbot says FAILURE, the rest of CI is SUCCESS. The top-level rollup
+        // would be FAILURE, but `checks` should reflect non-bugbot only.
+        let data = json!({
+            "q0": {
+                "ref": {
+                    "associatedPullRequests": {
+                        "nodes": [{
+                            "number": 1,
+                            "url": "u",
+                            "state": "OPEN",
+                            "isDraft": false,
+                            "reviewThreads": {"nodes": []},
+                            "commits": {
+                                "nodes": [{"commit": {
+                                    "oid": "o",
+                                    "statusCheckRollup": {
+                                        "state": "FAILURE",
+                                        "contexts": {"nodes": [
+                                            {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                                            {"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                                            {"__typename": "CheckRun", "name": "Cursor Bugbot", "status": "COMPLETED", "conclusion": "FAILURE"}
+                                        ]}
+                                    }
+                                }}]
+                            }
+                        }]
+                    }
+                }
+            }
+        });
+        let s = parse_response(&[mk_target(0)], &data)[0].2.clone().unwrap();
+        assert_eq!(s.checks, ChecksRollup::Success);
+        assert_eq!(s.bugbot, ChecksRollup::Failure);
+    }
+
+    #[test]
+    fn parse_bugbot_pending_when_in_progress() {
+        let data = json!({
+            "q0": {
+                "ref": {
+                    "associatedPullRequests": {
+                        "nodes": [{
+                            "number": 1,
+                            "url": "u",
+                            "state": "OPEN",
+                            "isDraft": false,
+                            "reviewThreads": {"nodes": []},
+                            "commits": {
+                                "nodes": [{"commit": {
+                                    "oid": "o",
+                                    "statusCheckRollup": {
+                                        "state": "PENDING",
+                                        "contexts": {"nodes": [
+                                            {"__typename": "CheckRun", "name": "Cursor Bugbot", "status": "IN_PROGRESS", "conclusion": null}
+                                        ]}
+                                    }
+                                }}]
+                            }
+                        }]
+                    }
+                }
+            }
+        });
+        let s = parse_response(&[mk_target(0)], &data)[0].2.clone().unwrap();
+        assert_eq!(s.bugbot, ChecksRollup::Pending);
+        assert_eq!(s.checks, ChecksRollup::None);
+    }
+
+    #[test]
+    fn parse_falls_back_to_top_level_rollup_when_no_contexts() {
+        // Older fixture shape — no contexts list. We still get the legacy rollup
+        // for `checks`, and `bugbot` falls through to None.
+        let data = json!({
+            "q0": {
+                "ref": {
+                    "associatedPullRequests": {
+                        "nodes": [{
+                            "number": 1,
+                            "url": "u",
+                            "state": "OPEN",
+                            "isDraft": false,
+                            "reviewThreads": {"nodes": []},
+                            "commits": {
+                                "nodes": [{"commit": {"oid": "o", "statusCheckRollup": {"state": "SUCCESS"}}}]
+                            }
+                        }]
+                    }
+                }
+            }
+        });
+        let s = parse_response(&[mk_target(0)], &data)[0].2.clone().unwrap();
+        assert_eq!(s.checks, ChecksRollup::Success);
+        assert_eq!(s.bugbot, ChecksRollup::None);
     }
 
     #[test]

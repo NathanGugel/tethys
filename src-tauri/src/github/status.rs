@@ -40,6 +40,10 @@ pub struct GithubPrStatus {
     pub state: PrState,
     pub is_draft: bool,
     pub checks: ChecksRollup,
+    /// Status of the Cursor Bugbot check, if present. Tracked separately from
+    /// the rest of the CI rollup so the UI can show it as its own indicator.
+    #[serde(default = "default_bugbot")]
+    pub bugbot: ChecksRollup,
     #[serde(default)]
     pub review_decision: ReviewDecision,
     pub unresolved_threads: u32,
@@ -47,4 +51,8 @@ pub struct GithubPrStatus {
     pub fetched_at: DateTime<Utc>,
     #[serde(default)]
     pub last_error: Option<String>,
+}
+
+fn default_bugbot() -> ChecksRollup {
+    ChecksRollup::None
 }
