@@ -10,6 +10,7 @@ mod inprogress;
 mod job;
 mod logging;
 mod paths;
+mod purge;
 mod reconcile;
 mod registry;
 mod sessions;
@@ -29,6 +30,7 @@ use tracing::{error, info, warn};
 use crate::commands::ClaudeBin;
 use crate::github::GithubPoller;
 use crate::paths::Paths;
+use crate::purge::Purger;
 use crate::registry::RegistryLoad;
 use crate::sessions::SessionSupervisor;
 use crate::store::Store;
@@ -166,6 +168,18 @@ pub fn run() {
             });
             tauri::async_runtime::spawn(poller.clone().run());
 
+            // --- soft-delete purger (hourly) -------------------------------
+            let registry_for_purger: Arc<RegistryLoad> =
+                app.state::<Arc<RegistryLoad>>().inner().clone();
+            let purger = Arc::new(Purger::new(
+                store.clone(),
+                paths.clone(),
+                registry_for_purger,
+                handle.clone(),
+            ));
+            app.manage(purger.clone());
+            tauri::async_runtime::spawn(purger.clone().run());
+
             app.manage(paths);
             app.manage(inprogress::InProgressWorkspaces::new());
 
@@ -199,6 +213,13 @@ pub fn run() {
             commands::get_workspace,
             commands::create_workspace,
             commands::delete_workspace,
+            commands::cancel_delete_workspace,
+            commands::archive_workspace,
+            commands::unarchive_workspace,
+            commands::reorder_workspaces,
+            commands::run_purge_now,
+            commands::list_system_errors,
+            commands::dismiss_system_error,
             commands::pause_workspace,
             commands::resume_workspace,
             commands::list_repos,

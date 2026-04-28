@@ -1226,3 +1226,233 @@ button.danger.primary:hover:not(:disabled) {
   overflow-y: auto;
   color: var(--muted);
 }
+
+.workspace-list > li.is-archived .workspace-name,
+.workspace-list > li.is-archived .repo-key {
+  opacity: 0.55;
+}
+
+.workspace-list > li.is-dragging {
+  cursor: grabbing;
+  background: var(--sidebar-bg);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  position: relative;
+}
+
+.archive-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+}
+
+.archive-header:hover {
+  background: rgba(125, 125, 125, 0.08);
+  color: var(--fg);
+}
+
+.archive-header .disclosure {
+  display: inline-block;
+  width: 10px;
+  transition: transform 0.12s ease;
+}
+
+.archive-header .disclosure.open {
+  transform: rotate(90deg);
+}
+
+.archive-count {
+  margin-left: auto;
+  font-family: "SF Mono", ui-monospace, monospace;
+  font-size: 10px;
+  background: rgba(125, 125, 125, 0.18);
+  padding: 1px 6px;
+  border-radius: 8px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 200;
+  min-width: 160px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+}
+
+.context-menu button {
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: 6px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--fg);
+  font: inherit;
+}
+
+.context-menu button:hover:not(:disabled) {
+  background: rgba(125, 125, 125, 0.16);
+}
+
+.context-menu button.danger {
+  color: var(--danger);
+}
+
+.context-menu-sep {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 2px;
+}
+
+.sidebar-footer {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+}
+
+.sidebar-footer .gh-auth-footer {
+  border-top: none;
+}
+
+.system-status-button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 8px 14px;
+  text-align: left;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+  width: 100%;
+}
+
+.system-status-button:hover:not(:disabled) {
+  background: rgba(125, 125, 125, 0.08);
+  color: var(--fg);
+}
+
+.system-status-button.has-errors {
+  color: var(--danger);
+}
+
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.status-dot.green {
+  background: #2ea043;
+}
+
+.status-dot.yellow {
+  background: #d6b25b;
+}
+
+.status-dot.red {
+  background: var(--danger);
+}
+
+.system-status-modal {
+  min-width: 480px;
+  max-width: 640px;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+
+.system-status-modal section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.system-status-modal h4 {
+  margin: 4px 0;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.system-status-modal .section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.system-status-modal .status-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.system-status-modal .status-list > li {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: rgba(125, 125, 125, 0.06);
+}
+
+.system-status-modal .status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.system-status-modal .error-when {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.system-status-modal .error-kind {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  background: rgba(125, 125, 125, 0.18);
+  padding: 1px 6px;
+  border-radius: 8px;
+}
+
+.system-status-modal .error-message {
+  margin: 0;
+  font-size: 11px;
+  font-family: "SF Mono", ui-monospace, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--fg);
+  background: rgba(0, 0, 0, 0.2);
+  padding: 6px 8px;
+  border-radius: 3px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.system-status-modal .status-list button {
+  align-self: flex-start;
+}

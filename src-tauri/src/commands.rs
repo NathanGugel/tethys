@@ -5,7 +5,7 @@ use serde::Deserialize;
 use tauri::{ipc::Channel, AppHandle, Emitter, State};
 use tracing::{info, warn};
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use tauri::ipc::InvokeResponseBody;
 
@@ -17,11 +17,14 @@ use crate::github::poller::{AuthSnapshot, GithubPoller};
 use crate::inprogress::InProgressWorkspaces;
 use crate::job::{JobEvent, JobTx};
 use crate::paths::Paths;
+use crate::purge::Purger;
 use crate::reconcile::{self, Discrepancies};
 use crate::registry::{self, starter_template, RegistryLoad, Repo};
 use crate::sessions::{SessionInfo, SessionSupervisor};
 use crate::setup;
-use crate::state::{new_workspace_id, ClaudeSessionMeta, RepoLink, Workspace, WorkspaceId};
+use crate::state::{
+    new_workspace_id, ClaudeSessionMeta, RepoLink, SystemErrorEntry, Workspace, WorkspaceId,
+};
 use crate::store::Store;
 use crate::theme::Theme;
 use crate::tmux::{self, TmuxBin};
@@ -268,6 +271,8 @@ pub async fn create_workspace(
                 repo_links: created_links,
                 sessions: Vec::new(),
                 claude_binary,
+                deleted_at: None,
+                archived_at: None,
             };
 
             let stored = store
@@ -331,126 +336,186 @@ pub async fn create_workspace(
     }
 }
 
+/// Soft delete: mark the workspace as deleted and kill any live PTY sessions
+/// so they can't keep writing to a worktree we're about to tear down. The
+/// hourly purger does the actual git/worktree cleanup once the entry is
+/// older than the grace window. Use `cancel_delete_workspace` to undo
+/// before the purger runs.
 #[tauri::command]
 pub async fn delete_workspace(
     app: AppHandle,
     store: State<'_, Arc<Store>>,
-    registry: State<'_, Arc<RegistryLoad>>,
-    paths: State<'_, Paths>,
     tmux_bin: State<'_, TmuxBin>,
     id: WorkspaceId,
-    on_event: Channel<JobEvent>,
 ) -> AppResult<()> {
-    let workspace = store
-        .read(|s| s.find_workspace(&id).cloned())
+    let session_ids: Vec<String> = store
+        .read(|s| {
+            s.find_workspace(&id)
+                .map(|w| w.sessions.iter().map(|m| m.id.clone()).collect())
+        })
         .await
         .ok_or_else(|| AppError::WorkspaceNotFound(id.clone()))?;
 
-    // Kill tmux sessions first so we don't leak long-lived claudes
-    // whose worktree is about to vanish from under them.
+    // Kill tmux sessions so claude processes stop writing to the worktree
+    // before the purger removes it. The supervisor reacts to the resulting
+    // session:exit and cleans up its own state.
     if !tmux_bin.0.as_os_str().is_empty() {
-        for meta in &workspace.sessions {
-            tmux::kill_session(&tmux_bin.0, &meta.id);
+        for sid in &session_ids {
+            tmux::kill_session(&tmux_bin.0, sid);
         }
     }
 
-    let tx = spawn_event_forwarder(on_event);
-
-    for link in &workspace.repo_links {
-        let clone_path = paths.repo_clone_path(&link.repo_key);
-
-        if !link.worktree_path.exists() {
-            tx.status(
-                format!("worktree {} already gone", link.worktree_path.display()),
-                Some(&link.repo_key),
-            );
-            continue;
-        }
-        if !clone_path.exists() {
-            // Registry entry is gone or the clone was manually deleted.
-            tx.status(
-                format!(
-                    "clone for {} missing; removing worktree dir directly",
-                    link.repo_key
-                ),
-                Some(&link.repo_key),
-            );
-            if let Err(e) = tokio::fs::remove_dir_all(&link.worktree_path).await {
-                let msg = format!("failed to remove {}: {e}", link.worktree_path.display());
-                let _ = tx.0.send(JobEvent::Failed { error: msg.clone() });
-                return Err(AppError::Other(msg));
-            }
-            continue;
-        }
-
-        // Always force: the user already confirmed deletion via the UI,
-        // and a git-level dirty-check failure here is useless friction.
-        // The confirmation banner warns that uncommitted changes will
-        // be lost.
-        if let Err(e) = git::worktree_remove(
-            &clone_path,
-            &link.worktree_path,
-            true,
-            &tx,
-            &link.repo_key,
-        )
-        .await
-        {
-            let _ = tx.0.send(JobEvent::Failed { error: e.to_string() });
-            return Err(e);
-        }
-
-        // Prune any stale worktree registrations first — otherwise git
-        // refuses to delete a branch whose worktree is "prunable but still
-        // known to git".
-        git::worktree_prune_best_effort(&clone_path, &tx, &link.repo_key).await;
-
-        // Clean up the branch too — otherwise the next workspace created
-        // with the same name fails with "a branch named X already exists".
-        git::branch_delete_best_effort(
-            &clone_path,
-            &workspace.branch,
-            &tx,
-            &link.repo_key,
-        )
-        .await;
-    }
-
-    // `git worktree remove` deletes the per-repo subdir but leaves the
-    // parent `<worktree_root>/<workspace_dir>/` behind — that's what the
-    // reconciler flags as an orphan on the next run. Clean it up now.
-    // Derive the parent from a stored worktree_path so this works for both
-    // legacy UUID-named dirs and new branch-named dirs.
-    if let Ok(reg) = registry.require() {
-        if let Some(parent) = workspace
-            .repo_links
-            .first()
-            .and_then(|l| l.worktree_path.parent())
-            .map(Path::to_path_buf)
-        {
-            if parent.exists() && reconcile::is_under(&reg.worktree_root, &parent) {
-                if let Err(e) = tokio::fs::remove_dir_all(&parent).await {
-                    warn!(path = %parent.display(), error = %e, "failed to remove workspace dir after delete");
-                }
-            }
-        }
-    }
-
-    let removed = store
+    let touched = store
         .mutate(|s| {
-            let before = s.workspaces.len();
-            s.workspaces.retain(|w| w.id != id);
-            Ok(s.workspaces.len() < before)
+            let ws = s
+                .find_workspace_mut(&id)
+                .ok_or_else(|| AppError::WorkspaceNotFound(id.clone()))?;
+            // Idempotent: re-deleting an already-soft-deleted workspace
+            // refreshes the timestamp, which extends the grace window.
+            ws.deleted_at = Some(Utc::now());
+            // Archive + delete are mutually exclusive views; clear archive
+            // so the entry doesn't double-count if someone unarchives later.
+            ws.archived_at = None;
+            Ok(())
+        })
+        .await;
+    if let Err(e) = touched {
+        return Err(e);
+    }
+
+    info!(%id, "soft-deleted workspace");
+    emit_workspace_changed(&app, &id);
+    let _ = app.emit("system_status:changed", &());
+    Ok(())
+}
+
+/// Undo a soft delete. Only succeeds if the purger hasn't already
+/// reaped the workspace.
+#[tauri::command]
+pub async fn cancel_delete_workspace(
+    app: AppHandle,
+    store: State<'_, Arc<Store>>,
+    id: WorkspaceId,
+) -> AppResult<()> {
+    store
+        .mutate(|s| {
+            let ws = s
+                .find_workspace_mut(&id)
+                .ok_or_else(|| AppError::WorkspaceNotFound(id.clone()))?;
+            ws.deleted_at = None;
+            Ok(())
         })
         .await?;
-
-    if !removed {
-        return Err(AppError::WorkspaceNotFound(id));
-    }
-
-    info!(%id, "deleted workspace");
-    let _ = tx.0.send(JobEvent::Success);
     emit_workspace_changed(&app, &id);
+    let _ = app.emit("system_status:changed", &());
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn archive_workspace(
+    app: AppHandle,
+    store: State<'_, Arc<Store>>,
+    id: WorkspaceId,
+) -> AppResult<()> {
+    store
+        .mutate(|s| {
+            let ws = s
+                .find_workspace_mut(&id)
+                .ok_or_else(|| AppError::WorkspaceNotFound(id.clone()))?;
+            ws.archived_at = Some(Utc::now());
+            Ok(())
+        })
+        .await?;
+    emit_workspace_changed(&app, &id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn unarchive_workspace(
+    app: AppHandle,
+    store: State<'_, Arc<Store>>,
+    id: WorkspaceId,
+) -> AppResult<()> {
+    store
+        .mutate(|s| {
+            let ws = s
+                .find_workspace_mut(&id)
+                .ok_or_else(|| AppError::WorkspaceNotFound(id.clone()))?;
+            ws.archived_at = None;
+            Ok(())
+        })
+        .await?;
+    emit_workspace_changed(&app, &id);
+    Ok(())
+}
+
+/// Reorder the active workspaces (everything not soft-deleted and not
+/// archived). The frontend computes a new ordering by drag-and-drop and
+/// posts the resulting ID list. Workspaces not in the list keep their
+/// current relative position in `AppState.workspaces`.
+#[tauri::command]
+pub async fn reorder_workspaces(
+    app: AppHandle,
+    store: State<'_, Arc<Store>>,
+    ids: Vec<WorkspaceId>,
+) -> AppResult<()> {
+    store
+        .mutate(|s| {
+            // Validate every id exists; bail without mutating on mismatch
+            // so a stale frontend snapshot can't shuffle the wrong rows.
+            for id in &ids {
+                if !s.workspaces.iter().any(|w| &w.id == id) {
+                    return Err(AppError::WorkspaceNotFound(id.clone()));
+                }
+            }
+            // Pull the named workspaces out in their requested order.
+            let mut moved: Vec<Workspace> = Vec::with_capacity(ids.len());
+            for id in &ids {
+                if let Some(pos) = s.workspaces.iter().position(|w| &w.id == id) {
+                    moved.push(s.workspaces.remove(pos));
+                }
+            }
+            // Re-insert at the front. Archived/soft-deleted entries that
+            // weren't included keep their positions after the moved block.
+            for ws in moved.into_iter().rev() {
+                s.workspaces.insert(0, ws);
+            }
+            Ok(())
+        })
+        .await?;
+    let _ = app.emit("workspace:reordered", &());
+    Ok(())
+}
+
+/// Trigger the background purger immediately. Used by the "Run cleanup
+/// now" button on the system status page. Still respects the 1-hour
+/// grace window — entries deleted under an hour ago stay put.
+#[tauri::command]
+pub fn run_purge_now(purger: State<'_, Arc<Purger>>) -> AppResult<()> {
+    purger.request_tick();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_system_errors(
+    store: State<'_, Arc<Store>>,
+) -> AppResult<Vec<SystemErrorEntry>> {
+    Ok(store.read(|s| s.system_errors.clone()).await)
+}
+
+#[tauri::command]
+pub async fn dismiss_system_error(
+    app: AppHandle,
+    store: State<'_, Arc<Store>>,
+    id: String,
+) -> AppResult<()> {
+    store
+        .mutate(|s| {
+            s.system_errors.retain(|e| e.id != id);
+            Ok(())
+        })
+        .await?;
+    let _ = app.emit("system_status:changed", &());
     Ok(())
 }
 

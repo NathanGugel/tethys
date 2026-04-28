@@ -17,6 +17,10 @@ pub fn new_workspace_id() -> WorkspaceId {
 pub struct AppState {
     #[serde(default)]
     pub workspaces: Vec<Workspace>,
+    /// Errors raised by the background purger when it failed to tear down
+    /// a soft-deleted workspace. Surfaced in the system status modal.
+    #[serde(default)]
+    pub system_errors: Vec<SystemErrorEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +39,30 @@ pub struct Workspace {
     /// resolved at boot.
     #[serde(default)]
     pub claude_binary: Option<String>,
+    /// Soft-delete marker. When set, the workspace is hidden from the
+    /// sidebar and queued for the hourly purger. Cleared by
+    /// `cancel_delete_workspace` to undo before the cron runs.
+    #[serde(default)]
+    pub deleted_at: Option<DateTime<Utc>>,
+    /// Archive marker. Archived workspaces render in the collapsed
+    /// "Archived" section at the bottom of the sidebar.
+    #[serde(default)]
+    pub archived_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemErrorEntry {
+    pub id: String,
+    pub at: DateTime<Utc>,
+    /// Free-form category for grouping in the UI (e.g. "purge").
+    pub kind: String,
+    pub message: String,
+    /// Optional workspace context — set when the error refers to a
+    /// specific workspace (e.g. the soft-deleted one we failed to purge).
+    #[serde(default)]
+    pub workspace_id: Option<WorkspaceId>,
+    #[serde(default)]
+    pub workspace_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +148,9 @@ mod tests {
         assert_eq!(ws.repo_links.len(), 1);
         assert!(ws.repo_links[0].github.is_none());
         assert!(ws.claude_binary.is_none());
+        assert!(ws.deleted_at.is_none());
+        assert!(ws.archived_at.is_none());
+        assert!(parsed.system_errors.is_empty());
     }
 
     #[test]

@@ -325,6 +325,60 @@ pub async fn branch_delete_best_effort(
     }
 }
 
+/// `git -C <clone_path> worktree remove <worktree_path>`. Silent variant
+/// for the background purger: no `JobTx`, no per-line streaming.
+pub async fn worktree_remove_silent(
+    clone_path: &Path,
+    worktree_path: &Path,
+    force: bool,
+) -> AppResult<()> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(clone_path)
+        .arg("worktree")
+        .arg("remove");
+    if force {
+        cmd.arg("--force");
+    }
+    cmd.arg(worktree_path);
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| AppError::Other(format!("git worktree remove: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(AppError::Other(format!(
+            "git worktree remove {} exited with {:?}: {stderr}",
+            worktree_path.display(),
+            output.status.code()
+        )));
+    }
+    Ok(())
+}
+
+/// `git -C <clone_path> worktree prune`. Silent best-effort variant.
+pub async fn worktree_prune_best_effort_silent(clone_path: &Path) {
+    let _ = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(clone_path)
+        .arg("worktree")
+        .arg("prune")
+        .output()
+        .await;
+}
+
+/// `git -C <clone_path> branch -D <branch>`. Silent best-effort variant.
+pub async fn branch_delete_best_effort_silent(clone_path: &Path, branch: &str) {
+    let _ = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(clone_path)
+        .arg("branch")
+        .arg("-D")
+        .arg(branch)
+        .output()
+        .await;
+}
+
 /// `git -C <clone_path> worktree remove <worktree_path>`. Returns an error if
 /// the worktree is dirty (caller can retry with `force`).
 pub async fn worktree_remove(

@@ -66,6 +66,21 @@ export interface Workspace {
   /** Override the claude entry-point binary name for sessions in this workspace
    *  (e.g. `claude-hipaa`). `null` falls back to the default `claude`. */
   claude_binary: string | null;
+  /** Soft-delete marker. The workspace is hidden from the sidebar until the
+   *  hourly purger runs (only purges entries older than 1 hour). */
+  deleted_at: string | null;
+  /** Archive marker. Archived workspaces render in a collapsed group at
+   *  the bottom of the sidebar. */
+  archived_at: string | null;
+}
+
+export interface SystemErrorEntry {
+  id: string;
+  at: string;
+  kind: string;
+  message: string;
+  workspace_id: string | null;
+  workspace_branch: string | null;
 }
 
 export interface CreateWorkspaceArgs {

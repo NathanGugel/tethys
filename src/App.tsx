@@ -1,10 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Channel, invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import type {
   CreateWorkspaceArgs,
   Discrepancies,
   GithubStatusChangedEvent,
-  JobEvent,
   RegistryStatus,
   Repo,
   SessionInfo,
@@ -18,12 +17,10 @@ import { GithubAuthFooter } from "./GithubAuthFooter";
 import { GithubChip } from "./GithubChip";
 import { JobLogPane } from "./JobLogPane";
 import { SessionTerminal } from "./SessionTerminal";
+import { Sidebar } from "./Sidebar";
+import { SystemStatus } from "./SystemStatus";
 import { applyTheme, ThemeContext } from "./theme";
-import {
-  useBackendJob,
-  type JobDescriptor,
-  type JobState,
-} from "./useBackendJob";
+import { useBackendJob, type JobDescriptor } from "./useBackendJob";
 import { useTauriEvent } from "./useTauriEvent";
 import { isReadyToArchive } from "./workspaceDerived";
 import "./App.css";
@@ -34,13 +31,6 @@ type PendingCreate = {
   args: CreateWorkspaceArgs;
 };
 
-type DeleteJob = {
-  workspaceId: WorkspaceId;
-  branch: string;
-  events: JobEvent[];
-  state: JobState;
-};
-
 function App() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [registry, setRegistry] = useState<RegistryStatus | null>(null);
@@ -49,14 +39,6 @@ function App() {
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pendingCreate, setPendingCreate] = useState<PendingCreate | null>(null);
-  const [deleteJobs, setDeleteJobs] = useState<Map<WorkspaceId, DeleteJob>>(
-    new Map(),
-  );
-  /**
-   * Guards against double-invoking delete_workspace for the same id if
-   * startDelete is called twice before state updates land.
-   */
-  const startedDeletesRef = useRef<Set<WorkspaceId>>(new Set());
   /**
    * Per-session turn state tracked by listening to `session:turn_changed`
    * globally. Used for the sidebar attention dot without needing to
@@ -146,6 +128,7 @@ function App() {
   const workspaceNeedsTurn = useCallback(
     (w: Workspace): boolean => {
       if (w.paused) return false;
+      if (w.archived_at) return false;
       for (const info of turnStates.values()) {
         if (info.workspaceId !== w.id) continue;
         if (info.state === "idle" || info.state === "waiting_input") return true;
@@ -201,12 +184,19 @@ function App() {
     refreshSessionsFor(event.payload.workspace_id);
   });
 
-  const selected = useMemo(
-    () => workspaces.find((w) => w.id === selectedId) ?? null,
-    [workspaces, selectedId],
+  const visibleWorkspaces = useMemo(
+    () => workspaces.filter((w) => !w.deleted_at),
+    [workspaces],
   );
-
-  const selectedDeleteJob = selected ? deleteJobs.get(selected.id) : undefined;
+  const selected = useMemo(() => {
+    const ws = workspaces.find((w) => w.id === selectedId);
+    if (!ws) return null;
+    // Don't render the detail pane for soft-deleted workspaces — the row
+    // is gone from the sidebar so showing the detail pane would be a
+    // dead-end. Acts as a side-effect-free guard.
+    if (ws.deleted_at) return null;
+    return ws;
+  }, [workspaces, selectedId]);
 
   const createDescriptor = useMemo<JobDescriptor | null>(
     () =>
@@ -244,90 +234,64 @@ function App() {
     },
   );
 
-  const startDelete = useCallback(
-    (workspaceId: WorkspaceId, branch: string) => {
-      if (startedDeletesRef.current.has(workspaceId)) return;
-      startedDeletesRef.current.add(workspaceId);
-
-      setDeleteJobs((prev) => {
-        const next = new Map(prev);
-        next.set(workspaceId, {
-          workspaceId,
-          branch,
-          events: [],
-          state: "running",
-        });
-        return next;
-      });
-
-      const channel = new Channel<JobEvent>();
-      channel.onmessage = (event) => {
-        setDeleteJobs((prev) => {
-          const existing = prev.get(workspaceId);
-          if (!existing) return prev;
-          const next = new Map(prev);
-          next.set(workspaceId, {
-            ...existing,
-            events: [...existing.events, event],
-            state:
-              event.kind === "success"
-                ? "success"
-                : event.kind === "failed"
-                  ? "failed"
-                  : existing.state,
-          });
-          return next;
-        });
-      };
-
-      invoke("delete_workspace", { id: workspaceId, onEvent: channel })
-        .then(() => {
-          startedDeletesRef.current.delete(workspaceId);
-          // Auto-dismiss on success: drop the entry and unselect if the
-          // deleted workspace was showing.
-          setDeleteJobs((prev) => {
-            if (!prev.has(workspaceId)) return prev;
-            const next = new Map(prev);
-            next.delete(workspaceId);
-            return next;
-          });
-          setSelectedId((cur) => (cur === workspaceId ? null : cur));
-          refresh();
-        })
-        .catch((e) => {
-          startedDeletesRef.current.delete(workspaceId);
-          setDeleteJobs((prev) => {
-            const existing = prev.get(workspaceId);
-            if (!existing) return prev;
-            const last = existing.events[existing.events.length - 1];
-            const events =
-              last?.kind === "failed"
-                ? existing.events
-                : [
-                    ...existing.events,
-                    { kind: "failed", error: String(e) } as JobEvent,
-                  ];
-            const next = new Map(prev);
-            next.set(workspaceId, { ...existing, events, state: "failed" });
-            return next;
-          });
-        });
+  const handleDelete = useCallback(
+    async (workspace: Workspace) => {
+      setSelectedId((cur) => (cur === workspace.id ? null : cur));
+      try {
+        await invoke("delete_workspace", { id: workspace.id });
+      } catch (e) {
+        setError(`delete failed: ${String(e)}`);
+      }
     },
-    [refresh],
+    [],
   );
 
-  const dismissDelete = useCallback(
-    (workspaceId: WorkspaceId) => {
-      setDeleteJobs((prev) => {
-        if (!prev.has(workspaceId)) return prev;
-        const next = new Map(prev);
-        next.delete(workspaceId);
-        return next;
-      });
+  const handleArchiveToggle = useCallback(async (workspace: Workspace) => {
+    try {
+      await invoke(
+        workspace.archived_at ? "unarchive_workspace" : "archive_workspace",
+        { id: workspace.id },
+      );
+    } catch (e) {
+      setError(`archive failed: ${String(e)}`);
+    }
+  }, []);
+
+  const handlePauseToggle = useCallback(async (workspace: Workspace) => {
+    try {
+      await invoke(
+        workspace.paused ? "resume_workspace" : "pause_workspace",
+        { id: workspace.id },
+      );
+    } catch (e) {
+      setError(`pause toggle failed: ${String(e)}`);
+    }
+  }, []);
+
+  const handleReorder = useCallback(async (ids: WorkspaceId[]) => {
+    // Optimistically reorder so the drop animation lands on the right row,
+    // then fire the backend command. The `workspace:reordered` event would
+    // also drive a refresh, but doing this here avoids the visible flicker
+    // from the round-trip.
+    setWorkspaces((prev) => {
+      const byId = new Map(prev.map((w) => [w.id, w]));
+      const moved: Workspace[] = [];
+      const rest: Workspace[] = [];
+      for (const id of ids) {
+        const w = byId.get(id);
+        if (w) moved.push(w);
+      }
+      const idsSet = new Set(ids);
+      for (const w of prev) if (!idsSet.has(w.id)) rest.push(w);
+      return [...moved, ...rest];
+    });
+    try {
+      await invoke("reorder_workspaces", { ids });
+    } catch (e) {
+      setError(`reorder failed: ${String(e)}`);
       refresh();
-    },
-    [refresh],
-  );
+    }
+  }, [refresh]);
 
   const registryOk = registry?.kind === "ok";
 
@@ -352,83 +316,28 @@ function App() {
             New workspace
           </button>
         </div>
-        <ul className="workspace-list">
-          {workspaces.length === 0 && !pendingCreate && (
-            <li className="empty">No workspaces yet.</li>
-          )}
-          {pendingCreate && (
-            <li
-              key={pendingCreate.tempId}
-              className={`pending${
-                pendingCreate.tempId === selectedId ? " selected" : ""
-              }`}
-              onClick={() => setSelectedId(pendingCreate.tempId)}
-            >
-              <div className="workspace-name">
-                <Spinner />
-                {pendingCreate.branch}
-              </div>
-              <div className="pending-label">creating…</div>
-            </li>
-          )}
-          {workspaces.map((w) => {
-            const deleteJob = deleteJobs.get(w.id);
-            const deleting = deleteJob?.state === "running";
-            const deleteFailed = deleteJob?.state === "failed";
-            const inDeleteFlow = deleting || deleteFailed;
-            const classes = [
-              w.id === selectedId ? "selected" : "",
-              inDeleteFlow ? "pending" : "",
-              w.paused && !inDeleteFlow ? "is-paused" : "",
-            ]
-              .filter(Boolean)
-              .join(" ");
-            return (
-              <li
-                key={w.id}
-                className={classes}
-                onClick={() => setSelectedId(w.id)}
-              >
-                <div className="workspace-name">
-                  {deleting ? (
-                    <Spinner />
-                  ) : (
-                    !deleteFailed &&
-                    workspaceNeedsTurn(w) && (
-                      <span
-                        className="turn-dot"
-                        title="Your turn"
-                        aria-label="your turn"
-                      />
-                    )
-                  )}
-                  {w.branch}
-                </div>
-                {deleting ? (
-                  <div className="pending-label">deleting…</div>
-                ) : deleteFailed ? (
-                  <div className="pending-label">delete failed</div>
-                ) : (
-                  w.repo_links.length > 0 && (
-                    <ul className="workspace-repo-list">
-                      {w.repo_links.map((r) => (
-                        <li key={r.repo_key}>
-                          <span className="repo-key">{r.repo_key}</span>
-                          {r.github && (
-                            <div className="repo-gh-footer">
-                              <GithubChip status={r.github} linkable={false} />
-                            </div>
-                          )}
-                        </li>
-                      ))}
-                    </ul>
-                  )
-                )}
-              </li>
-            );
-          })}
-        </ul>
-        <GithubAuthFooter />
+        <Sidebar
+          workspaces={visibleWorkspaces}
+          selectedId={selectedId}
+          pendingCreate={
+            pendingCreate
+              ? { tempId: pendingCreate.tempId, branch: pendingCreate.branch }
+              : null
+          }
+          onSelect={setSelectedId}
+          onSelectPending={() =>
+            pendingCreate && setSelectedId(pendingCreate.tempId)
+          }
+          onReorder={handleReorder}
+          onPauseToggle={handlePauseToggle}
+          onArchiveToggle={handleArchiveToggle}
+          onDelete={handleDelete}
+          workspaceNeedsTurn={workspaceNeedsTurn}
+        />
+        <div className="sidebar-footer">
+          <SystemStatus allWorkspaces={workspaces} />
+          <GithubAuthFooter />
+        </div>
       </aside>
 
       <main className="detail">
@@ -454,18 +363,12 @@ function App() {
               setSelectedId(null);
             }}
           />
-        ) : selectedDeleteJob ? (
-          <JobLogPane
-            title={`Deleting ${selectedDeleteJob.branch}`}
-            events={selectedDeleteJob.events}
-            state={selectedDeleteJob.state}
-            onDismiss={() => dismissDelete(selectedDeleteJob.workspaceId)}
-          />
         ) : selected ? (
           <WorkspaceDetail
             workspace={selected}
             sessions={sessionsByWorkspace.get(selected.id) ?? []}
-            onRequestDelete={() => startDelete(selected.id, selected.branch)}
+            onRequestDelete={() => handleDelete(selected)}
+            onRequestArchive={() => handleArchiveToggle(selected)}
           />
         ) : (
           registryOk && (
@@ -685,13 +588,14 @@ function WorkspaceDetail({
   workspace,
   sessions,
   onRequestDelete,
+  onRequestArchive,
 }: {
   workspace: Workspace;
   sessions: SessionInfo[];
   onRequestDelete: () => void;
+  onRequestArchive: () => void;
 }) {
   const [busy, setBusy] = useState(false);
-  const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
   // Per-workspace selection. Derived on render (no effect), so switching
   // back to a workspace paints the remembered pick immediately.
@@ -722,11 +626,6 @@ function WorkspaceDetail({
     } finally {
       setBusy(false);
     }
-  };
-
-  const performDelete = () => {
-    setConfirmingDelete(false);
-    onRequestDelete();
   };
 
   const liveById = new Map(sessions.map((s) => [s.id, s]));
@@ -846,40 +745,22 @@ function WorkspaceDetail({
           </button>
           <button
             type="button"
+            onClick={onRequestArchive}
+            disabled={busy}
+          >
+            {workspace.archived_at ? "Unarchive" : "Archive"}
+          </button>
+          <button
+            type="button"
             className="danger"
-            onClick={() => setConfirmingDelete(true)}
+            onClick={onRequestDelete}
             disabled={busy}
           >
             Delete
           </button>
         </div>
       </header>
-      {confirmingDelete && (
-        <div className="inline-confirm" role="alert">
-          <div className="inline-confirm-message">
-            Delete workspace <code>{workspace.branch}</code>? This removes
-            every worktree <strong>including any uncommitted changes</strong>{" "}
-            and clears the workspace from Tethys state.
-          </div>
-          <div className="inline-confirm-actions">
-            <button
-              type="button"
-              onClick={() => setConfirmingDelete(false)}
-              autoFocus
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              className="danger primary"
-              onClick={performDelete}
-            >
-              Delete
-            </button>
-          </div>
-        </div>
-      )}
-      {!confirmingDelete && isReadyToArchive(workspace) && (
+      {!workspace.archived_at && isReadyToArchive(workspace) && (
         <div className="archive-banner">
           <div>
             <strong>Ready to archive.</strong>{" "}
@@ -890,9 +771,9 @@ function WorkspaceDetail({
           <button
             type="button"
             className="primary"
-            onClick={() => setConfirmingDelete(true)}
+            onClick={onRequestArchive}
           >
-            Delete workspace
+            Archive workspace
           </button>
         </div>
       )}
