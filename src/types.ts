@@ -46,10 +46,14 @@ export interface RepoLink {
 
 export interface ClaudeSessionMeta {
   id: SessionId;
-  repo_key: string;
+  /** `null` => session is rooted at the workspace dir (parent of all repo worktrees). */
+  repo_key: string | null;
   cwd: string;
   claude_session_id: string | null;
   transcript_path: string | null;
+  /** Cosmetic: when true the session is filtered out of the chip bar
+   *  unless the user toggles "show hidden". The tmux session keeps running. */
+  hidden: boolean;
 }
 
 export interface Workspace {
@@ -59,11 +63,15 @@ export interface Workspace {
   created_at: string;
   repo_links: RepoLink[];
   sessions: ClaudeSessionMeta[];
+  /** Override the claude entry-point binary name for sessions in this workspace
+   *  (e.g. `claude-hipaa`). `null` falls back to the default `claude`. */
+  claude_binary: string | null;
 }
 
 export interface CreateWorkspaceArgs {
   branch: string;
   repo_selections: string[];
+  claude_binary?: string | null;
 }
 
 export interface Repo {
@@ -103,7 +111,8 @@ export interface Discrepancies {
 export interface SessionInfo {
   id: string;
   workspace_id: string;
-  repo_key: string;
+  /** `null` => session is rooted at the workspace dir (parent of all repo worktrees). */
+  repo_key: string | null;
   cwd: string;
   running: boolean;
   runtime_state: SessionRuntimeState;

@@ -109,9 +109,9 @@ function reviewTone(
       // Approved with unresolved threads is still "feedback outstanding".
       return unresolved > 0 ? "yellow" : "green";
     case "changes_requested":
-      return "yellow";
-    case "review_required":
       return "red";
+    case "review_required":
+      return "gray";
     case "none":
       return unresolved > 0 ? "yellow" : "gray";
   }

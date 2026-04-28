@@ -213,6 +213,7 @@ pub fn run() {
             commands::list_sessions,
             commands::start_claude_session,
             commands::resume_claude_session,
+            commands::set_claude_session_hidden,
             commands::attach_session,
             commands::send_input,
             commands::resize_session,
@@ -234,7 +235,7 @@ fn prewarm_live_sessions(
     tmux_bin: &std::path::Path,
     store: &Arc<Store>,
 ) {
-    let candidates: Vec<(String, String, String, std::path::PathBuf)> =
+    let candidates: Vec<(String, String, Option<String>, std::path::PathBuf)> =
         tauri::async_runtime::block_on(async {
             store
                 .read(|s| {

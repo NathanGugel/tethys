@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use tauri::ipc::InvokeResponseBody;
 
+use crate::claude;
 use crate::claude_local;
 use crate::error::{AppError, AppResult};
 use crate::git;
@@ -131,6 +132,10 @@ pub async fn open_in_vscode(
 pub struct CreateWorkspaceArgs {
     pub branch: String,
     pub repo_selections: Vec<String>,
+    /// Optional alternate entry-point binary name (e.g. `claude-hipaa`).
+    /// Resolved on the login-shell PATH at spawn time.
+    #[serde(default)]
+    pub claude_binary: Option<String>,
 }
 
 /// Orchestrates clone + worktree add + setup script for every selected repo,
@@ -158,6 +163,15 @@ pub async fn create_workspace(
         return Err(AppError::Other(
             "pick at least one repo to include in the workspace".into(),
         ));
+    }
+    let claude_binary = args
+        .claude_binary
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    // Validate up-front so the user finds out before we clone repos.
+    if let Some(bin) = claude_binary.as_deref() {
+        claude::resolve_named(bin)?;
     }
 
     let reg = registry.require()?;
@@ -253,6 +267,7 @@ pub async fn create_workspace(
                 created_at: Utc::now(),
                 repo_links: created_links,
                 sessions: Vec::new(),
+                claude_binary,
             };
 
             let stored = store
@@ -560,7 +575,10 @@ pub fn list_sessions(
 #[derive(Debug, serde::Deserialize)]
 pub struct StartClaudeArgs {
     pub workspace_id: WorkspaceId,
-    pub repo_key: String,
+    /// `None` => start the session at the workspace root (the parent dir
+    /// containing each repo's worktree subdir).
+    #[serde(default)]
+    pub repo_key: Option<String>,
 }
 
 /// Spawn a fresh `claude` session in the given workspace/repo worktree.
@@ -590,7 +608,9 @@ pub async fn start_claude_session(
 #[derive(Debug, serde::Deserialize)]
 pub struct ResumeClaudeArgs {
     pub workspace_id: WorkspaceId,
-    pub repo_key: String,
+    /// `None` matches a workspace-root session.
+    #[serde(default)]
+    pub repo_key: Option<String>,
     /// The `id` field from an existing `ClaudeSessionMeta` — its
     /// `claude_session_id` will be passed to `claude --resume`.
     pub session_meta_id: String,
@@ -683,29 +703,51 @@ async fn spawn_claude(
         ));
     }
 
-    let worktree_path = store
+    // Resolve the cwd: a specific repo's worktree, or — when repo_key is
+    // None — the workspace root (parent of every repo worktree).
+    // Also pull the per-workspace claude binary override, if any.
+    let lookup = store
         .read(|s| {
-            s.find_workspace(&args.workspace_id).and_then(|w| {
-                w.repo_links
+            let w = s.find_workspace(&args.workspace_id)?;
+            let cwd = match args.repo_key.as_deref() {
+                Some(key) => w
+                    .repo_links
                     .iter()
-                    .find(|r| r.repo_key == args.repo_key)
-                    .map(|r| r.worktree_path.clone())
-            })
+                    .find(|r| r.repo_key == key)
+                    .map(|r| r.worktree_path.clone()),
+                None => w
+                    .repo_links
+                    .first()
+                    .and_then(|r| r.worktree_path.parent().map(|p| p.to_path_buf())),
+            }?;
+            Some((cwd, w.claude_binary.clone()))
         })
         .await
         .ok_or_else(|| {
-            AppError::Other(format!(
-                "no worktree for {}/{} in state",
-                args.workspace_id, args.repo_key
-            ))
+            AppError::Other(match args.repo_key.as_deref() {
+                Some(key) => format!(
+                    "no worktree for {}/{} in state",
+                    args.workspace_id, key
+                ),
+                None => format!(
+                    "workspace {} has no repos — can't resolve a root dir",
+                    args.workspace_id
+                ),
+            })
         })?;
+    let (cwd, ws_binary) = lookup;
+
+    let resolved_bin = match ws_binary.as_deref() {
+        Some(bin) => claude::resolve_named(bin)?,
+        None => claude_bin.0.clone(),
+    };
 
     let (info, _token) = supervisor.spawn_claude(
         args.workspace_id.clone(),
         args.repo_key.clone(),
-        &worktree_path,
+        &cwd,
         &tmux_bin.0,
-        &claude_bin.0,
+        &resolved_bin,
         resume_claude_sid,
     )?;
 
@@ -716,9 +758,10 @@ async fn spawn_claude(
     let meta = ClaudeSessionMeta {
         id: info.id.clone(),
         repo_key: args.repo_key.clone(),
-        cwd: worktree_path.clone(),
+        cwd: cwd.clone(),
         claude_session_id: None,
         transcript_path: None,
+        hidden: false,
     };
 
     store
@@ -742,6 +785,45 @@ async fn spawn_claude(
 
     emit_workspace_changed(app, &args.workspace_id);
     Ok(info)
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct SetClaudeHiddenArgs {
+    pub workspace_id: WorkspaceId,
+    pub session_id: String,
+    pub hidden: bool,
+}
+
+/// Toggle a Claude session's `hidden` flag in state. Cosmetic only — the
+/// tmux session and the supervisor's `SessionHandle` keep running.
+#[tauri::command]
+pub async fn set_claude_session_hidden(
+    app: AppHandle,
+    store: State<'_, Arc<Store>>,
+    args: SetClaudeHiddenArgs,
+) -> AppResult<()> {
+    let touched = store
+        .mutate(|s| {
+            let ws = s
+                .find_workspace_mut(&args.workspace_id)
+                .ok_or_else(|| AppError::WorkspaceNotFound(args.workspace_id.clone()))?;
+            let Some(meta) = ws.sessions.iter_mut().find(|m| m.id == args.session_id) else {
+                return Ok(false);
+            };
+            meta.hidden = args.hidden;
+            Ok(true)
+        })
+        .await?;
+
+    if !touched {
+        return Err(AppError::Other(format!(
+            "session {} not found in workspace {}",
+            args.session_id, args.workspace_id
+        )));
+    }
+
+    emit_workspace_changed(&app, &args.workspace_id);
+    Ok(())
 }
 
 /// Newtype so `claude_bin` can be managed in Tauri state.

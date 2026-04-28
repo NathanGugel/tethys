@@ -898,6 +898,59 @@ button.danger.primary:hover:not(:disabled) {
   color: var(--fg);
 }
 
+.session-chip .chip-repo.root {
+  font-style: italic;
+  opacity: 0.85;
+}
+
+.session-chip .chip-x {
+  margin-left: 4px;
+  padding: 0 4px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: 14px;
+  line-height: 1;
+  opacity: 0.4;
+  cursor: pointer;
+  border-radius: 3px;
+}
+
+.session-chip:hover .chip-x,
+.session-chip.active .chip-x {
+  opacity: 0.85;
+}
+
+.session-chip .chip-x:hover {
+  opacity: 1;
+  background: var(--danger-bg, rgba(255, 80, 80, 0.18));
+}
+
+.session-chip.hidden {
+  opacity: 0.55;
+  border-style: dotted;
+}
+
+.session-chip.hidden.active {
+  opacity: 0.85;
+}
+
+.hidden-toggle {
+  margin-left: auto;
+  padding: 4px 10px;
+  font-size: 11px;
+  background: transparent;
+  color: var(--fg-muted, var(--fg));
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0.7;
+}
+
+.hidden-toggle:hover {
+  opacity: 1;
+}
+
 .session-chip.new {
   border-style: dashed;
 }

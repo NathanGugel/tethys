@@ -28,7 +28,9 @@ pub type SessionId = String;
 pub struct SessionInfo {
     pub id: SessionId,
     pub workspace_id: String,
-    pub repo_key: String,
+    /// `None` => session is rooted at the workspace's parent dir (which
+    /// contains every repo subdir), not inside any one repo.
+    pub repo_key: Option<String>,
     pub cwd: PathBuf,
     pub running: bool,
     pub runtime_state: SessionRuntimeState,
@@ -134,7 +136,7 @@ impl SessionSupervisor {
         &self,
         id: SessionId,
         workspace_id: String,
-        repo_key: String,
+        repo_key: Option<String>,
         cwd: &Path,
         program: &Path,
         args: &[String],
@@ -243,7 +245,7 @@ impl SessionSupervisor {
     pub fn spawn_claude(
         &self,
         workspace_id: String,
-        repo_key: String,
+        repo_key: Option<String>,
         cwd: &Path,
         tmux_bin: &Path,
         claude_bin: &Path,
@@ -313,7 +315,7 @@ impl SessionSupervisor {
         &self,
         session_id: SessionId,
         workspace_id: String,
-        repo_key: String,
+        repo_key: Option<String>,
         cwd: &Path,
         tmux_bin: &Path,
     ) -> AppResult<SessionInfo> {

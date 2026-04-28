@@ -229,6 +229,17 @@ function App() {
         await refresh();
         setSelectedId(ws.id);
         setPendingCreate(null);
+        // Auto-start a Claude session: in the only repo when the workspace
+        // has just one, otherwise at the workspace root.
+        const repoKey =
+          ws.repo_links.length === 1 ? ws.repo_links[0].repo_key : null;
+        try {
+          await invoke<SessionInfo>("start_claude_session", {
+            args: { workspace_id: ws.id, repo_key: repoKey },
+          });
+        } catch (e) {
+          setError(`auto-start claude failed: ${String(e)}`);
+        }
       },
     },
   );
@@ -722,14 +733,19 @@ function WorkspaceDetail({
   // Newest first — the most recently started session is usually what you
   // want to see. `workspace.sessions` is append-ordered on the backend.
   const ordered = [...workspace.sessions].reverse();
+  const visibleOrdered = ordered.filter((m) => !m.hidden);
+  const hiddenOrdered = ordered.filter((m) => m.hidden);
+  const [showHidden, setShowHidden] = useState(false);
 
-  // Effective selection: user's explicit pick if still valid; otherwise the
-  // first live session, else the newest entry.
+  // Effective selection: prefer the user's explicit pick when it's still
+  // visible, else fall through to first live, else newest. When hiding
+  // the selected chip, this naturally jumps to the next visible one.
+  const candidates = showHidden ? ordered : visibleOrdered;
   const effectiveSelected = (() => {
-    if (selectedSessionId && ordered.some((m) => m.id === selectedSessionId))
+    if (selectedSessionId && candidates.some((m) => m.id === selectedSessionId))
       return selectedSessionId;
-    const firstLive = ordered.find((m) => liveById.has(m.id));
-    return firstLive?.id ?? ordered[0]?.id ?? null;
+    const firstLive = candidates.find((m) => liveById.has(m.id));
+    return firstLive?.id ?? candidates[0]?.id ?? null;
   })();
 
   const selected = effectiveSelected
@@ -737,7 +753,9 @@ function WorkspaceDetail({
     : null;
   const selectedLive = selected ? liveById.get(selected.id) ?? null : null;
 
-  const startInRepo = async (repoKey: string) => {
+  // `repoKey === null` spawns at the workspace root (parent of every
+  // repo worktree) — only offered when the workspace has 2+ repos.
+  const startInRepo = async (repoKey: string | null) => {
     setBusy(true);
     setError(null);
     try {
@@ -753,7 +771,21 @@ function WorkspaceDetail({
     }
   };
 
-  const resumeMeta = async (metaId: string, repoKey: string) => {
+  const setSessionHidden = async (sessionId: string, hidden: boolean) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("set_claude_session_hidden", {
+        args: { workspace_id: workspace.id, session_id: sessionId, hidden },
+      });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const resumeMeta = async (metaId: string, repoKey: string | null) => {
     setBusy(true);
     setError(null);
     try {
@@ -873,12 +905,16 @@ function WorkspaceDetail({
 
       <div className="session-pane">
         <SessionBar
-          sessions={ordered}
+          visibleSessions={visibleOrdered}
+          hiddenSessions={hiddenOrdered}
+          showHidden={showHidden}
+          onToggleShowHidden={() => setShowHidden((v) => !v)}
           liveById={liveById}
           repos={workspace.repo_links}
           selectedId={effectiveSelected}
           onSelect={selectSession}
           onStartInRepo={startInRepo}
+          onSetHidden={setSessionHidden}
           busy={busy}
         />
         {error && <div className="error-banner">{error}</div>}
@@ -935,21 +971,98 @@ function WorkspaceDetail({
   );
 }
 
+type ChipMeta = {
+  id: string;
+  repo_key: string | null;
+  claude_session_id: string | null;
+};
+
+function SessionChip({
+  meta,
+  hidden,
+  selected,
+  live,
+  onSelect,
+  onSetHidden,
+}: {
+  meta: ChipMeta;
+  hidden: boolean;
+  selected: boolean;
+  live: SessionInfo | undefined;
+  onSelect: (id: string) => void;
+  onSetHidden: (id: string, hidden: boolean) => void;
+}) {
+  const label = meta.id.slice(0, 8);
+  const needsTurn =
+    live?.running &&
+    (live.runtime_state === "idle" || live.runtime_state === "waiting_input");
+  const chipClass = [
+    "session-chip",
+    selected ? "active" : "",
+    hidden ? "hidden" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      className={chipClass}
+      onClick={() => onSelect(meta.id)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onSelect(meta.id);
+        }
+      }}
+    >
+      <span className={`chip-repo${meta.repo_key === null ? " root" : ""}`}>
+        {meta.repo_key ?? "root"}
+      </span>
+      <code>{label}</code>
+      {needsTurn && <span className="turn-dot" />}
+      {live && !live.running && <span className="chip-state">exited</span>}
+      {!live && <span className="chip-state">dormant</span>}
+      <button
+        type="button"
+        className="chip-x"
+        title={hidden ? "Show this chat" : "Hide this chat"}
+        aria-label={hidden ? "Show this chat" : "Hide this chat"}
+        onClick={(e) => {
+          e.stopPropagation();
+          onSetHidden(meta.id, !hidden);
+        }}
+      >
+        {hidden ? "↺" : "×"}
+      </button>
+    </div>
+  );
+}
+
 function SessionBar({
-  sessions,
+  visibleSessions,
+  hiddenSessions,
+  showHidden,
+  onToggleShowHidden,
   liveById,
   repos,
   selectedId,
   onSelect,
   onStartInRepo,
+  onSetHidden,
   busy,
 }: {
-  sessions: { id: string; repo_key: string; claude_session_id: string | null }[];
+  visibleSessions: ChipMeta[];
+  hiddenSessions: ChipMeta[];
+  showHidden: boolean;
+  onToggleShowHidden: () => void;
   liveById: Map<string, SessionInfo>;
   repos: { repo_key: string }[];
   selectedId: string | null;
   onSelect: (id: string) => void;
-  onStartInRepo: (repoKey: string) => void;
+  /** `null` => start at the workspace root. */
+  onStartInRepo: (repoKey: string | null) => void;
+  onSetHidden: (id: string, hidden: boolean) => void;
   busy: boolean;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -978,30 +1091,29 @@ function SessionBar({
 
   return (
     <div className="session-chip-bar">
-      {sessions.map((m) => {
-        const live = liveById.get(m.id);
-        const label = m.id.slice(0, 8);
-        const needsTurn =
-          live?.running &&
-          (live.runtime_state === "idle" ||
-            live.runtime_state === "waiting_input");
-        return (
-          <button
+      {visibleSessions.map((m) => (
+        <SessionChip
+          key={m.id}
+          meta={m}
+          hidden={false}
+          selected={selectedId === m.id}
+          live={liveById.get(m.id)}
+          onSelect={onSelect}
+          onSetHidden={onSetHidden}
+        />
+      ))}
+      {showHidden &&
+        hiddenSessions.map((m) => (
+          <SessionChip
             key={m.id}
-            type="button"
-            className={`session-chip${selectedId === m.id ? " active" : ""}`}
-            onClick={() => onSelect(m.id)}
-          >
-            <span className="chip-repo">{m.repo_key}</span>
-            <code>{label}</code>
-            {needsTurn && <span className="turn-dot" />}
-            {live && !live.running && (
-              <span className="chip-state">exited</span>
-            )}
-            {!live && <span className="chip-state">dormant</span>}
-          </button>
-        );
-      })}
+            meta={m}
+            hidden={true}
+            selected={selectedId === m.id}
+            live={liveById.get(m.id)}
+            onSelect={onSelect}
+            onSetHidden={onSetHidden}
+          />
+        ))}
       <div className="new-session-wrap" ref={wrapRef}>
         <button
           type="button"
@@ -1021,6 +1133,16 @@ function SessionBar({
         </button>
         {menuOpen && repos.length > 1 && (
           <div className="new-session-menu" role="menu">
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setMenuOpen(false);
+                onStartInRepo(null);
+              }}
+            >
+              New at workspace <code>root</code>
+            </button>
             {repos.map((r) => (
               <button
                 key={r.repo_key}
@@ -1037,6 +1159,18 @@ function SessionBar({
           </div>
         )}
       </div>
+      {hiddenSessions.length > 0 && (
+        <button
+          type="button"
+          className="hidden-toggle"
+          onClick={onToggleShowHidden}
+          title={showHidden ? "Hide hidden chats" : "Show hidden chats"}
+        >
+          {showHidden
+            ? `Hide ${hiddenSessions.length} hidden`
+            : `Show ${hiddenSessions.length} hidden`}
+        </button>
+      )}
     </div>
   );
 }
@@ -1129,6 +1263,7 @@ function CreateWorkspaceDialog({
   const [selected, setSelected] = useState<Set<string>>(() =>
     loadLastRepoSelection(repos),
   );
+  const [useHipaa, setUseHipaa] = useState(false);
 
   const toggle = (key: string) => {
     setSelected((prev) => {
@@ -1155,6 +1290,7 @@ function CreateWorkspaceDialog({
     onSubmit({
       branch: branch.trim(),
       repo_selections: repoSelections,
+      claude_binary: useHipaa ? "claude-hipaa" : null,
     });
   };
 
@@ -1201,6 +1337,16 @@ function CreateWorkspaceDialog({
             </ul>
           )}
         </div>
+        <label className="repo-row">
+          <input
+            type="checkbox"
+            checked={useHipaa}
+            onChange={(e) => setUseHipaa(e.target.checked)}
+          />
+          <span className="repo-display">
+            Use <code>claude-hipaa</code> for sessions in this workspace
+          </span>
+        </label>
         <div className="modal-actions">
           <button type="button" onClick={onClose}>
             Cancel

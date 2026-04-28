@@ -30,6 +30,11 @@ pub struct Workspace {
     pub repo_links: Vec<RepoLink>,
     #[serde(default)]
     pub sessions: Vec<ClaudeSessionMeta>,
+    /// Override the entry-point binary name for sessions in this workspace
+    /// (e.g. `claude-hipaa`). `None` falls back to the app-wide `claude`
+    /// resolved at boot.
+    #[serde(default)]
+    pub claude_binary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,10 +49,18 @@ pub struct RepoLink {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeSessionMeta {
     pub id: SessionId,
-    pub repo_key: String,
+    /// `None` => session was started at the workspace root (the parent dir
+    /// containing each repo's worktree subdir), not inside any one repo.
+    #[serde(default)]
+    pub repo_key: Option<String>,
     pub cwd: PathBuf,
     pub claude_session_id: Option<String>,
     pub transcript_path: Option<PathBuf>,
+    /// User-set: when true, the session chip is filtered out of the
+    /// default chip bar. The tmux session and supervisor handle stay
+    /// live — hide is purely cosmetic.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,5 +119,26 @@ mod tests {
         assert_eq!(ws.branch, "feat/foo");
         assert_eq!(ws.repo_links.len(), 1);
         assert!(ws.repo_links[0].github.is_none());
+        assert!(ws.claude_binary.is_none());
+    }
+
+    #[test]
+    fn claude_binary_round_trips() {
+        let raw = r#"{
+            "workspaces": [
+                {
+                    "id": "abc-123",
+                    "branch": "feat/foo",
+                    "created_at": "2026-04-01T12:00:00Z",
+                    "repo_links": [],
+                    "claude_binary": "claude-hipaa"
+                }
+            ]
+        }"#;
+        let parsed: AppState = serde_json::from_str(raw).expect("must deserialize");
+        assert_eq!(
+            parsed.workspaces[0].claude_binary.as_deref(),
+            Some("claude-hipaa")
+        );
     }
 }
