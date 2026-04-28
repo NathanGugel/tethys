@@ -261,6 +261,7 @@ function WorkspaceRow({
       }}
     >
       <div className="workspace-name">
+        {workspace.branch}
         {needsTurn && (
           <span
             className="turn-dot"
@@ -268,7 +269,6 @@ function WorkspaceRow({
             aria-label="your turn"
           />
         )}
-        {workspace.branch}
       </div>
       {workspace.repo_links.length > 0 && (
         <ul className="workspace-repo-list">

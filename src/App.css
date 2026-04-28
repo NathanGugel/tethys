@@ -789,6 +789,7 @@ button.danger.primary:hover:not(:disabled) {
   box-shadow: 0 0 0 2px
     color-mix(in oklab, var(--turn-dot, #e2b23a) 25%, transparent);
   display: inline-block;
+  margin-left: auto;
 }
 
 .session-pane {
