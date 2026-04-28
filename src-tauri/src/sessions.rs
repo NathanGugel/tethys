@@ -349,13 +349,13 @@ impl SessionSupervisor {
         )
     }
 
-    /// Dispatch a hook event from `tethys-hook`. Currently handles
-    /// SessionStart (correlation), Stop (turn → Idle), and Notification
-    /// (turn → WaitingInput).
+    /// Dispatch a hook event from `tethys-hook`.
     pub async fn handle_hook_event(&self, msg: HookMessage) {
         match msg.event.as_str() {
             "session-start" => self.handle_session_start(msg).await,
-            "user-submit" | "pre-tool" => self.handle_resume_working(msg).await,
+            "user-submit" | "pre-tool" | "post-tool" => {
+                self.handle_resume_working(msg).await
+            }
             "stop" | "stop-failure" => self.handle_stop(msg).await,
             "notify" => self.handle_notify(msg).await,
             "permission-request" => self.handle_permission_request(msg).await,
@@ -364,9 +364,13 @@ impl SessionSupervisor {
         }
     }
 
-    /// UserPromptSubmit or PreToolUse → Claude is (re)starting work.
-    /// The latter covers the "user just answered a permission prompt"
-    /// case, where Claude proceeds with its tool call.
+    /// UserPromptSubmit / PreToolUse / PostToolUse → Claude is (re)starting
+    /// work. PostToolUse is what clears WaitingInput after a permission
+    /// prompt is accepted: Claude Code emits no hook at the moment of
+    /// acceptance, so we wait for the gated tool to finish and treat that
+    /// as the "prompt was answered" signal. Yellow lingers for the tool's
+    /// runtime — there's no way to do better without an optimistic clear
+    /// off the user's keystroke.
     async fn handle_resume_working(&self, msg: HookMessage) {
         self.set_turn_from_hook(&msg, SessionRuntimeState::Working, None)
             .await;

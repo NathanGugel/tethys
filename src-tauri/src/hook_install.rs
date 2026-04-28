@@ -12,6 +12,12 @@ const EVENTS: &[(&str, &str)] = &[
     ("SessionStart", "session-start"),
     ("UserPromptSubmit", "user-submit"),
     ("PreToolUse", "pre-tool"),
+    // Claude Code has no `PermissionResponse` hook — we have no way to
+    // observe the moment a user accepts/denies a permission prompt. Post
+    // is the next-best signal: when a (potentially permission-gated) tool
+    // finishes, we know the prompt was answered, so flip back to Working.
+    // This lags by however long the tool takes to run.
+    ("PostToolUse", "post-tool"),
     ("Stop", "stop"),
     // StopFailure fires when a turn dies to an API error — without this
     // the session would hang in Working forever.
