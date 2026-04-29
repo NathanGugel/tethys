@@ -337,7 +337,7 @@ pub async fn create_workspace(
 
             let stored = store
                 .mutate(|s| {
-                    s.workspaces.push(workspace.clone());
+                    s.workspaces.insert(0, workspace.clone());
                     Ok(workspace.clone())
                 })
                 .await?;

@@ -24,14 +24,20 @@ import { GithubChip } from "./GithubChip";
 
 type PendingCreate = { tempId: string; branch: string };
 
+type ActiveItem =
+  | { kind: "workspace"; id: string; workspace: Workspace }
+  | { kind: "pending"; id: string; pending: PendingCreate };
+
 type Props = {
   /** Workspaces that should appear in the sidebar (soft-deleted already filtered out). */
   workspaces: Workspace[];
   selectedId: WorkspaceId | null;
   pendingCreates: PendingCreate[];
+  /** Unified ordering of active items — workspace ids and pending tempIds mixed. */
+  displayOrder: string[];
   onSelect: (id: WorkspaceId) => void;
   onSelectPending: (tempId: string) => void;
-  onReorder: (ids: WorkspaceId[]) => void;
+  onReorder: (orderedIds: string[]) => void;
   onArchiveToggle: (ws: Workspace) => void;
   onDelete: (ws: Workspace) => void;
   onClearTurn: (ws: Workspace) => void;
@@ -42,6 +48,7 @@ export function Sidebar({
   workspaces,
   selectedId,
   pendingCreates,
+  displayOrder,
   onSelect,
   onSelectPending,
   onReorder,
@@ -50,18 +57,48 @@ export function Sidebar({
   onClearTurn,
   workspaceNeedsTurn,
 }: Props) {
-  const { active, archived } = useMemo(() => {
-    const active: Workspace[] = [];
+  const { activeItems, archived } = useMemo(() => {
+    const wsById = new Map(workspaces.map((w) => [w.id, w]));
+    const pendingById = new Map(pendingCreates.map((p) => [p.tempId, p]));
     const archived: Workspace[] = [];
     for (const w of workspaces) {
       if (w.archived_at) archived.push(w);
-      else active.push(w);
     }
     archived.sort((a, b) =>
       (b.archived_at ?? "").localeCompare(a.archived_at ?? ""),
     );
-    return { active, archived };
-  }, [workspaces]);
+
+    const seen = new Set<string>();
+    const activeItems: ActiveItem[] = [];
+    const pushWs = (w: Workspace) => {
+      if (w.archived_at) return;
+      activeItems.push({ kind: "workspace", id: w.id, workspace: w });
+    };
+    for (const id of displayOrder) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const ws = wsById.get(id);
+      if (ws) {
+        pushWs(ws);
+        continue;
+      }
+      const p = pendingById.get(id);
+      if (p) activeItems.push({ kind: "pending", id: p.tempId, pending: p });
+    }
+    // Anything not yet in displayOrder (transient — reconcile in App.tsx
+    // will catch up next render). Pendings prepend, workspaces append.
+    for (const p of pendingCreates) {
+      if (seen.has(p.tempId)) continue;
+      seen.add(p.tempId);
+      activeItems.unshift({ kind: "pending", id: p.tempId, pending: p });
+    }
+    for (const w of workspaces) {
+      if (seen.has(w.id) || w.archived_at) continue;
+      seen.add(w.id);
+      pushWs(w);
+    }
+    return { activeItems, archived };
+  }, [workspaces, pendingCreates, displayOrder]);
 
   const [archivedExpanded, setArchivedExpanded] = useState(false);
   const [menu, setMenu] = useState<{
@@ -82,53 +119,49 @@ export function Sidebar({
   const handleDragEnd = (event: DragEndEvent) => {
     const { active: dragged, over } = event;
     if (!over || dragged.id === over.id) return;
-    const from = active.findIndex((w) => w.id === dragged.id);
-    const to = active.findIndex((w) => w.id === over.id);
+    const ids = activeItems.map((i) => i.id);
+    const from = ids.indexOf(String(dragged.id));
+    const to = ids.indexOf(String(over.id));
     if (from < 0 || to < 0) return;
-    const next = arrayMove(active, from, to);
-    onReorder(next.map((w) => w.id));
+    onReorder(arrayMove(ids, from, to));
   };
 
   return (
     <>
       <ul className="workspace-list">
-        {active.length === 0 &&
-          archived.length === 0 &&
-          pendingCreates.length === 0 && (
-            <li className="empty">No workspaces yet.</li>
-          )}
-        {pendingCreates.map((p) => (
-          <li
-            key={p.tempId}
-            className={`pending${p.tempId === selectedId ? " selected" : ""}`}
-            onClick={() => onSelectPending(p.tempId)}
-          >
-            <div className="workspace-name">
-              <Spinner />
-              {p.branch}
-            </div>
-            <div className="pending-label">creating…</div>
-          </li>
-        ))}
+        {activeItems.length === 0 && archived.length === 0 && (
+          <li className="empty">No workspaces yet.</li>
+        )}
         <DndContext
           sensors={sensors}
           collisionDetection={closestCenter}
           onDragEnd={handleDragEnd}
         >
           <SortableContext
-            items={active.map((w) => w.id)}
+            items={activeItems.map((i) => i.id)}
             strategy={verticalListSortingStrategy}
           >
-            {active.map((w) => (
-              <SortableWorkspaceRow
-                key={w.id}
-                workspace={w}
-                selected={w.id === selectedId}
-                needsTurn={workspaceNeedsTurn(w)}
-                onSelect={() => onSelect(w.id)}
-                onContextMenu={(x, y) => setMenu({ ws: w, x, y })}
-              />
-            ))}
+            {activeItems.map((item) =>
+              item.kind === "workspace" ? (
+                <SortableWorkspaceRow
+                  key={item.id}
+                  workspace={item.workspace}
+                  selected={item.id === selectedId}
+                  needsTurn={workspaceNeedsTurn(item.workspace)}
+                  onSelect={() => onSelect(item.workspace.id)}
+                  onContextMenu={(x, y) =>
+                    setMenu({ ws: item.workspace, x, y })
+                  }
+                />
+              ) : (
+                <SortablePendingRow
+                  key={item.id}
+                  pending={item.pending}
+                  selected={item.id === selectedId}
+                  onSelect={() => onSelectPending(item.pending.tempId)}
+                />
+              ),
+            )}
           </SortableContext>
         </DndContext>
 
@@ -170,6 +203,46 @@ export function Sidebar({
         />
       )}
     </>
+  );
+}
+
+function SortablePendingRow({
+  pending,
+  selected,
+  onSelect,
+}: {
+  pending: PendingCreate;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id: pending.tempId });
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    zIndex: isDragging ? 10 : undefined,
+  };
+
+  const classes = ["pending", selected ? "selected" : "", isDragging ? "is-dragging" : ""]
+    .filter(Boolean)
+    .join(" ");
+
+  return (
+    <li
+      ref={setNodeRef}
+      style={style}
+      {...attributes}
+      {...listeners}
+      className={classes}
+      onClick={onSelect}
+    >
+      <div className="workspace-name">
+        <Spinner />
+        {pending.branch}
+      </div>
+      <div className="pending-label">creating…</div>
+    </li>
   );
 }
 

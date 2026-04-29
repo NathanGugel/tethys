@@ -40,6 +40,13 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [pendingCreates, setPendingCreates] = useState<PendingCreate[]>([]);
   /**
+   * Unified ordering of the active sidebar list — workspace ids and pending
+   * tempIds intermixed. Source of truth for sidebar render order; reconciled
+   * against `workspaces` and `pendingCreates`, and synced back to the
+   * backend (workspace-only sub-order) by an effect below.
+   */
+  const [displayOrder, setDisplayOrder] = useState<string[]>([]);
+  /**
    * Per-session turn state tracked by listening to `session:turn_changed`
    * globally. Used for the sidebar attention dot without needing to
    * fetch sessions for every workspace.
@@ -220,6 +227,53 @@ function App() {
     () => workspaces.filter((w) => !w.deleted_at),
     [workspaces],
   );
+  const activeWorkspaces = useMemo(
+    () => visibleWorkspaces.filter((w) => !w.archived_at),
+    [visibleWorkspaces],
+  );
+
+  useEffect(() => {
+    setDisplayOrder((prev) => {
+      const wsIdSet = new Set(activeWorkspaces.map((w) => w.id));
+      const pendingIdSet = new Set(pendingCreates.map((p) => p.tempId));
+      const filtered = prev.filter(
+        (id) => wsIdSet.has(id) || pendingIdSet.has(id),
+      );
+      const filteredSet = new Set(filtered);
+      const addedPendings = pendingCreates
+        .filter((p) => !filteredSet.has(p.tempId))
+        .map((p) => p.tempId);
+      const addedWorkspaces = activeWorkspaces
+        .filter((w) => !filteredSet.has(w.id))
+        .map((w) => w.id);
+      if (
+        addedPendings.length === 0 &&
+        addedWorkspaces.length === 0 &&
+        filtered.length === prev.length
+      ) {
+        return prev;
+      }
+      // New pendings prepend (matches the prior "spinner appears at top"
+      // UX). New workspaces append — covers initial load and the rare case
+      // of a workspace appearing without going through a local pending.
+      return [...addedPendings, ...filtered, ...addedWorkspaces];
+    });
+  }, [activeWorkspaces, pendingCreates]);
+
+  // Persist the workspace-only sub-order of `displayOrder` whenever it
+  // diverges from the backend's order. Drives the post-create reorder that
+  // keeps a freshly-created workspace at the position the pending occupied.
+  useEffect(() => {
+    if (activeWorkspaces.length === 0) return;
+    const wsIdSet = new Set(activeWorkspaces.map((w) => w.id));
+    const wsOrder = displayOrder.filter((id) => wsIdSet.has(id));
+    if (wsOrder.length !== activeWorkspaces.length) return;
+    const backendOrder = activeWorkspaces.map((w) => w.id);
+    if (wsOrder.every((id, i) => id === backendOrder[i])) return;
+    invoke("reorder_workspaces", { ids: wsOrder }).catch((e) =>
+      setError(`reorder failed: ${String(e)}`),
+    );
+  }, [activeWorkspaces, displayOrder]);
   const selected = useMemo(() => {
     const ws = workspaces.find((w) => w.id === selectedId);
     if (!ws) return null;
@@ -233,6 +287,14 @@ function App() {
   const handleCreateSuccess = useCallback(
     async (tempId: string, result: unknown) => {
       const ws = result as Workspace;
+      // Slot the new workspace into the position the pending occupied so
+      // the row stays where the user left it. Removing the pending tempId
+      // and replacing with ws.id in the same setDisplayOrder pass keeps
+      // the reconcile effect from re-prepending ws.id once refresh runs.
+      setDisplayOrder((prev) =>
+        prev.map((id) => (id === tempId ? ws.id : id)),
+      );
+      setPendingCreates((prev) => prev.filter((p) => p.tempId !== tempId));
       await refresh();
       // Auto-start a Claude session: in the only repo when the workspace
       // has just one, otherwise at the workspace root.
@@ -245,7 +307,6 @@ function App() {
       } catch (e) {
         setError(`auto-start claude failed: ${String(e)}`);
       }
-      setPendingCreates((prev) => prev.filter((p) => p.tempId !== tempId));
       // If the user was viewing this pending pane, drop selection rather
       // than yanking them onto the newly-created workspace.
       setSelectedId((cur) => (cur === tempId ? null : cur));
@@ -281,30 +342,12 @@ function App() {
     }
   }, []);
 
-  const handleReorder = useCallback(async (ids: WorkspaceId[]) => {
-    // Optimistically reorder so the drop animation lands on the right row,
-    // then fire the backend command. The `workspace:reordered` event would
-    // also drive a refresh, but doing this here avoids the visible flicker
-    // from the round-trip.
-    setWorkspaces((prev) => {
-      const byId = new Map(prev.map((w) => [w.id, w]));
-      const moved: Workspace[] = [];
-      const rest: Workspace[] = [];
-      for (const id of ids) {
-        const w = byId.get(id);
-        if (w) moved.push(w);
-      }
-      const idsSet = new Set(ids);
-      for (const w of prev) if (!idsSet.has(w.id)) rest.push(w);
-      return [...moved, ...rest];
-    });
-    try {
-      await invoke("reorder_workspaces", { ids });
-    } catch (e) {
-      setError(`reorder failed: ${String(e)}`);
-      refresh();
-    }
-  }, [refresh]);
+  // Receives the unified order (workspace ids and pending tempIds mixed)
+  // from the sidebar drag handler. Persistence happens via the displayOrder
+  // sync effect — this just commits the new order to React state.
+  const handleReorder = useCallback((newOrder: string[]) => {
+    setDisplayOrder(newOrder);
+  }, []);
 
   const registryOk = registry?.kind === "ok";
   const showingPendingId = useMemo(
@@ -335,6 +378,7 @@ function App() {
             tempId: p.tempId,
             branch: p.branch,
           }))}
+          displayOrder={displayOrder}
           onSelect={setSelectedId}
           onSelectPending={(tempId) => setSelectedId(tempId)}
           onReorder={handleReorder}
