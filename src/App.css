@@ -848,6 +848,8 @@ button.danger.primary:hover:not(:disabled) {
   font-size: 13px;
   display: flex;
   align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .session-chip-bar {

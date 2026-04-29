@@ -878,7 +878,29 @@ function WorkspaceDetail({
             <>
               {!selectedLive.running && (
                 <div className="session-exit-banner">
-                  Claude exited. Scrollback preserved below.
+                  <span>Claude exited. Scrollback preserved below.</span>
+                  {selected.claude_session_id ? (
+                    <button
+                      type="button"
+                      className="primary"
+                      onClick={() =>
+                        resumeMeta(selected.id, selected.repo_key)
+                      }
+                      disabled={busy}
+                    >
+                      {busy ? (
+                        <>
+                          <Spinner /> Reconnecting…
+                        </>
+                      ) : (
+                        "Reconnect"
+                      )}
+                    </button>
+                  ) : (
+                    <span className="muted">
+                      No claude_session_id — can't reconnect.
+                    </span>
+                  )}
                 </div>
               )}
               <SessionTerminal sessionId={selectedLive.id} />
