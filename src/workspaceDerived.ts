@@ -12,10 +12,10 @@ export function isStale(fetchedAt: string, nowMs: number = Date.now()): boolean 
 /**
  * True when every GitHub-linked repo in the workspace has a merged PR.
  * Non-GitHub repos (no `github` field) are ignored — they don't block
- * archiving. A workspace with no GitHub-linked repos at all returns false
- * so we don't suggest archiving an unsynced workspace.
+ * deletion. A workspace with no GitHub-linked repos at all returns false
+ * so we don't suggest deleting an unsynced workspace.
  */
-export function isReadyToArchive(ws: Workspace): boolean {
+export function isReadyToDelete(ws: Workspace): boolean {
   const linked = ws.repo_links.filter((r) => r.github !== null);
   if (linked.length === 0) return false;
   return linked.every((r) => r.github!.state === "merged");

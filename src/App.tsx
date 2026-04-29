@@ -22,7 +22,7 @@ import { SystemStatus } from "./SystemStatus";
 import { applyTheme, ThemeContext } from "./theme";
 import { useBackendJob, type JobDescriptor } from "./useBackendJob";
 import { useTauriEvent } from "./useTauriEvent";
-import { isReadyToArchive } from "./workspaceDerived";
+import { isReadyToDelete } from "./workspaceDerived";
 import "./App.css";
 
 type PendingCreate = {
@@ -826,10 +826,10 @@ function WorkspaceDetail({
           </button>
         </div>
       </header>
-      {!workspace.archived_at && isReadyToArchive(workspace) && (
+      {!workspace.archived_at && isReadyToDelete(workspace) && (
         <div className="archive-banner">
           <div>
-            <strong>Ready to archive.</strong>{" "}
+            <strong>Ready to delete.</strong>{" "}
             <span className="muted">
               Every linked PR for <code>{workspace.branch}</code> is merged.
             </span>
@@ -837,9 +837,9 @@ function WorkspaceDetail({
           <button
             type="button"
             className="primary"
-            onClick={onRequestArchive}
+            onClick={onRequestDelete}
           >
-            Archive workspace
+            Delete workspace
           </button>
         </div>
       )}
