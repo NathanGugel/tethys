@@ -238,6 +238,7 @@ pub fn run() {
             commands::send_input,
             commands::resize_session,
             commands::get_theme,
+            commands::read_clipboard_file_paths,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

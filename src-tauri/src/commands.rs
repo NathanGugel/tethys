@@ -1065,6 +1065,40 @@ pub fn get_theme(paths: State<'_, Paths>) -> AppResult<Option<Theme>> {
     Theme::load_saved(&paths.theme_file())
 }
 
+/// Read file paths from the macOS general pasteboard. Used on Cmd+V when the
+/// browser-side `clipboardData` only carries opaque `File` objects (no
+/// `text/plain`, no `text/uri-list`) — WKWebView hides the real path. We need
+/// it so paste-of-a-file inserts the path text iTerm2-style instead of relying
+/// on WKWebView's hidden auto-insert (which always triggers Claude Code's
+/// `[Image #N]` flow regardless of the actual file type).
+#[tauri::command]
+pub fn read_clipboard_file_paths() -> AppResult<Vec<String>> {
+    const SCRIPT: &str = r#"ObjC.import('AppKit');
+const pb = $.NSPasteboard.generalPasteboard;
+const urls = pb.readObjectsForClassesOptions($.NSArray.arrayWithObject($.NSURL), $());
+const paths = [];
+if (!urls.isNil()) {
+    for (let i = 0; i < urls.count; i++) {
+        const u = urls.objectAtIndex(i);
+        if (u.isFileURL) paths.push(ObjC.unwrap(u.path));
+    }
+}
+JSON.stringify(paths);"#;
+
+    let output = std::process::Command::new("osascript")
+        .args(["-l", "JavaScript", "-e", SCRIPT])
+        .output()?;
+    if !output.status.success() {
+        return Err(AppError::Other(format!(
+            "osascript exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(serde_json::from_str(stdout.trim())?)
+}
+
 fn emit_workspace_changed(app: &AppHandle, workspace_id: &str) {
     let _ = app.emit(
         "workspace:changed",

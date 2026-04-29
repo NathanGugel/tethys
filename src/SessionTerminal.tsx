@@ -102,6 +102,43 @@ export function SessionTerminal({ sessionId }: Props) {
     fit.fit();
     term.focus();
 
+    // Cmd+V of a file from Finder/screenshot: WKWebView delivers only an
+    // opaque `File` (no `text/plain`, no `text/uri-list`) and then quietly
+    // auto-inserts the temp path into the helper textarea after the paste
+    // event. xterm wraps that text in bracketed-paste markers, which trips
+    // Claude Code's path-→-image flow indiscriminately — turning a pasted
+    // log path into `[Image #N]`.
+    //
+    // For image MIME we want that flow (it's the whole point of pasting a
+    // screenshot). For everything else we want iTerm2-style behavior: the
+    // path appears as plain typed text. Branch on file MIME, intercept the
+    // non-image case, read real paths from NSPasteboard via Rust, and inject
+    // raw bytes without bracketed-paste markers.
+    const helperTextarea = container.querySelector<HTMLTextAreaElement>(
+      ".xterm-helper-textarea",
+    );
+    const onPaste = (ev: ClipboardEvent) => {
+      const cd = ev.clipboardData;
+      if (!cd || cd.files.length === 0) return;
+      const allImages = Array.from(cd.files).every((f) =>
+        f.type.startsWith("image/"),
+      );
+      if (allImages) return;
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      invoke<string[]>("read_clipboard_file_paths")
+        .then((paths) => {
+          if (paths.length === 0) return;
+          const text = paths.map(escapeDroppedPath).join(" ") + " ";
+          const bytes = Array.from(new TextEncoder().encode(text));
+          return invoke("send_input", { sessionId, data: bytes });
+        })
+        .catch((e) => {
+          console.error("file paste failed:", e);
+        });
+    };
+    helperTextarea?.addEventListener("paste", onPaste, true);
+
     // macOS-friendly keybindings over and above xterm's defaults.
     // Returning false suppresses xterm's default dispatch for that key;
     // we send our own byte sequence via send_input.
@@ -242,6 +279,7 @@ export function SessionTerminal({ sessionId }: Props) {
       try {
         dragUnlisten?.();
       } catch {}
+      helperTextarea?.removeEventListener("paste", onPaste, true);
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
