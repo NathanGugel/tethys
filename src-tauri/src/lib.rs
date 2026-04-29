@@ -143,6 +143,8 @@ pub fn run() {
                 prewarm_live_sessions(&supervisor, path, &store);
             }
 
+            regen_workspace_root_settings_at_boot(&store, &paths);
+
             let socket_path = paths.hook_socket();
             let sup_for_listener = supervisor.clone();
             tauri::async_runtime::spawn(async move {
@@ -290,6 +292,54 @@ fn prewarm_live_sessions(
             Ok(_) => info!(%session_id, "pre-warmed live tmux session"),
             Err(e) => warn!(%session_id, error = %e, "pre-warm reattach failed"),
         }
+    }
+}
+
+/// Regenerate `<workspace_root>/.claude/settings.local.json` for every
+/// active workspace so external edits to per-repo `settings.local.json`
+/// (made while Tethys was offline) propagate to the root file. Soft-deleted
+/// workspaces are skipped — their worktree dirs may already be torn down.
+fn regen_workspace_root_settings_at_boot(store: &Arc<Store>, paths: &Paths) {
+    let snapshots: Vec<(String, std::path::PathBuf, Vec<String>)> =
+        tauri::async_runtime::block_on(async {
+            store
+                .read(|s| {
+                    s.workspaces
+                        .iter()
+                        .filter(|w| w.deleted_at.is_none())
+                        .filter_map(|w| {
+                            let root = w
+                                .repo_links
+                                .first()?
+                                .worktree_path
+                                .parent()?
+                                .to_path_buf();
+                            let keys =
+                                w.repo_links.iter().map(|r| r.repo_key.clone()).collect();
+                            Some((w.id.clone(), root, keys))
+                        })
+                        .collect()
+                })
+                .await
+        });
+
+    for (workspace_id, workspace_root, repo_keys) in snapshots {
+        let paths = paths.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = claude_local::write_workspace_root_settings(
+                &workspace_root,
+                &repo_keys,
+                &paths,
+            )
+            .await
+            {
+                warn!(
+                    workspace = %workspace_id,
+                    error = %e,
+                    "boot regen of workspace-root settings.local.json failed"
+                );
+            }
+        });
     }
 }
 

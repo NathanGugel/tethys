@@ -342,6 +342,8 @@ pub async fn create_workspace(
                 })
                 .await?;
 
+            regen_workspace_root_settings(&stored, &paths, &tx).await;
+
             info!(id = %stored.id, branch = %stored.branch, repos = stored.repo_links.len(), "created workspace");
             let _ = tx.0.send(JobEvent::Success);
             emit_workspace_changed(&app, &stored.id);
@@ -476,6 +478,8 @@ pub async fn add_repo_to_workspace(
                     Ok(ws.clone())
                 })
                 .await?;
+
+            regen_workspace_root_settings(&updated, &paths, &tx).await;
 
             info!(
                 id = %args.workspace_id,
@@ -1097,6 +1101,37 @@ JSON.stringify(paths);"#;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     Ok(serde_json::from_str(stdout.trim())?)
+}
+
+/// Regenerate `<workspace_root>/.claude/settings.local.json` from the
+/// current set of repo links. Best-effort: failures are surfaced as a
+/// status event but never fail the parent command.
+async fn regen_workspace_root_settings(workspace: &Workspace, paths: &Paths, tx: &JobTx) {
+    let Some(workspace_root) = workspace
+        .repo_links
+        .first()
+        .and_then(|r| r.worktree_path.parent().map(|p| p.to_path_buf()))
+    else {
+        return;
+    };
+    let repo_keys: Vec<String> = workspace
+        .repo_links
+        .iter()
+        .map(|r| r.repo_key.clone())
+        .collect();
+    if let Err(e) =
+        claude_local::write_workspace_root_settings(&workspace_root, &repo_keys, paths).await
+    {
+        warn!(
+            workspace = %workspace.id,
+            error = %e,
+            "failed to regenerate workspace-root settings.local.json"
+        );
+        tx.status(
+            format!("workspace-root settings regen failed: {e}"),
+            None,
+        );
+    }
 }
 
 fn emit_workspace_changed(app: &AppHandle, workspace_id: &str) {
