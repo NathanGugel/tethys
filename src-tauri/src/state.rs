@@ -87,6 +87,16 @@ pub struct ClaudeSessionMeta {
     /// live — hide is purely cosmetic.
     #[serde(default)]
     pub hidden: bool,
+    /// Last turn state observed via Claude Code hooks. Persisted so the
+    /// "your turn" indicator survives Tethys restarts. `None` until the
+    /// first hook lands (or for state.json from before this field existed).
+    #[serde(default)]
+    pub runtime_state: Option<SessionRuntimeState>,
+    /// Notification subtype that accompanied the last `WaitingInput`
+    /// transition (e.g. `permission_prompt`). Cleared when the session
+    /// leaves `WaitingInput`.
+    #[serde(default)]
+    pub notification_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -149,6 +159,34 @@ mod tests {
         assert!(ws.deleted_at.is_none());
         assert!(ws.archived_at.is_none());
         assert!(parsed.system_errors.is_empty());
+    }
+
+    #[test]
+    fn pre_turn_state_session_round_trips() {
+        // ClaudeSessionMeta from before runtime_state/notification_type were
+        // added must still deserialize.
+        let raw = r#"{
+            "workspaces": [
+                {
+                    "id": "abc-123",
+                    "branch": "feat/foo",
+                    "created_at": "2026-04-01T12:00:00Z",
+                    "repo_links": [],
+                    "sessions": [
+                        {
+                            "id": "sess-1",
+                            "cwd": "/tmp/wt/abc-123/frontend",
+                            "claude_session_id": null,
+                            "transcript_path": null
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let parsed: AppState = serde_json::from_str(raw).expect("must deserialize");
+        let session = &parsed.workspaces[0].sessions[0];
+        assert!(session.runtime_state.is_none());
+        assert!(session.notification_type.is_none());
     }
 
     #[test]

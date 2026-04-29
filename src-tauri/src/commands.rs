@@ -963,6 +963,8 @@ async fn spawn_claude(
         claude_session_id: None,
         transcript_path: None,
         hidden: false,
+        runtime_state: None,
+        notification_type: None,
     };
 
     store

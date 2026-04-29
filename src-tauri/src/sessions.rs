@@ -106,10 +106,31 @@ impl SessionSupervisor {
         }
     }
 
-    /// Update a session's turn state + emit `session:turn_changed`.
-    /// No-op if the new state matches the current one (other than forcing
-    /// a notification_type refresh).
-    fn set_turn(
+    /// Seed the in-memory turn map from a persisted snapshot. Used at
+    /// boot, immediately after `reattach_tmux` clobbers the entry with
+    /// `Working`. Does not persist (the value came from disk) and does
+    /// not emit — the frontend hasn't subscribed yet, and `list_sessions`
+    /// will pick the value up from `list_for_workspace`.
+    pub fn seed_turn(
+        &self,
+        session_id: &str,
+        state: SessionRuntimeState,
+        notification_type: Option<String>,
+    ) {
+        let mut map = self.turn.lock().unwrap();
+        map.insert(
+            session_id.to_string(),
+            TurnState {
+                state,
+                notification_type,
+            },
+        );
+    }
+
+    /// Update a session's turn state + emit `session:turn_changed` + write
+    /// the new state through to `state.json` so the indicator survives a
+    /// Tethys restart. No-op if the new state matches the current one.
+    async fn set_turn(
         &self,
         session_id: &str,
         workspace_id: &str,
@@ -139,6 +160,21 @@ impl SessionSupervisor {
                 "notification_type": notification_type,
             }),
         );
+        let persist = self
+            .store
+            .mutate(|s| {
+                if let Some(ws) = s.find_workspace_mut(workspace_id) {
+                    if let Some(meta) = ws.sessions.iter_mut().find(|m| m.id == session_id) {
+                        meta.runtime_state = Some(state);
+                        meta.notification_type = notification_type.clone();
+                    }
+                }
+                Ok(())
+            })
+            .await;
+        if let Err(e) = persist {
+            warn!(error = %e, session_id, "persist turn state failed");
+        }
     }
 
     /// Inner spawn: opens a PTY, runs `program args`, wires up reader/
@@ -487,7 +523,7 @@ impl SessionSupervisor {
             );
             return;
         };
-        self.set_turn(&sess_id, &ws_id, state, notification_type);
+        self.set_turn(&sess_id, &ws_id, state, notification_type).await;
     }
 
     async fn handle_session_start(&self, msg: HookMessage) {

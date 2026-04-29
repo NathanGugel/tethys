@@ -258,39 +258,57 @@ fn prewarm_live_sessions(
     tmux_bin: &std::path::Path,
     store: &Arc<Store>,
 ) {
-    let candidates: Vec<(String, String, Option<String>, std::path::PathBuf)> =
-        tauri::async_runtime::block_on(async {
-            store
-                .read(|s| {
-                    let mut out = Vec::new();
-                    for ws in &s.workspaces {
-                        for meta in &ws.sessions {
-                            out.push((
-                                meta.id.clone(),
-                                ws.id.clone(),
-                                meta.repo_key.clone(),
-                                meta.cwd.clone(),
-                            ));
-                        }
-                    }
-                    out
-                })
-                .await
-        });
+    struct PrewarmCandidate {
+        session_id: String,
+        workspace_id: String,
+        repo_key: Option<String>,
+        cwd: std::path::PathBuf,
+        runtime_state: Option<crate::state::SessionRuntimeState>,
+        notification_type: Option<String>,
+    }
 
-    for (session_id, workspace_id, repo_key, cwd) in candidates {
-        if !tmux::has_session(tmux_bin, &session_id) {
+    let candidates: Vec<PrewarmCandidate> = tauri::async_runtime::block_on(async {
+        store
+            .read(|s| {
+                let mut out = Vec::new();
+                for ws in &s.workspaces {
+                    for meta in &ws.sessions {
+                        out.push(PrewarmCandidate {
+                            session_id: meta.id.clone(),
+                            workspace_id: ws.id.clone(),
+                            repo_key: meta.repo_key.clone(),
+                            cwd: meta.cwd.clone(),
+                            runtime_state: meta.runtime_state,
+                            notification_type: meta.notification_type.clone(),
+                        });
+                    }
+                }
+                out
+            })
+            .await
+    });
+
+    for c in candidates {
+        if !tmux::has_session(tmux_bin, &c.session_id) {
             continue;
         }
         match supervisor.reattach_tmux(
-            session_id.clone(),
-            workspace_id,
-            repo_key,
-            &cwd,
+            c.session_id.clone(),
+            c.workspace_id,
+            c.repo_key,
+            &c.cwd,
             tmux_bin,
         ) {
-            Ok(_) => info!(%session_id, "pre-warmed live tmux session"),
-            Err(e) => warn!(%session_id, error = %e, "pre-warm reattach failed"),
+            Ok(_) => {
+                info!(session_id = %c.session_id, "pre-warmed live tmux session");
+                // Restore the last persisted turn state so the dot survives
+                // restarts. `reattach_tmux` defaults the entry to Working;
+                // override it here. If nothing was persisted, leave Working.
+                if let Some(state) = c.runtime_state {
+                    supervisor.seed_turn(&c.session_id, state, c.notification_type);
+                }
+            }
+            Err(e) => warn!(session_id = %c.session_id, error = %e, "pre-warm reattach failed"),
         }
     }
 }
