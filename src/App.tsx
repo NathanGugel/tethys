@@ -38,7 +38,7 @@ function App() {
   const [selectedId, setSelectedId] = useState<WorkspaceId | null>(null);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [pendingCreate, setPendingCreate] = useState<PendingCreate | null>(null);
+  const [pendingCreates, setPendingCreates] = useState<PendingCreate[]>([]);
   /**
    * Per-session turn state tracked by listening to `session:turn_changed`
    * globally. Used for the sidebar attention dot without needing to
@@ -47,6 +47,13 @@ function App() {
   const [turnStates, setTurnStates] = useState<
     Map<string, { workspaceId: string; state: SessionRuntimeState }>
   >(new Map());
+  /**
+   * Session IDs whose attention state the user dismissed via the sidebar
+   * right-click "Clear notification". Any subsequent `turn_changed` event
+   * for the session re-enables the dot — this is a one-shot mute, not a
+   * persistent pause.
+   */
+  const [clearedTurns, setClearedTurns] = useState<Set<string>>(new Set());
   /**
    * Sessions for every workspace, cached so switching into a workspace
    * shows the terminal immediately instead of flashing "Dormant" during
@@ -88,6 +95,15 @@ function App() {
       }
       return next;
     });
+    // Any new event for this session lifts a prior "Clear notification" —
+    // a state change is the user-facing signal that something fresh
+    // happened.
+    setClearedTurns((prev) => {
+      if (!prev.has(session_id)) return prev;
+      const next = new Set(prev);
+      next.delete(session_id);
+      return next;
+    });
     // Keep the cached SessionInfo[] in sync so WorkspaceDetail sees the
     // new runtime_state without a full re-fetch.
     setSessionsByWorkspace((prev) => {
@@ -127,13 +143,29 @@ function App() {
 
   const workspaceNeedsTurn = useCallback(
     (w: Workspace): boolean => {
-      if (w.paused) return false;
       if (w.archived_at) return false;
-      for (const info of turnStates.values()) {
+      for (const [sessionId, info] of turnStates) {
         if (info.workspaceId !== w.id) continue;
-        if (info.state === "idle" || info.state === "waiting_input") return true;
+        if (info.state !== "idle" && info.state !== "waiting_input") continue;
+        if (clearedTurns.has(sessionId)) continue;
+        return true;
       }
       return false;
+    },
+    [turnStates, clearedTurns],
+  );
+
+  const handleClearTurn = useCallback(
+    (workspace: Workspace) => {
+      setClearedTurns((prev) => {
+        const next = new Set(prev);
+        for (const [sessionId, info] of turnStates) {
+          if (info.workspaceId !== workspace.id) continue;
+          if (info.state !== "idle" && info.state !== "waiting_input") continue;
+          next.add(sessionId);
+        }
+        return next;
+      });
     },
     [turnStates],
   );
@@ -198,41 +230,33 @@ function App() {
     return ws;
   }, [workspaces, selectedId]);
 
-  const createDescriptor = useMemo<JobDescriptor | null>(
-    () =>
-      pendingCreate
-        ? {
-            key: pendingCreate.tempId,
-            command: "create_workspace",
-            args: { args: pendingCreate.args },
-          }
-        : null,
-    [pendingCreate],
-  );
-  const { events: createEvents, state: createState } = useBackendJob(
-    createDescriptor,
-    {
-      onSuccess: async (_key, result) => {
-        const ws = result as Workspace;
-        // Refresh before swapping selection so WorkspaceDetail has the
-        // workspace available when the pending pane unmounts.
-        await refresh();
-        setSelectedId(ws.id);
-        setPendingCreate(null);
-        // Auto-start a Claude session: in the only repo when the workspace
-        // has just one, otherwise at the workspace root.
-        const repoKey =
-          ws.repo_links.length === 1 ? ws.repo_links[0].repo_key : null;
-        try {
-          await invoke<SessionInfo>("start_claude_session", {
-            args: { workspace_id: ws.id, repo_key: repoKey },
-          });
-        } catch (e) {
-          setError(`auto-start claude failed: ${String(e)}`);
-        }
-      },
+  const handleCreateSuccess = useCallback(
+    async (tempId: string, result: unknown) => {
+      const ws = result as Workspace;
+      await refresh();
+      // Auto-start a Claude session: in the only repo when the workspace
+      // has just one, otherwise at the workspace root.
+      const repoKey =
+        ws.repo_links.length === 1 ? ws.repo_links[0].repo_key : null;
+      try {
+        await invoke<SessionInfo>("start_claude_session", {
+          args: { workspace_id: ws.id, repo_key: repoKey },
+        });
+      } catch (e) {
+        setError(`auto-start claude failed: ${String(e)}`);
+      }
+      setPendingCreates((prev) => prev.filter((p) => p.tempId !== tempId));
+      // If the user was viewing this pending pane, drop selection rather
+      // than yanking them onto the newly-created workspace.
+      setSelectedId((cur) => (cur === tempId ? null : cur));
     },
+    [refresh],
   );
+
+  const handleCreateDismiss = useCallback((tempId: string) => {
+    setPendingCreates((prev) => prev.filter((p) => p.tempId !== tempId));
+    setSelectedId((cur) => (cur === tempId ? null : cur));
+  }, []);
 
   const handleDelete = useCallback(
     async (workspace: Workspace) => {
@@ -254,17 +278,6 @@ function App() {
       );
     } catch (e) {
       setError(`archive failed: ${String(e)}`);
-    }
-  }, []);
-
-  const handlePauseToggle = useCallback(async (workspace: Workspace) => {
-    try {
-      await invoke(
-        workspace.paused ? "resume_workspace" : "pause_workspace",
-        { id: workspace.id },
-      );
-    } catch (e) {
-      setError(`pause toggle failed: ${String(e)}`);
     }
   }, []);
 
@@ -294,6 +307,11 @@ function App() {
   }, [refresh]);
 
   const registryOk = registry?.kind === "ok";
+  const showingPendingId = useMemo(
+    () =>
+      pendingCreates.find((p) => p.tempId === selectedId)?.tempId ?? null,
+    [pendingCreates, selectedId],
+  );
 
   return (
     <ThemeContext.Provider value={theme}>
@@ -304,14 +322,8 @@ function App() {
             className="primary"
             onClick={() => setCreating(true)}
             type="button"
-            disabled={!registryOk || pendingCreate !== null}
-            title={
-              !registryOk
-                ? "Configure repos.toml first"
-                : pendingCreate
-                  ? "Another workspace is being created"
-                  : undefined
-            }
+            disabled={!registryOk}
+            title={!registryOk ? "Configure repos.toml first" : undefined}
           >
             New workspace
           </button>
@@ -319,19 +331,16 @@ function App() {
         <Sidebar
           workspaces={visibleWorkspaces}
           selectedId={selectedId}
-          pendingCreate={
-            pendingCreate
-              ? { tempId: pendingCreate.tempId, branch: pendingCreate.branch }
-              : null
-          }
+          pendingCreates={pendingCreates.map((p) => ({
+            tempId: p.tempId,
+            branch: p.branch,
+          }))}
           onSelect={setSelectedId}
-          onSelectPending={() =>
-            pendingCreate && setSelectedId(pendingCreate.tempId)
-          }
+          onSelectPending={(tempId) => setSelectedId(tempId)}
           onReorder={handleReorder}
-          onPauseToggle={handlePauseToggle}
           onArchiveToggle={handleArchiveToggle}
           onDelete={handleDelete}
+          onClearTurn={handleClearTurn}
           workspaceNeedsTurn={workspaceNeedsTurn}
         />
         <div className="sidebar-footer">
@@ -353,29 +362,41 @@ function App() {
               onChanged={refresh}
             />
           )}
-        {pendingCreate && selectedId === pendingCreate.tempId ? (
-          <JobLogPane
-            title={`Creating ${pendingCreate.branch}`}
-            events={createEvents}
-            state={createState}
-            onDismiss={() => {
-              setPendingCreate(null);
-              setSelectedId(null);
-            }}
+        {/*
+          Mount one runner per pending create so each job stays alive
+          regardless of which pane is visible. The runner only renders its
+          JobLogPane when its tempId matches the current selection.
+        */}
+        {pendingCreates.map((p) => (
+          <PendingCreateRunner
+            key={p.tempId}
+            pending={p}
+            isShown={p.tempId === showingPendingId}
+            onSuccess={handleCreateSuccess}
+            onDismiss={() => handleCreateDismiss(p.tempId)}
           />
-        ) : selected ? (
+        ))}
+        {!showingPendingId && selected && (
           <WorkspaceDetail
             workspace={selected}
             sessions={sessionsByWorkspace.get(selected.id) ?? []}
+            availableRepos={
+              registry?.kind === "ok"
+                ? registry.registry.repos.filter(
+                    (r) =>
+                      !selected.repo_links.some((l) => l.repo_key === r.key),
+                  )
+                : []
+            }
             onRequestDelete={() => handleDelete(selected)}
             onRequestArchive={() => handleArchiveToggle(selected)}
+            onRepoAdded={refresh}
           />
-        ) : (
-          registryOk && (
-            <div className="placeholder">
-              Select a workspace, or create one to get started.
-            </div>
-          )
+        )}
+        {!showingPendingId && !selected && registryOk && (
+          <div className="placeholder">
+            Select a workspace, or create one to get started.
+          </div>
         )}
       </main>
 
@@ -385,14 +406,56 @@ function App() {
           onClose={() => setCreating(false)}
           onSubmit={(args) => {
             setCreating(false);
-            const tempId = `pending:${Date.now()}`;
-            setPendingCreate({ tempId, branch: args.branch, args });
+            const tempId = `pending:${crypto.randomUUID()}`;
+            setPendingCreates((prev) => [
+              ...prev,
+              { tempId, branch: args.branch, args },
+            ]);
             setSelectedId(tempId);
           }}
         />
       )}
     </div>
     </ThemeContext.Provider>
+  );
+}
+
+/**
+ * Drives one in-flight `create_workspace` job. Stays mounted for the full
+ * lifetime of the pending entry so the job keeps running while the user
+ * navigates around; renders the JobLogPane only when its tempId is the
+ * selected pane.
+ */
+function PendingCreateRunner({
+  pending,
+  isShown,
+  onSuccess,
+  onDismiss,
+}: {
+  pending: PendingCreate;
+  isShown: boolean;
+  onSuccess: (tempId: string, result: unknown) => void;
+  onDismiss: () => void;
+}) {
+  const descriptor = useMemo<JobDescriptor>(
+    () => ({
+      key: pending.tempId,
+      command: "create_workspace",
+      args: { args: pending.args },
+    }),
+    [pending.tempId, pending.args],
+  );
+  const { events, state } = useBackendJob(descriptor, {
+    onSuccess: (_key, result) => onSuccess(pending.tempId, result),
+  });
+  if (!isShown) return null;
+  return (
+    <JobLogPane
+      title={`Creating ${pending.branch}`}
+      events={events}
+      state={state}
+      onDismiss={onDismiss}
+    />
   );
 }
 
@@ -587,16 +650,21 @@ function DiscrepancyNotice({
 function WorkspaceDetail({
   workspace,
   sessions,
+  availableRepos,
   onRequestDelete,
   onRequestArchive,
+  onRepoAdded,
 }: {
   workspace: Workspace;
   sessions: SessionInfo[];
+  availableRepos: Repo[];
   onRequestDelete: () => void;
   onRequestArchive: () => void;
+  onRepoAdded: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
+  const [addingRepo, setAddingRepo] = useState(false);
   // Per-workspace selection. Derived on render (no effect), so switching
   // back to a workspace paints the remembered pick immediately.
   const [selectedByWorkspace, setSelectedByWorkspace] = useState<
@@ -616,17 +684,6 @@ function WorkspaceDetail({
   // retry loops if spawn fails, while still allowing a manual Resume
   // click to try again.
   const autoResumedRef = useRef<Set<string>>(new Set());
-
-  const togglePause = async () => {
-    setBusy(true);
-    try {
-      await invoke(workspace.paused ? "resume_workspace" : "pause_workspace", {
-        id: workspace.id,
-      });
-    } finally {
-      setBusy(false);
-    }
-  };
 
   const liveById = new Map(sessions.map((s) => [s.id, s]));
   // Newest first — the most recently started session is usually what you
@@ -730,6 +787,18 @@ function WorkspaceDetail({
           </button>
           <button
             type="button"
+            onClick={() => setAddingRepo(true)}
+            disabled={availableRepos.length === 0}
+            title={
+              availableRepos.length === 0
+                ? "Every repo in your registry is already in this workspace"
+                : "Add another repo's worktree to this workspace"
+            }
+          >
+            Add repo
+          </button>
+          <button
+            type="button"
             onClick={() =>
               invoke("open_in_vscode", { id: workspace.id }).catch((e) =>
                 setError(String(e)),
@@ -739,9 +808,6 @@ function WorkspaceDetail({
             title="Open every worktree in VS Code"
           >
             Open in VS Code
-          </button>
-          <button type="button" onClick={togglePause} disabled={busy}>
-            {workspace.paused ? "Resume" : "Pause"}
           </button>
           <button
             type="button"
@@ -781,6 +847,14 @@ function WorkspaceDetail({
         <WorkspaceInfoDialog
           workspace={workspace}
           onClose={() => setShowInfo(false)}
+        />
+      )}
+      {addingRepo && (
+        <AddRepoDialog
+          workspace={workspace}
+          availableRepos={availableRepos}
+          onClose={() => setAddingRepo(false)}
+          onSuccess={onRepoAdded}
         />
       )}
 
@@ -1105,6 +1179,109 @@ function WorkspaceInfoDialog({
             Close
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function AddRepoDialog({
+  workspace,
+  availableRepos,
+  onClose,
+  onSuccess,
+}: {
+  workspace: Workspace;
+  availableRepos: Repo[];
+  onClose: () => void;
+  onSuccess: () => void;
+}) {
+  const [picked, setPicked] = useState<string | null>(null);
+  // Setting `tempId` flips the dialog from picker → job-log mode and triggers
+  // useBackendJob (which only fires when `descriptor` is non-null).
+  const [tempId, setTempId] = useState<string | null>(null);
+
+  const descriptor = useMemo<JobDescriptor | null>(() => {
+    if (!tempId || !picked) return null;
+    return {
+      key: tempId,
+      command: "add_repo_to_workspace",
+      args: { args: { workspace_id: workspace.id, repo_key: picked } },
+    };
+  }, [tempId, picked, workspace.id]);
+
+  const { events, state } = useBackendJob(descriptor, {
+    onSuccess: () => onSuccess(),
+  });
+
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!picked) return;
+    setTempId(crypto.randomUUID());
+  };
+
+  const isRunning = tempId !== null && state === "running";
+
+  return (
+    <div
+      className="modal-backdrop"
+      onClick={isRunning ? undefined : onClose}
+    >
+      <div
+        className={`modal${tempId ? " add-repo-modal-running" : ""}`}
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+      >
+        {!tempId ? (
+          <form onSubmit={submit}>
+            <h3>
+              Add repo to <code>{workspace.branch}</code>
+            </h3>
+            {availableRepos.length === 0 ? (
+              <p className="muted">
+                Every repo in your registry is already in this workspace.
+              </p>
+            ) : (
+              <div className="repo-select">
+                <div className="repo-select-label">Repo</div>
+                <ul>
+                  {availableRepos.map((r) => (
+                    <li key={r.key}>
+                      <label className="repo-row">
+                        <input
+                          type="radio"
+                          name="add-repo-pick"
+                          checked={picked === r.key}
+                          onChange={() => setPicked(r.key)}
+                        />
+                        <span className="repo-display">{r.key}</span>
+                      </label>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            <div className="modal-actions">
+              <button type="button" onClick={onClose}>
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="primary"
+                disabled={!picked || availableRepos.length === 0}
+              >
+                Add
+              </button>
+            </div>
+          </form>
+        ) : (
+          <JobLogPane
+            title={`Adding ${picked} to ${workspace.branch}`}
+            events={events}
+            state={state}
+            onDismiss={onClose}
+          />
+        )}
       </div>
     </div>
   );

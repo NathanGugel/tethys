@@ -5,7 +5,7 @@ use serde::Deserialize;
 use tauri::{ipc::Channel, AppHandle, Emitter, State};
 use tracing::{info, warn};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tauri::ipc::InvokeResponseBody;
 
@@ -141,6 +141,104 @@ pub struct CreateWorkspaceArgs {
     pub claude_binary: Option<String>,
 }
 
+struct RepoProvision<'a> {
+    repo: &'a Repo,
+    worktree_path: &'a Path,
+    branch: &'a str,
+    paths: &'a Paths,
+    tx: &'a JobTx,
+}
+
+/// Clone (if needed) → pull → branch pre-check → worktree add → install
+/// `.claude/settings.local.json` symlink → run setup script. Returns the
+/// `RepoLink` to push into state. Caller is responsible for teardown on
+/// later failure (we don't know whether sibling repos still need to be
+/// provisioned after us).
+async fn provision_repo_worktree(ctx: RepoProvision<'_>) -> AppResult<RepoLink> {
+    let clone_path = ctx.paths.repo_clone_path(&ctx.repo.key);
+
+    git::ensure_clone(&clone_path, &ctx.repo.remote_url, ctx.tx, &ctx.repo.key).await?;
+    git::pull_clone_best_effort(&clone_path, ctx.tx, &ctx.repo.key).await;
+
+    // Pre-check: if the branch already exists, git worktree add will fail
+    // with a fatal. We bail here with a clearer message — and (for the
+    // multi-repo create flow) avoid partially-creating worktrees in other
+    // repos first.
+    if git::branch_exists(&clone_path, ctx.branch).await? {
+        return Err(AppError::Other(format!(
+            "branch '{}' already exists in {}. Pick a different branch name, \
+             or delete the stale branch first.",
+            ctx.branch, ctx.repo.key
+        )));
+    }
+
+    git::worktree_add(&clone_path, ctx.worktree_path, ctx.branch, ctx.tx, &ctx.repo.key)
+        .await?;
+
+    claude_local::install_symlink(
+        ctx.worktree_path,
+        &ctx.paths.repo_shared_claude_local(&ctx.repo.key),
+        ctx.tx,
+        &ctx.repo.key,
+    )
+    .await?;
+
+    let mut link = RepoLink {
+        repo_key: ctx.repo.key.clone(),
+        worktree_path: ctx.worktree_path.to_path_buf(),
+        setup_script_ran_at: None,
+        github: None,
+    };
+
+    if let Some(script) = ctx
+        .repo
+        .default_setup_script
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        setup::run_setup_script(
+            script,
+            ctx.worktree_path,
+            ctx.repo.setup_timeout_secs,
+            ctx.tx,
+            &ctx.repo.key,
+        )
+        .await?;
+        link.setup_script_ran_at = Some(Utc::now());
+    }
+
+    Ok(link)
+}
+
+struct RepoTeardown<'a> {
+    repo_key: &'a str,
+    worktree_path: &'a Path,
+    branch: &'a str,
+    paths: &'a Paths,
+    tx: &'a JobTx,
+}
+
+/// Best-effort reverse of `provision_repo_worktree`: force-remove the
+/// worktree, prune stale registrations, delete the branch we created.
+/// Errors are streamed as status events but never bubbled — teardown is
+/// always best-effort.
+async fn teardown_repo_worktree(ctx: RepoTeardown<'_>) {
+    if !ctx.worktree_path.exists() {
+        return;
+    }
+    let clone_path = ctx.paths.repo_clone_path(ctx.repo_key);
+    if let Err(cleanup_err) =
+        git::worktree_remove(&clone_path, ctx.worktree_path, true, ctx.tx, ctx.repo_key).await
+    {
+        ctx.tx.status(
+            format!("cleanup failed for {}: {cleanup_err}", ctx.repo_key),
+            Some(ctx.repo_key),
+        );
+    }
+    git::worktree_prune_best_effort(&clone_path, ctx.tx, ctx.repo_key).await;
+    git::branch_delete_best_effort(&clone_path, ctx.branch, ctx.tx, ctx.repo_key).await;
+}
+
 /// Orchestrates clone + worktree add + setup script for every selected repo,
 /// streaming progress to the frontend via `on_event`. On any failure, tears
 /// down every worktree it already created before returning the error.
@@ -210,52 +308,15 @@ pub async fn create_workspace(
     let orchestrate = async {
         let mut created: Vec<RepoLink> = Vec::new();
         for repo in &selected {
-            let clone_path = paths.repo_clone_path(&repo.key);
             let worktree_path = reg.plan_worktree_path(&workspace_dir, &repo.key);
-
-            git::ensure_clone(&clone_path, &repo.remote_url, &tx, &repo.key).await?;
-            git::pull_clone_best_effort(&clone_path, &tx, &repo.key).await;
-
-            // Pre-check: if the branch already exists, git worktree add will
-            // fail with a fatal. We bail here with a clearer message — and
-            // avoid partially-creating worktrees in other repos first.
-            if git::branch_exists(&clone_path, &branch).await? {
-                return Err(AppError::Other(format!(
-                    "branch '{branch}' already exists in {}. Pick a different \
-                     branch name, or delete the stale branch first.",
-                    repo.key
-                )));
-            }
-
-            git::worktree_add(&clone_path, &worktree_path, &branch, &tx, &repo.key).await?;
-
-            claude_local::install_symlink(
-                &worktree_path,
-                &paths.repo_shared_claude_local(&repo.key),
-                &tx,
-                &repo.key,
-            )
+            let link = provision_repo_worktree(RepoProvision {
+                repo,
+                worktree_path: &worktree_path,
+                branch: &branch,
+                paths: &paths,
+                tx: &tx,
+            })
             .await?;
-
-            let mut link = RepoLink {
-                repo_key: repo.key.clone(),
-                worktree_path: worktree_path.clone(),
-                setup_script_ran_at: None,
-                github: None,
-            };
-
-            if let Some(script) = repo.default_setup_script.as_ref().filter(|s| !s.trim().is_empty()) {
-                setup::run_setup_script(
-                    script,
-                    &worktree_path,
-                    repo.setup_timeout_secs,
-                    &tx,
-                    &repo.key,
-                )
-                .await?;
-                link.setup_script_ran_at = Some(Utc::now());
-            }
-
             created.push(link);
         }
         Ok::<_, AppError>(created)
@@ -266,7 +327,6 @@ pub async fn create_workspace(
             let workspace = Workspace {
                 id: id.clone(),
                 branch,
-                paused: false,
                 created_at: Utc::now(),
                 repo_links: created_links,
                 sessions: Vec::new(),
@@ -292,33 +352,20 @@ pub async fn create_workspace(
             warn!(error = %msg, "workspace create failed; rolling back worktrees");
             tx.status(format!("tearing down partial workspace: {msg}"), None);
 
-            // Best-effort teardown of anything we managed to create.
-            // For each repo where the worktree dir exists, we know both the
-            // worktree and the branch are ours to remove (the pre-check
-            // above guarantees we didn't inherit a pre-existing branch).
+            // Best-effort teardown of anything we managed to create. The
+            // branch pre-check inside provision_repo_worktree guarantees we
+            // didn't inherit any pre-existing branches, so deleting them
+            // here is safe.
             for repo in selected.iter().rev() {
-                let clone_path = paths.repo_clone_path(&repo.key);
                 let worktree_path = reg.plan_worktree_path(&workspace_dir, &repo.key);
-                if !worktree_path.exists() {
-                    continue;
-                }
-                if let Err(cleanup_err) = git::worktree_remove(
-                    &clone_path,
-                    &worktree_path,
-                    true, // force: we created it, we're tearing it down
-                    &tx,
-                    &repo.key,
-                )
-                .await
-                {
-                    tx.status(
-                        format!("cleanup failed for {}: {cleanup_err}", repo.key),
-                        Some(&repo.key),
-                    );
-                }
-                git::worktree_prune_best_effort(&clone_path, &tx, &repo.key).await;
-                git::branch_delete_best_effort(&clone_path, &branch, &tx, &repo.key)
-                    .await;
+                teardown_repo_worktree(RepoTeardown {
+                    repo_key: &repo.key,
+                    worktree_path: &worktree_path,
+                    branch: &branch,
+                    paths: &paths,
+                    tx: &tx,
+                })
+                .await;
             }
 
             // Remove the now-empty parent dir so the reconciler doesn't
@@ -330,6 +377,128 @@ pub async fn create_workspace(
                 }
             }
 
+            let _ = tx.0.send(JobEvent::Failed { error: msg });
+            Err(e)
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddRepoArgs {
+    pub workspace_id: WorkspaceId,
+    pub repo_key: String,
+}
+
+/// Add another repo's worktree to an existing workspace on the workspace's
+/// branch. Mirrors a single-repo iteration of `create_workspace`: clone +
+/// branch pre-check + worktree add + claude_local symlink + setup script,
+/// then push the new `RepoLink` into state on success. On failure, tears
+/// down only the worktree it created — leaves the rest of the workspace
+/// intact.
+#[tauri::command]
+pub async fn add_repo_to_workspace(
+    app: AppHandle,
+    store: State<'_, Arc<Store>>,
+    registry: State<'_, Arc<RegistryLoad>>,
+    paths: State<'_, Paths>,
+    args: AddRepoArgs,
+    on_event: Channel<JobEvent>,
+) -> AppResult<Workspace> {
+    let reg = registry.require()?;
+    let repo = reg
+        .find_repo(&args.repo_key)
+        .cloned()
+        .ok_or_else(|| AppError::Other(format!("unknown repo key: {}", args.repo_key)))?;
+
+    let (branch, already_present, is_deleted) = store
+        .read(|s| {
+            s.find_workspace(&args.workspace_id).map(|w| {
+                (
+                    w.branch.clone(),
+                    w.repo_links.iter().any(|r| r.repo_key == args.repo_key),
+                    w.deleted_at.is_some(),
+                )
+            })
+        })
+        .await
+        .ok_or_else(|| AppError::WorkspaceNotFound(args.workspace_id.clone()))?;
+
+    if is_deleted {
+        return Err(AppError::Other(
+            "workspace is soft-deleted; cancel deletion before adding repos".into(),
+        ));
+    }
+    if already_present {
+        return Err(AppError::Other(format!(
+            "repo '{}' is already in this workspace",
+            args.repo_key
+        )));
+    }
+
+    let workspace_dir = registry::sanitize_branch_for_dir(&branch);
+    let worktree_path = reg.plan_worktree_path(&workspace_dir, &repo.key);
+
+    if worktree_path.exists() {
+        return Err(AppError::Other(format!(
+            "a worktree directory already exists at {}. Remove it first or \
+             pick a different repo.",
+            worktree_path.display()
+        )));
+    }
+
+    let tx = spawn_event_forwarder(on_event);
+
+    let provision = provision_repo_worktree(RepoProvision {
+        repo: &repo,
+        worktree_path: &worktree_path,
+        branch: &branch,
+        paths: &paths,
+        tx: &tx,
+    })
+    .await;
+
+    match provision {
+        Ok(link) => {
+            let updated = store
+                .mutate(|s| {
+                    let ws = s
+                        .find_workspace_mut(&args.workspace_id)
+                        .ok_or_else(|| {
+                            AppError::WorkspaceNotFound(args.workspace_id.clone())
+                        })?;
+                    if ws.repo_links.iter().any(|r| r.repo_key == link.repo_key) {
+                        return Err(AppError::Other(format!(
+                            "repo '{}' is already in this workspace",
+                            link.repo_key
+                        )));
+                    }
+                    ws.repo_links.push(link.clone());
+                    Ok(ws.clone())
+                })
+                .await?;
+
+            info!(
+                id = %args.workspace_id,
+                repo = %args.repo_key,
+                branch = %branch,
+                "added repo to workspace"
+            );
+            let _ = tx.0.send(JobEvent::Success);
+            emit_workspace_changed(&app, &args.workspace_id);
+            Ok(updated)
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            warn!(error = %msg, "add_repo_to_workspace failed; rolling back worktree");
+            tx.status(format!("rolling back: {msg}"), None);
+            teardown_repo_worktree(RepoTeardown {
+                repo_key: &repo.key,
+                worktree_path: &worktree_path,
+                branch: &branch,
+                paths: &paths,
+                tx: &tx,
+            })
+            .await;
             let _ = tx.0.send(JobEvent::Failed { error: msg });
             Err(e)
         }
@@ -520,28 +689,6 @@ pub async fn dismiss_system_error(
 }
 
 #[tauri::command]
-pub async fn pause_workspace(
-    app: AppHandle,
-    store: State<'_, Arc<Store>>,
-    id: WorkspaceId,
-) -> AppResult<()> {
-    set_paused(&store, &id, true).await?;
-    emit_workspace_changed(&app, &id);
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn resume_workspace(
-    app: AppHandle,
-    store: State<'_, Arc<Store>>,
-    id: WorkspaceId,
-) -> AppResult<()> {
-    set_paused(&store, &id, false).await?;
-    emit_workspace_changed(&app, &id);
-    Ok(())
-}
-
-#[tauri::command]
 pub async fn list_discrepancies(
     store: State<'_, Arc<Store>>,
     registry: State<'_, Arc<RegistryLoad>>,
@@ -615,18 +762,6 @@ pub async fn forget_workspace(
     info!(%id, "forgot workspace (state-only removal)");
     emit_workspace_changed(&app, &id);
     Ok(())
-}
-
-async fn set_paused(store: &Arc<Store>, id: &str, paused: bool) -> AppResult<()> {
-    store
-        .mutate(|s| {
-            let ws = s
-                .find_workspace_mut(id)
-                .ok_or_else(|| AppError::WorkspaceNotFound(id.to_string()))?;
-            ws.paused = paused;
-            Ok(())
-        })
-        .await
 }
 
 #[tauri::command]

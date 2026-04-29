@@ -28,26 +28,26 @@ type Props = {
   /** Workspaces that should appear in the sidebar (soft-deleted already filtered out). */
   workspaces: Workspace[];
   selectedId: WorkspaceId | null;
-  pendingCreate: PendingCreate | null;
+  pendingCreates: PendingCreate[];
   onSelect: (id: WorkspaceId) => void;
-  onSelectPending: () => void;
+  onSelectPending: (tempId: string) => void;
   onReorder: (ids: WorkspaceId[]) => void;
-  onPauseToggle: (ws: Workspace) => void;
   onArchiveToggle: (ws: Workspace) => void;
   onDelete: (ws: Workspace) => void;
+  onClearTurn: (ws: Workspace) => void;
   workspaceNeedsTurn: (ws: Workspace) => boolean;
 };
 
 export function Sidebar({
   workspaces,
   selectedId,
-  pendingCreate,
+  pendingCreates,
   onSelect,
   onSelectPending,
   onReorder,
-  onPauseToggle,
   onArchiveToggle,
   onDelete,
+  onClearTurn,
   workspaceNeedsTurn,
 }: Props) {
   const { active, archived } = useMemo(() => {
@@ -92,24 +92,24 @@ export function Sidebar({
   return (
     <>
       <ul className="workspace-list">
-        {active.length === 0 && archived.length === 0 && !pendingCreate && (
-          <li className="empty">No workspaces yet.</li>
-        )}
-        {pendingCreate && (
+        {active.length === 0 &&
+          archived.length === 0 &&
+          pendingCreates.length === 0 && (
+            <li className="empty">No workspaces yet.</li>
+          )}
+        {pendingCreates.map((p) => (
           <li
-            key={pendingCreate.tempId}
-            className={`pending${
-              pendingCreate.tempId === selectedId ? " selected" : ""
-            }`}
-            onClick={onSelectPending}
+            key={p.tempId}
+            className={`pending${p.tempId === selectedId ? " selected" : ""}`}
+            onClick={() => onSelectPending(p.tempId)}
           >
             <div className="workspace-name">
               <Spinner />
-              {pendingCreate.branch}
+              {p.branch}
             </div>
             <div className="pending-label">creating…</div>
           </li>
-        )}
+        ))}
         <DndContext
           sensors={sensors}
           collisionDetection={closestCenter}
@@ -162,10 +162,11 @@ export function Sidebar({
           x={menu.x}
           y={menu.y}
           workspace={menu.ws}
+          hasTurn={workspaceNeedsTurn(menu.ws)}
           onClose={() => setMenu(null)}
-          onPauseToggle={onPauseToggle}
           onArchiveToggle={onArchiveToggle}
           onDelete={onDelete}
+          onClearTurn={onClearTurn}
         />
       )}
     </>
@@ -240,7 +241,6 @@ function WorkspaceRow({
 }) {
   const classes = [
     selected ? "selected" : "",
-    workspace.paused ? "is-paused" : "",
     isArchived ? "is-archived" : "",
     isDragging ? "is-dragging" : "",
   ]
@@ -292,18 +292,20 @@ function ContextMenu({
   x,
   y,
   workspace,
+  hasTurn,
   onClose,
-  onPauseToggle,
   onArchiveToggle,
   onDelete,
+  onClearTurn,
 }: {
   x: number;
   y: number;
   workspace: Workspace;
+  hasTurn: boolean;
   onClose: () => void;
-  onPauseToggle: (ws: Workspace) => void;
   onArchiveToggle: (ws: Workspace) => void;
   onDelete: (ws: Workspace) => void;
+  onClearTurn: (ws: Workspace) => void;
 }) {
   const ref = useRef<HTMLDivElement | null>(null);
 
@@ -342,13 +344,15 @@ function ContextMenu({
       style={{ left, top }}
       role="menu"
     >
-      <button
-        type="button"
-        role="menuitem"
-        onClick={wrap(() => onPauseToggle(workspace))}
-      >
-        {workspace.paused ? "Resume" : "Pause"}
-      </button>
+      {hasTurn && (
+        <button
+          type="button"
+          role="menuitem"
+          onClick={wrap(() => onClearTurn(workspace))}
+        >
+          Clear notification
+        </button>
+      )}
       <button
         type="button"
         role="menuitem"

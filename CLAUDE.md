@@ -17,3 +17,7 @@ pnpm tauri dev
 State lives at `~/Library/Application Support/app.tethys.dev/` (`state.json`, `logs/`, `repos.toml`, auto-generated `repos.schema.json`, `hook.sock`).
 
 Tethys writes its hook entries into `~/.claude/settings.json` on every boot (keyed by `description: "Tethys session monitor"`). They're idempotent — safe to leave across reinstalls.
+
+## Rust
+
+Use idiomatic rust. After a set of changes are finished, run clippy and clean up the issues it reports

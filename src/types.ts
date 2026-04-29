@@ -59,7 +59,6 @@ export interface ClaudeSessionMeta {
 export interface Workspace {
   id: WorkspaceId;
   branch: string;
-  paused: boolean;
   created_at: string;
   repo_links: RepoLink[];
   sessions: ClaudeSessionMeta[];

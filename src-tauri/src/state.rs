@@ -27,8 +27,6 @@ pub struct AppState {
 pub struct Workspace {
     pub id: WorkspaceId,
     pub branch: String,
-    #[serde(default)]
-    pub paused: bool,
     pub created_at: DateTime<Utc>,
     #[serde(default)]
     pub repo_links: Vec<RepoLink>,
