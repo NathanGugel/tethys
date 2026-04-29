@@ -4,6 +4,7 @@ use std::process::Command;
 use tracing::{info, warn};
 
 use crate::error::{AppError, AppResult};
+use crate::shell::extract_path;
 
 /// Socket label for the tmux server Tethys uses. Kept distinct from the
 /// user's personal tmux so their `~/.tmux.conf` isn't loaded, their
@@ -91,17 +92,12 @@ pub fn server_init_args() -> Vec<String> {
         // default wheel behavior in alt-buffer is "send arrow keys," not
         // scroll the main-buffer scrollback. Neutering alt-screen keeps
         // everything in the main buffer so wheel events scroll natively.
-        &[
-            "set-option", "-ga", "terminal-overrides",
-            ",*:smcup@:rmcup@",
-        ],
+        &["set-option", "-ga", "terminal-overrides", ",*:smcup@:rmcup@"],
     ];
-    let mut out = Vec::new();
-    for cmd in commands {
-        out.extend(cmd.iter().map(|s| s.to_string()));
-        out.push(";".into());
-    }
-    out
+    commands
+        .iter()
+        .flat_map(|cmd| cmd.iter().map(|s| s.to_string()).chain(std::iter::once(";".into())))
+        .collect()
 }
 
 /// Boot-time best-effort: apply server options if the server is already
@@ -179,26 +175,3 @@ pub fn kill_session(tmux_bin: &Path, session_id: &str) {
         .status();
 }
 
-fn extract_path(raw: &str) -> String {
-    let trimmed = match raw.rfind('\x07') {
-        Some(idx) => &raw[idx + 1..],
-        None => raw,
-    };
-    trimmed.trim().to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::extract_path;
-
-    #[test]
-    fn plain_output() {
-        assert_eq!(extract_path("/opt/homebrew/bin/tmux\n"), "/opt/homebrew/bin/tmux");
-    }
-
-    #[test]
-    fn iterm_osc_prefix() {
-        let raw = "\x1b]1337;RemoteHost=ryan@host\x07/usr/local/bin/tmux\n";
-        assert_eq!(extract_path(raw), "/usr/local/bin/tmux");
-    }
-}

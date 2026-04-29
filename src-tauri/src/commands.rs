@@ -828,7 +828,7 @@ pub async fn resume_claude_session(
 ) -> AppResult<SessionInfo> {
     // Pull claude_session_id + cwd from the ClaudeSessionMeta we already
     // persisted on the previous run.
-    let lookup = store
+    let (claude_sid, cwd) = store
         .read(|s| {
             s.find_workspace(&args.workspace_id).and_then(|w| {
                 w.sessions
@@ -844,7 +844,6 @@ pub async fn resume_claude_session(
                 args.session_meta_id, args.workspace_id
             ))
         })?;
-    let (claude_sid, cwd) = lookup;
 
     // If the tmux session from a prior run is still alive, reattach to it
     // — no claude respawn, no transcript replay. The Tethys SessionId is
@@ -907,7 +906,7 @@ async fn spawn_claude(
     // Resolve the cwd: a specific repo's worktree, or — when repo_key is
     // None — the workspace root (parent of every repo worktree).
     // Also pull the per-workspace claude binary override, if any.
-    let lookup = store
+    let (cwd, ws_binary) = store
         .read(|s| {
             let w = s.find_workspace(&args.workspace_id)?;
             let cwd = match args.repo_key.as_deref() {
@@ -936,7 +935,6 @@ async fn spawn_claude(
                 ),
             })
         })?;
-    let (cwd, ws_binary) = lookup;
 
     let resolved_bin = match ws_binary.as_deref() {
         Some(bin) => claude::resolve_named(bin)?,

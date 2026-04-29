@@ -690,13 +690,14 @@ fn parent_session_from_subagent_path(transcript_path: &str) -> Option<String> {
 /// Hex + ASCII formatter for tracing bytes sent to the PTY. Control
 /// codes show as `\xNN`; printable bytes show as themselves.
 fn format_bytes(data: &[u8]) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(data.len() * 4);
     out.push('"');
     for &b in data {
         if (0x20..0x7f).contains(&b) && b != b'\\' && b != b'"' {
             out.push(b as char);
         } else {
-            out.push_str(&format!("\\x{b:02x}"));
+            let _ = write!(out, "\\x{b:02x}");
         }
     }
     out.push('"');
@@ -740,36 +741,28 @@ fn spawn_reader_thread(
 /// exits, so it lands in our buffer via the reader thread. Called from
 /// the child watcher once we've confirmed the session itself is gone.
 fn trim_detach_epilogue(ring: &Arc<Mutex<VecDeque<u8>>>) {
-    let mut ring = ring.lock().unwrap();
+    const NEEDLE: &[u8] = b"[detached ";
     // Search back at most ~256 bytes — the message is short.
-    let scan_len = ring.len().min(256);
-    if scan_len == 0 {
+    const SCAN_WINDOW: usize = 256;
+
+    let mut ring = ring.lock().unwrap();
+    if ring.is_empty() {
         return;
     }
-    let tail_start = ring.len() - scan_len;
-    let tail: Vec<u8> = ring.iter().skip(tail_start).copied().collect();
-    // Find the last occurrence of "[detached " in the tail.
-    let needle = b"[detached ";
-    let mut idx = None;
-    for i in (0..=tail.len().saturating_sub(needle.len())).rev() {
-        if tail[i..i + needle.len()] == *needle {
-            idx = Some(i);
-            break;
-        }
-    }
-    let Some(i) = idx else {
+    let tail_start = ring.len().saturating_sub(SCAN_WINDOW);
+    // make_contiguous so we can call windows() on a single &[u8] slice.
+    let bytes = ring.make_contiguous();
+    let Some(rel) = bytes[tail_start..]
+        .windows(NEEDLE.len())
+        .rposition(|w| w == NEEDLE)
+    else {
         return;
     };
     // Truncate from the byte preceding the pattern, walking back over
     // any trailing CR/LF so we don't leave a blank line either.
-    let mut cut_from = tail_start + i;
-    while cut_from > 0 {
-        let prev = ring[cut_from - 1];
-        if prev == b'\r' || prev == b'\n' {
-            cut_from -= 1;
-        } else {
-            break;
-        }
+    let mut cut_from = tail_start + rel;
+    while cut_from > 0 && matches!(bytes[cut_from - 1], b'\r' | b'\n') {
+        cut_from -= 1;
     }
     ring.truncate(cut_from);
 }

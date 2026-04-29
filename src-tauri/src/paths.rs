@@ -72,7 +72,8 @@ impl Paths {
 
 /// `~/.claude/settings.json` — user-level Claude Code settings.
 pub fn claude_settings_path() -> Option<PathBuf> {
-    Some(dirs_home()?.join(".claude").join("settings.json"))
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".claude").join("settings.json"))
 }
 
 /// Resolve the tethys-hook companion binary next to the current executable.
@@ -84,8 +85,4 @@ pub fn tethys_hook_bin() -> std::io::Result<PathBuf> {
         std::io::Error::new(std::io::ErrorKind::NotFound, "no parent for current exe")
     })?;
     Ok(parent.join("tethys-hook"))
-}
-
-fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
 }

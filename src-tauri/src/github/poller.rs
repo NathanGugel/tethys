@@ -349,11 +349,7 @@ fn build_query(targets: &[Target]) -> (String, BTreeMap<String, String>) {
         vars.insert(br.clone(), format!("refs/heads/{}", t.branch));
         vars.insert(bn.clone(), t.branch.clone());
         var_decls.push(format!(
-            "${ow}: String!, ${nm}: String!, ${br}: String!, ${bn}: String!",
-            ow = ow,
-            nm = nm,
-            br = br,
-            bn = bn,
+            "${ow}: String!, ${nm}: String!, ${br}: String!, ${bn}: String!"
         ));
         // `mergedPrs` is the fallback for when the branch has been deleted
         // post-merge: GitHub nulls the `ref`, but the PR record persists and
@@ -373,21 +369,12 @@ fn build_query(targets: &[Target]) -> (String, BTreeMap<String, String>) {
       }}
     }}
   }}
-"#,
-            i = i,
-            ow = ow,
-            nm = nm,
-            br = br,
-            bn = bn,
-            PR_FIELDS = PR_FIELDS,
+"#
         ));
     }
 
-    let query = format!(
-        "query({decls}) {{\n  {body}}}\n",
-        decls = var_decls.join(", "),
-        body = body,
-    );
+    let decls = var_decls.join(", ");
+    let query = format!("query({decls}) {{\n  {body}}}\n");
     (query, vars)
 }
 
@@ -547,22 +534,18 @@ fn context_state(node: &Value) -> Option<ChecksRollup> {
             if status != "COMPLETED" {
                 return Some(ChecksRollup::Pending);
             }
-            match node.get("conclusion").and_then(|c| c.as_str()) {
-                Some("SUCCESS") => Some(ChecksRollup::Success),
-                Some("FAILURE")
-                | Some("TIMED_OUT")
-                | Some("STARTUP_FAILURE")
-                | Some("ACTION_REQUIRED")
-                | Some("CANCELLED")
-                | Some("STALE") => Some(ChecksRollup::Failure),
-                Some("NEUTRAL") | Some("SKIPPED") => Some(ChecksRollup::Neutral),
+            match node.get("conclusion").and_then(|c| c.as_str())? {
+                "SUCCESS" => Some(ChecksRollup::Success),
+                "FAILURE" | "TIMED_OUT" | "STARTUP_FAILURE" | "ACTION_REQUIRED"
+                | "CANCELLED" | "STALE" => Some(ChecksRollup::Failure),
+                "NEUTRAL" | "SKIPPED" => Some(ChecksRollup::Neutral),
                 _ => None,
             }
         }
-        "StatusContext" => match node.get("state").and_then(|s| s.as_str()) {
-            Some("SUCCESS") => Some(ChecksRollup::Success),
-            Some("FAILURE") | Some("ERROR") => Some(ChecksRollup::Failure),
-            Some("PENDING") | Some("EXPECTED") => Some(ChecksRollup::Pending),
+        "StatusContext" => match node.get("state").and_then(|s| s.as_str())? {
+            "SUCCESS" => Some(ChecksRollup::Success),
+            "FAILURE" | "ERROR" => Some(ChecksRollup::Failure),
+            "PENDING" | "EXPECTED" => Some(ChecksRollup::Pending),
             _ => None,
         },
         _ => None,

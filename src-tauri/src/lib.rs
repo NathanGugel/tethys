@@ -15,6 +15,7 @@ mod reconcile;
 mod registry;
 mod sessions;
 mod setup;
+mod shell;
 mod state;
 mod store;
 mod theme;

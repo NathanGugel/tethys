@@ -1,4 +1,5 @@
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
@@ -121,10 +122,14 @@ fn install_inner(settings_path: &Path, tethys_hook_bin: &Path) -> AppResult<()> 
 fn write_atomic(settings_path: &Path, value: &Value) -> AppResult<()> {
     let pretty = serde_json::to_vec_pretty(value)?;
     let tmp = settings_path.with_extension("json.tethys.tmp");
-    std::fs::write(&tmp, &pretty)?;
-    if let Ok(f) = File::open(&tmp) {
-        let _ = f.sync_all();
-    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp)?;
+    file.write_all(&pretty)?;
+    let _ = file.sync_all();
+    drop(file);
     std::fs::rename(&tmp, settings_path)?;
     Ok(())
 }

@@ -88,12 +88,24 @@ pub async fn write_workspace_root_settings(
         return Ok(());
     }
 
-    let mut allow: Vec<String> = Vec::new();
-    let mut deny: Vec<String> = Vec::new();
-    let mut ask: Vec<String> = Vec::new();
-    let mut seen_allow: BTreeSet<String> = BTreeSet::new();
-    let mut seen_deny: BTreeSet<String> = BTreeSet::new();
-    let mut seen_ask: BTreeSet<String> = BTreeSet::new();
+    /// Order-preserving deduped list. Insertion order is the merge order
+    /// across repos, which the snapshot test relies on.
+    #[derive(Default)]
+    struct DedupList {
+        items: Vec<String>,
+        seen: BTreeSet<String>,
+    }
+    impl DedupList {
+        fn push(&mut self, s: String) {
+            if self.seen.insert(s.clone()) {
+                self.items.push(s);
+            }
+        }
+    }
+
+    let mut allow = DedupList::default();
+    let mut deny = DedupList::default();
+    let mut ask = DedupList::default();
 
     for repo_key in repo_keys {
         let path = paths.repo_shared_claude_local(repo_key);
@@ -124,44 +136,29 @@ pub async fn write_workspace_root_settings(
             continue;
         };
 
-        for field in ["allow", "deny", "ask"] {
+        for (field, target) in [
+            ("allow", &mut allow),
+            ("deny", &mut deny),
+            ("ask", &mut ask),
+        ] {
             let Some(arr) = perms.get(field).and_then(|v| v.as_array()) else {
                 continue;
             };
-            let (target, seen) = match field {
-                "allow" => (&mut allow, &mut seen_allow),
-                "deny" => (&mut deny, &mut seen_deny),
-                "ask" => (&mut ask, &mut seen_ask),
-                _ => unreachable!(),
-            };
             for item in arr {
                 let Some(s) = item.as_str() else { continue };
-                let rewritten = rewrite_relative_path(s, repo_key);
-                if seen.insert(rewritten.clone()) {
-                    target.push(rewritten);
-                }
+                target.push(rewrite_relative_path(s, repo_key));
             }
         }
     }
 
     let mut permissions = Map::new();
-    if !allow.is_empty() {
-        permissions.insert(
-            "allow".into(),
-            Value::Array(allow.into_iter().map(Value::String).collect()),
-        );
-    }
-    if !deny.is_empty() {
-        permissions.insert(
-            "deny".into(),
-            Value::Array(deny.into_iter().map(Value::String).collect()),
-        );
-    }
-    if !ask.is_empty() {
-        permissions.insert(
-            "ask".into(),
-            Value::Array(ask.into_iter().map(Value::String).collect()),
-        );
+    for (field, list) in [("allow", allow), ("deny", deny), ("ask", ask)] {
+        if !list.items.is_empty() {
+            permissions.insert(
+                field.into(),
+                Value::Array(list.items.into_iter().map(Value::String).collect()),
+            );
+        }
     }
 
     let mut root = Map::new();
