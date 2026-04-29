@@ -59,8 +59,8 @@ impl Theme {
         };
 
         let mut ansi: [String; 16] = Default::default();
-        for i in 0..16 {
-            ansi[i] = get(&format!("Ansi {i} Color"))?;
+        for (i, slot) in ansi.iter_mut().enumerate() {
+            *slot = get(&format!("Ansi {i} Color"))?;
         }
 
         let name = path

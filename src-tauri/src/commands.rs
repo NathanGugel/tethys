@@ -534,7 +534,7 @@ pub async fn delete_workspace(
         }
     }
 
-    let touched = store
+    store
         .mutate(|s| {
             let ws = s
                 .find_workspace_mut(&id)
@@ -547,10 +547,7 @@ pub async fn delete_workspace(
             ws.archived_at = None;
             Ok(())
         })
-        .await;
-    if let Err(e) = touched {
-        return Err(e);
-    }
+        .await?;
 
     info!(%id, "soft-deleted workspace");
     emit_workspace_changed(&app, &id);

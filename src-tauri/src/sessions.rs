@@ -20,6 +20,19 @@ use crate::tmux;
 const RING_CAPACITY: usize = 2 * 1024 * 1024; // 2 MB scrollback per session
 const READ_BUF: usize = 4096;
 
+/// Inputs to `SessionSupervisor::spawn_with_id`. Bundled in a struct so the
+/// inner function doesn't trip clippy's `too_many_arguments` lint.
+struct SpawnRequest<'a> {
+    id: SessionId,
+    workspace_id: String,
+    repo_key: Option<String>,
+    cwd: &'a Path,
+    program: &'a Path,
+    args: &'a [String],
+    tmux_bin: PathBuf,
+    seed_bytes: &'a [u8],
+}
+
 pub type SessionId = String;
 
 /// Snapshot returned to the frontend for the sessions list. Does not include
@@ -132,17 +145,17 @@ impl SessionSupervisor {
     /// subscribers/watcher, and stores a `SessionHandle` under `id`. The
     /// caller provides `id` so it can match an existing tmux session name
     /// (the tmux session name == Tethys SessionId by convention).
-    fn spawn_with_id(
-        &self,
-        id: SessionId,
-        workspace_id: String,
-        repo_key: Option<String>,
-        cwd: &Path,
-        program: &Path,
-        args: &[String],
-        tmux_bin: PathBuf,
-        seed_bytes: &[u8],
-    ) -> AppResult<SessionInfo> {
+    fn spawn_with_id(&self, req: SpawnRequest<'_>) -> AppResult<SessionInfo> {
+        let SpawnRequest {
+            id,
+            workspace_id,
+            repo_key,
+            cwd,
+            program,
+            args,
+            tmux_bin,
+            seed_bytes,
+        } = req;
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -279,16 +292,16 @@ impl SessionSupervisor {
             args.push(csid.to_string());
         }
 
-        let info = self.spawn_with_id(
+        let info = self.spawn_with_id(SpawnRequest {
             id,
-            workspace_id.clone(),
+            workspace_id: workspace_id.clone(),
             repo_key,
             cwd,
-            tmux_bin,
-            &args,
-            tmux_bin.to_path_buf(),
-            &[],
-        )?;
+            program: tmux_bin,
+            args: &args,
+            tmux_bin: tmux_bin.to_path_buf(),
+            seed_bytes: &[],
+        })?;
 
         // Prune any expired pending correlations while we're here.
         let mut pending = self.pending.lock().unwrap();
@@ -337,16 +350,16 @@ impl SessionSupervisor {
             "-t".into(),
             session_id.clone(),
         ]);
-        self.spawn_with_id(
-            session_id,
+        self.spawn_with_id(SpawnRequest {
+            id: session_id,
             workspace_id,
             repo_key,
             cwd,
-            tmux_bin,
-            &args,
-            tmux_bin.to_path_buf(),
-            &seed,
-        )
+            program: tmux_bin,
+            args: &args,
+            tmux_bin: tmux_bin.to_path_buf(),
+            seed_bytes: &seed,
+        })
     }
 
     /// Dispatch a hook event from `tethys-hook`.

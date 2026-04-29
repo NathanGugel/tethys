@@ -134,7 +134,7 @@ impl Purger {
             .read(|s| {
                 s.workspaces
                     .iter()
-                    .filter(|w| w.deleted_at.map_or(false, |t| t <= cutoff))
+                    .filter(|w| w.deleted_at.is_some_and(|t| t <= cutoff))
                     .cloned()
                     .collect()
             })

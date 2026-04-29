@@ -58,7 +58,7 @@ pub async fn start(
     Ok(())
 }
 
-const MAX_FRAME_BYTES: usize = 1 * 1024 * 1024;
+const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 async fn handle_connection(
     mut stream: UnixStream,

@@ -396,7 +396,7 @@ fn parse_response(targets: &[Target], data: &Value) -> Vec<(WorkspaceId, String,
     for (i, t) in targets.iter().enumerate() {
         let alias = format!("q{i}");
         let node = data.get(&alias);
-        let status = node.and_then(|n| parse_repo_node(n));
+        let status = node.and_then(parse_repo_node);
         out.push((t.workspace_id.clone(), t.repo_key.clone(), status));
     }
     out
