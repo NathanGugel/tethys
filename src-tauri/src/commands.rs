@@ -158,7 +158,7 @@ async fn provision_repo_worktree(ctx: RepoProvision<'_>) -> AppResult<RepoLink> 
     let clone_path = ctx.paths.repo_clone_path(&ctx.repo.key);
 
     git::ensure_clone(&clone_path, &ctx.repo.remote_url, ctx.tx, &ctx.repo.key).await?;
-    git::pull_clone_best_effort(&clone_path, ctx.tx, &ctx.repo.key).await;
+    git::pull_clone(&clone_path, ctx.tx, &ctx.repo.key).await?;
 
     // Pre-check: if the branch already exists, git worktree add will fail
     // with a fatal. We bail here with a clearer message — and (for the

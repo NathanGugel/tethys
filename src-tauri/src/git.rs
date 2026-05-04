@@ -181,12 +181,12 @@ pub async fn ensure_clone(
     Ok(())
 }
 
-/// `git -C <clone_path> pull --ff-only`. Best-effort: nothing in tethys ever
-/// modifies the clone's working tree or checked-out branch, so a fast-forward
-/// pull should always succeed when online. If it fails (offline, network
-/// hiccup, force-pushed default branch), we log and continue — the caller
-/// will branch off whatever the clone currently has, which is at worst stale.
-pub async fn pull_clone_best_effort(clone_path: &Path, tx: &JobTx, repo: &str) {
+/// `git -C <clone_path> pull --ff-only`. Tethys never modifies the clone's
+/// working tree or checked-out branch, so a fast-forward pull should always
+/// succeed when online. A failure means the clone is in a bad state (dirty
+/// working tree, diverged history) and branching off it would silently use
+/// stale code — bubble the error so workspace creation aborts loudly.
+pub async fn pull_clone(clone_path: &Path, tx: &JobTx, repo: &str) -> AppResult<()> {
     tx.status("updating clone from origin".to_string(), Some(repo));
     let args: [&OsStr; 4] = [
         "-C".as_ref(),
@@ -194,20 +194,15 @@ pub async fn pull_clone_best_effort(clone_path: &Path, tx: &JobTx, repo: &str) {
         "pull".as_ref(),
         "--ff-only".as_ref(),
     ];
-    match run_streamed("git", args, None, tx, Some(repo)).await {
-        Ok(status) if status.success() => {}
-        Ok(status) => tx.status(
-            format!(
-                "git pull --ff-only exited with {:?}; continuing with current clone state",
-                status.code()
-            ),
-            Some(repo),
-        ),
-        Err(e) => tx.status(
-            format!("git pull --ff-only failed: {e}; continuing with current clone state"),
-            Some(repo),
-        ),
+    let status = run_streamed("git", args, None, tx, Some(repo)).await?;
+    if !status.success() {
+        return Err(AppError::Other(format!(
+            "git pull --ff-only in {} exited with {:?}",
+            clone_path.display(),
+            status.code()
+        )));
     }
+    Ok(())
 }
 
 /// `git -C <clone_path> worktree add <worktree_path> -b <branch>`.
