@@ -312,6 +312,7 @@ fn build_query(targets: &[Target]) -> (String, BTreeMap<String, String>) {
           url
           state
           isDraft
+          mergeable
           reviewDecision
           reviewThreads(first: 50) { nodes { isResolved } }
           commits(last: 1) {
@@ -416,6 +417,16 @@ fn parse_repo_node(repo: &Value) -> Option<GithubPrStatus> {
     };
     let is_draft = pr.get("isDraft").and_then(|v| v.as_bool()).unwrap_or(false);
 
+    // GitHub's `mergeable` is `MERGEABLE | CONFLICTING | UNKNOWN`. UNKNOWN
+    // shows up briefly after a push while GitHub computes the merge — only
+    // treat the explicit CONFLICTING signal as a conflict, so we don't flash
+    // a false-positive red square during recomputation.
+    let has_merge_conflicts = pr
+        .get("mergeable")
+        .and_then(|v| v.as_str())
+        .map(|s| s == "CONFLICTING")
+        .unwrap_or(false);
+
     let review_decision = if state == PrState::Open {
         match pr.get("reviewDecision").and_then(|v| v.as_str()) {
             Some("APPROVED") => ReviewDecision::Approved,
@@ -497,6 +508,7 @@ fn parse_repo_node(repo: &Value) -> Option<GithubPrStatus> {
         is_draft,
         checks,
         bugbot,
+        has_merge_conflicts,
         review_decision,
         unresolved_threads,
         head_sha,
@@ -614,6 +626,7 @@ fn is_meaningful_change(old: Option<&GithubPrStatus>, new: Option<&GithubPrStatu
                 || a.is_draft != b.is_draft
                 || a.checks != b.checks
                 || a.bugbot != b.bugbot
+                || a.has_merge_conflicts != b.has_merge_conflicts
                 || a.review_decision != b.review_decision
                 || a.unresolved_threads != b.unresolved_threads
                 || a.head_sha != b.head_sha
@@ -837,6 +850,83 @@ mod tests {
     }
 
     #[test]
+    fn parse_mergeable_conflicting_sets_flag() {
+        let data = json!({
+            "q0": {
+                "ref": {
+                    "associatedPullRequests": {
+                        "nodes": [{
+                            "number": 1,
+                            "url": "u",
+                            "state": "OPEN",
+                            "isDraft": false,
+                            "mergeable": "CONFLICTING",
+                            "reviewThreads": {"nodes": []},
+                            "commits": {
+                                "nodes": [{"commit": {"oid": "o", "statusCheckRollup": null}}]
+                            }
+                        }]
+                    }
+                }
+            }
+        });
+        let s = parse_response(&[mk_target(0)], &data)[0].2.clone().unwrap();
+        assert!(s.has_merge_conflicts);
+    }
+
+    #[test]
+    fn parse_mergeable_unknown_does_not_set_flag() {
+        // GitHub returns UNKNOWN briefly after a push while it recomputes the
+        // merge — don't flash a false positive in that window.
+        let data = json!({
+            "q0": {
+                "ref": {
+                    "associatedPullRequests": {
+                        "nodes": [{
+                            "number": 1,
+                            "url": "u",
+                            "state": "OPEN",
+                            "isDraft": false,
+                            "mergeable": "UNKNOWN",
+                            "reviewThreads": {"nodes": []},
+                            "commits": {
+                                "nodes": [{"commit": {"oid": "o", "statusCheckRollup": null}}]
+                            }
+                        }]
+                    }
+                }
+            }
+        });
+        let s = parse_response(&[mk_target(0)], &data)[0].2.clone().unwrap();
+        assert!(!s.has_merge_conflicts);
+    }
+
+    #[test]
+    fn parse_mergeable_clean_does_not_set_flag() {
+        let data = json!({
+            "q0": {
+                "ref": {
+                    "associatedPullRequests": {
+                        "nodes": [{
+                            "number": 1,
+                            "url": "u",
+                            "state": "OPEN",
+                            "isDraft": false,
+                            "mergeable": "MERGEABLE",
+                            "reviewThreads": {"nodes": []},
+                            "commits": {
+                                "nodes": [{"commit": {"oid": "o", "statusCheckRollup": null}}]
+                            }
+                        }]
+                    }
+                }
+            }
+        });
+        let s = parse_response(&[mk_target(0)], &data)[0].2.clone().unwrap();
+        assert!(!s.has_merge_conflicts);
+    }
+
+    #[test]
     fn is_meaningful_change_ignores_fetched_at() {
         let base = GithubPrStatus {
             pr_number: 1,
@@ -845,6 +935,7 @@ mod tests {
             is_draft: false,
             checks: ChecksRollup::Success,
             bugbot: ChecksRollup::None,
+            has_merge_conflicts: false,
             review_decision: ReviewDecision::None,
             unresolved_threads: 0,
             head_sha: "sha".into(),

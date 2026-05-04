@@ -44,6 +44,11 @@ pub struct GithubPrStatus {
     /// the rest of the CI rollup so the UI can show it as its own indicator.
     #[serde(default = "default_bugbot")]
     pub bugbot: ChecksRollup,
+    /// True when GitHub reports the PR as having merge conflicts with its
+    /// base branch (`mergeable: CONFLICTING`). The UI surfaces this through
+    /// the same CI indicator since you can't merge regardless of CI state.
+    #[serde(default)]
+    pub has_merge_conflicts: bool,
     #[serde(default)]
     pub review_decision: ReviewDecision,
     pub unresolved_threads: u32,

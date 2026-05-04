@@ -86,7 +86,8 @@ function Square({
   );
 }
 
-function ciTone(checks: ChecksRollup): SquareTone {
+function ciTone(checks: ChecksRollup, hasMergeConflicts: boolean): SquareTone {
+  if (hasMergeConflicts) return "red";
   switch (checks) {
     case "success":
     case "neutral":
@@ -131,7 +132,8 @@ function bugbotTone(bugbot: ChecksRollup): SquareTone {
   }
 }
 
-function ciTitle(checks: ChecksRollup): string {
+function ciTitle(checks: ChecksRollup, hasMergeConflicts: boolean): string {
+  if (hasMergeConflicts) return "Merge conflict with base branch";
   switch (checks) {
     case "success":
       return "CI: passing";
@@ -224,7 +226,11 @@ export function GithubChip({
       <span className="gh-pr">#{status.pr_number}</span>
       {isOpen && (
         <span className="gh-squares">
-          <Square kind="ci" tone={ciTone(status.checks)} title={ciTitle(status.checks)} />
+          <Square
+            kind="ci"
+            tone={ciTone(status.checks, status.has_merge_conflicts)}
+            title={ciTitle(status.checks, status.has_merge_conflicts)}
+          />
           {!status.is_draft && (
             <Square
               kind="review"

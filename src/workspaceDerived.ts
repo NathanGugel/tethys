@@ -29,6 +29,7 @@ export function checksSummary(ws: Workspace): ChecksRollup | null {
   let worst: ChecksRollup | null = null;
   for (const r of ws.repo_links) {
     if (!r.github || r.github.state !== "open") continue;
+    if (r.github.has_merge_conflicts) return "failure";
     const c = r.github.checks;
     if (c === "failure") return "failure";
     if (c === "pending") worst = "pending";

@@ -30,6 +30,8 @@ export interface GithubPrStatus {
   checks: ChecksRollup;
   /** Cursor Bugbot's check, split out from `checks` for its own indicator. */
   bugbot: ChecksRollup;
+  /** GitHub reports the PR conflicts with its base branch. Surfaced through the CI indicator. */
+  has_merge_conflicts: boolean;
   review_decision: ReviewDecision;
   unresolved_threads: number;
   head_sha: string;
