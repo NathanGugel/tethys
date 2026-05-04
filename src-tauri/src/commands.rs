@@ -104,29 +104,27 @@ pub async fn open_in_vscode(
     store: State<'_, Arc<Store>>,
     id: WorkspaceId,
 ) -> AppResult<()> {
-    let paths: Vec<PathBuf> = store
+    let workspace_root: PathBuf = store
         .read(|s| {
-            s.find_workspace(&id)
-                .map(|w| w.repo_links.iter().map(|r| r.worktree_path.clone()).collect())
+            s.find_workspace(&id).and_then(|w| {
+                w.repo_links
+                    .first()
+                    .and_then(|r| r.worktree_path.parent().map(|p| p.to_path_buf()))
+            })
         })
         .await
         .ok_or_else(|| AppError::WorkspaceNotFound(id.clone()))?;
 
-    if paths.is_empty() {
-        return Err(AppError::Other(format!(
-            "workspace {id} has no repos to open"
-        )));
-    }
-
-    for path in &paths {
-        std::process::Command::new("open")
-            .args(["-a", "Visual Studio Code"])
-            .arg(path)
-            .status()
-            .map_err(|e| {
-                AppError::Other(format!("failed to open {} in VS Code: {e}", path.display()))
-            })?;
-    }
+    std::process::Command::new("open")
+        .args(["-a", "Visual Studio Code"])
+        .arg(&workspace_root)
+        .status()
+        .map_err(|e| {
+            AppError::Other(format!(
+                "failed to open {} in VS Code: {e}",
+                workspace_root.display()
+            ))
+        })?;
 
     Ok(())
 }
