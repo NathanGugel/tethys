@@ -322,13 +322,6 @@ fn build_query(targets: &[Target]) -> (String, BTreeMap<String, String>) {
               }
             }
           }
-          reviews(first: 20) {
-            nodes {
-              author { login }
-              body
-              commit { oid }
-            }
-          }
           commits(last: 1) {
             nodes {
               commit {
@@ -452,28 +445,35 @@ fn parse_repo_node(repo: &Value) -> Option<GithubPrStatus> {
         ReviewDecision::None
     };
 
-    let unresolved_threads = if state == PrState::Open {
+    // Walk threads once, splitting unresolved counts between human reviewers
+    // and bugbot. The human count drives the review (eye) square; the bugbot
+    // count drives the bugbot square — resolving a bugbot finding clears it.
+    let (unresolved_threads, bugbot_unresolved) = if state == PrState::Open {
         pr.get("reviewThreads")
             .and_then(|r| r.get("nodes"))
             .and_then(|n| n.as_array())
             .map(|arr| {
-                arr.iter()
-                    .filter(|t| {
-                        let unresolved = !t
-                            .get("isResolved")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        // Bugbot leaves its findings as review threads. Don't
-                        // let them turn the human-review indicator yellow —
-                        // bugbot has its own square.
-                        let from_bugbot = thread_first_author(t) == Some(BUGBOT_LOGIN);
-                        unresolved && !from_bugbot
-                    })
-                    .count() as u32
+                let mut human = 0u32;
+                let mut bugbot = 0u32;
+                for t in arr {
+                    let unresolved = !t
+                        .get("isResolved")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if !unresolved {
+                        continue;
+                    }
+                    if thread_first_author(t) == Some(BUGBOT_LOGIN) {
+                        bugbot += 1;
+                    } else {
+                        human += 1;
+                    }
+                }
+                (human, bugbot)
             })
-            .unwrap_or(0)
+            .unwrap_or((0, 0))
     } else {
-        0
+        (0, 0)
     };
 
     let commit = pr
@@ -522,10 +522,10 @@ fn parse_repo_node(repo: &Value) -> Option<GithubPrStatus> {
     };
 
     // Bugbot's CheckRun conclusion is unreliable — it can complete as
-    // SUCCESS or NEUTRAL even when bugbot found bugs. The authoritative
-    // "found N issues" signal lives in the body of a review left by the
-    // `cursor` user against the head commit.
-    let bugbot = if bugbot_review_reports_issues(pr.get("reviews"), &head_sha) {
+    // SUCCESS or NEUTRAL even when bugbot found bugs. Drive the indicator
+    // off unresolved bugbot review threads instead, so resolving a finding
+    // (or pushing a fix that GitHub auto-resolves) clears the square.
+    let bugbot = if bugbot_unresolved > 0 {
         ChecksRollup::Failure
     } else if matches!(bugbot_check, ChecksRollup::Pending) {
         ChecksRollup::Pending
@@ -570,9 +570,6 @@ fn context_is_bugbot(node: &Value) -> bool {
 /// GitHub login used by Cursor Bugbot to post reviews and threads.
 const BUGBOT_LOGIN: &str = "cursor";
 
-/// Marker Cursor Bugbot embeds at the top of every review it leaves on a PR.
-const BUGBOT_REVIEW_MARKER: &str = "<!-- BUGBOT_REVIEW -->";
-
 fn thread_first_author(thread: &Value) -> Option<&str> {
     thread
         .get("comments")
@@ -582,58 +579,6 @@ fn thread_first_author(thread: &Value) -> Option<&str> {
         .and_then(|c| c.get("author"))
         .and_then(|a| a.get("login"))
         .and_then(|l| l.as_str())
-}
-
-/// Look for a Cursor Bugbot review against `head_sha` whose body says it
-/// found at least one potential issue. Older reviews against earlier commits
-/// are ignored — once you push a fix, the bugbot square should clear.
-fn bugbot_review_reports_issues(reviews: Option<&Value>, head_sha: &str) -> bool {
-    let Some(nodes) = reviews
-        .and_then(|r| r.get("nodes"))
-        .and_then(|n| n.as_array())
-    else {
-        return false;
-    };
-    nodes.iter().any(|review| {
-        let login = review
-            .get("author")
-            .and_then(|a| a.get("login"))
-            .and_then(|l| l.as_str());
-        if login != Some(BUGBOT_LOGIN) {
-            return false;
-        }
-        let oid = review
-            .get("commit")
-            .and_then(|c| c.get("oid"))
-            .and_then(|o| o.as_str());
-        if oid != Some(head_sha) {
-            return false;
-        }
-        let body = review.get("body").and_then(|b| b.as_str()).unwrap_or("");
-        body.contains(BUGBOT_REVIEW_MARKER) && body_reports_potential_issues(body)
-    })
-}
-
-/// Match the bugbot summary pattern: `found N potential issue[s]` with N >= 1.
-/// Defensive in case bugbot ever posts a clean-state review with the marker
-/// (e.g. "found 0 potential issues") — only a positive count counts as failure.
-fn body_reports_potential_issues(body: &str) -> bool {
-    let needle = "found ";
-    let Some(idx) = body.find(needle) else {
-        return false;
-    };
-    let rest = &body[idx + needle.len()..];
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
-        return false;
-    }
-    let Ok(n) = digits.parse::<u32>() else {
-        return false;
-    };
-    if n == 0 {
-        return false;
-    }
-    rest[digits.len()..].trim_start().starts_with("potential issue")
 }
 
 /// Map a single check-run / status-context node to a rollup-style state.
@@ -1127,10 +1072,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_bugbot_review_overrides_neutral_check() {
+    fn parse_unresolved_bugbot_thread_marks_failure() {
         // Cursor Bugbot's CheckRun reports NEUTRAL even when it found bugs —
-        // the real signal is in the review body. With a matching head SHA, the
-        // review forces bugbot to Failure.
+        // the actionable signal is the unresolved review thread it leaves.
         let data = json!({
             "q0": {
                 "ref": {
@@ -1140,12 +1084,12 @@ mod tests {
                             "url": "u",
                             "state": "OPEN",
                             "isDraft": false,
-                            "reviewThreads": {"nodes": []},
-                            "reviews": {"nodes": [{
-                                "author": {"login": "cursor"},
-                                "body": "<!-- BUGBOT_REVIEW -->\nCursor Bugbot has reviewed your changes and found 1 potential issue.",
-                                "commit": {"oid": "abc123"}
-                            }]},
+                            "reviewThreads": {"nodes": [
+                                {
+                                    "isResolved": false,
+                                    "comments": {"nodes": [{"author": {"login": "cursor"}}]}
+                                }
+                            ]},
                             "commits": {
                                 "nodes": [{"commit": {
                                     "oid": "abc123",
@@ -1167,10 +1111,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_bugbot_review_against_old_sha_is_ignored() {
-        // A previous push had a bugbot review against an older commit. After
-        // the user pushed a fix, the review still exists but no longer applies
-        // — bugbot should fall back to the current check state.
+    fn parse_resolved_bugbot_thread_does_not_mark_failure() {
+        // Once the user resolves bugbot's thread, the square should clear and
+        // fall back to the underlying check state.
         let data = json!({
             "q0": {
                 "ref": {
@@ -1180,19 +1123,19 @@ mod tests {
                             "url": "u",
                             "state": "OPEN",
                             "isDraft": false,
-                            "reviewThreads": {"nodes": []},
-                            "reviews": {"nodes": [{
-                                "author": {"login": "cursor"},
-                                "body": "<!-- BUGBOT_REVIEW -->\nCursor Bugbot has reviewed your changes and found 2 potential issues.",
-                                "commit": {"oid": "old"}
-                            }]},
+                            "reviewThreads": {"nodes": [
+                                {
+                                    "isResolved": true,
+                                    "comments": {"nodes": [{"author": {"login": "cursor"}}]}
+                                }
+                            ]},
                             "commits": {
                                 "nodes": [{"commit": {
-                                    "oid": "newhead",
+                                    "oid": "abc123",
                                     "statusCheckRollup": {
                                         "state": "SUCCESS",
                                         "contexts": {"nodes": [
-                                            {"__typename": "CheckRun", "name": "Cursor Bugbot", "status": "COMPLETED", "conclusion": "SUCCESS"}
+                                            {"__typename": "CheckRun", "name": "Cursor Bugbot", "status": "COMPLETED", "conclusion": "NEUTRAL"}
                                         ]}
                                     }
                                 }}]
@@ -1203,7 +1146,7 @@ mod tests {
             }
         });
         let s = parse_response(&[mk_target(0)], &data)[0].2.clone().unwrap();
-        assert_eq!(s.bugbot, ChecksRollup::Success);
+        assert_eq!(s.bugbot, ChecksRollup::Neutral);
     }
 
     #[test]
@@ -1240,21 +1183,6 @@ mod tests {
         });
         let s = parse_response(&[mk_target(0)], &data)[0].2.clone().unwrap();
         assert_eq!(s.unresolved_threads, 1);
-    }
-
-    #[test]
-    fn body_reports_potential_issues_matches_real_messages() {
-        assert!(body_reports_potential_issues(
-            "<!-- BUGBOT_REVIEW -->\nCursor Bugbot has reviewed your changes and found 1 potential issue."
-        ));
-        assert!(body_reports_potential_issues(
-            "Cursor Bugbot has reviewed your changes and found 2 potential issues."
-        ));
-        assert!(!body_reports_potential_issues(
-            "Cursor Bugbot has reviewed your changes and found 0 potential issues."
-        ));
-        assert!(!body_reports_potential_issues("Bugbot found nothing here."));
-        assert!(!body_reports_potential_issues(""));
     }
 
     #[test]
