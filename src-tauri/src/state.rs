@@ -2,16 +2,11 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::github::GithubPrStatus;
 
 pub type WorkspaceId = String;
 pub type SessionId = String;
-
-pub fn new_workspace_id() -> WorkspaceId {
-    Uuid::new_v4().to_string()
-}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppState {
@@ -46,6 +41,24 @@ pub struct Workspace {
     /// "Archived" section at the bottom of the sidebar.
     #[serde(default)]
     pub archived_at: Option<DateTime<Utc>>,
+    /// Lifecycle state of the workspace itself. Newly-submitted entries land
+    /// in state as `Creating` so the sidebar row appears at the user's
+    /// chosen position from t=0; provisioning then flips it to `Ready` (or
+    /// `CreationFailed` with the error message). Persisted as `Ready` for
+    /// every pre-existing workspace via the field default.
+    #[serde(default)]
+    pub status: WorkspaceStatus,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkspaceStatus {
+    #[default]
+    Ready,
+    Creating,
+    CreationFailed {
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,5 +220,32 @@ mod tests {
             parsed.workspaces[0].claude_binary.as_deref(),
             Some("claude-hipaa")
         );
+    }
+
+    #[test]
+    fn pre_status_state_defaults_to_ready() {
+        // state.json from before the WorkspaceStatus field was added must
+        // load as Ready — older entries are by definition fully-provisioned.
+        let raw = r#"{
+            "workspaces": [
+                {
+                    "id": "abc-123",
+                    "branch": "feat/foo",
+                    "created_at": "2026-04-01T12:00:00Z"
+                }
+            ]
+        }"#;
+        let parsed: AppState = serde_json::from_str(raw).expect("must deserialize");
+        assert!(matches!(parsed.workspaces[0].status, WorkspaceStatus::Ready));
+    }
+
+    #[test]
+    fn workspace_status_round_trips() {
+        let failed = WorkspaceStatus::CreationFailed {
+            error: "boom".into(),
+        };
+        let bytes = serde_json::to_vec(&failed).expect("serialize");
+        let back: WorkspaceStatus = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(failed, back);
     }
 }

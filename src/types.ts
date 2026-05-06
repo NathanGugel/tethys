@@ -58,6 +58,11 @@ export interface ClaudeSessionMeta {
   hidden: boolean;
 }
 
+export type WorkspaceStatus =
+  | { kind: "ready" }
+  | { kind: "creating" }
+  | { kind: "creation_failed"; error: string };
+
 export interface Workspace {
   id: WorkspaceId;
   branch: string;
@@ -73,6 +78,10 @@ export interface Workspace {
   /** Archive marker. Archived workspaces render in a collapsed group at
    *  the bottom of the sidebar. */
   archived_at: string | null;
+  /** Lifecycle state. `creating` rows render as a spinner row in the sidebar
+   *  and a JobLogPane in the detail; `creation_failed` rows render the
+   *  failed log so the user can read the error before dismissing. */
+  status: WorkspaceStatus;
 }
 
 export interface SystemErrorEntry {
@@ -85,6 +94,9 @@ export interface SystemErrorEntry {
 }
 
 export interface CreateWorkspaceArgs {
+  /** Frontend-minted UUID. Used so the backend can insert the workspace
+   *  draft into state immediately and the sidebar row holds its position. */
+  workspace_id: WorkspaceId;
   branch: string;
   repo_selections: string[];
   claude_binary?: string | null;

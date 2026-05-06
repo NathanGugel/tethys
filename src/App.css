@@ -127,6 +127,25 @@ html,
   font-style: italic;
 }
 
+.workspace-list > li.creation-failed {
+  padding: 10px 14px;
+  cursor: pointer;
+  border-left: 3px solid #c64545;
+  opacity: 0.9;
+}
+
+.workspace-list > li.creation-failed:hover {
+  background: rgba(125, 125, 125, 0.08);
+  opacity: 1;
+}
+
+.workspace-list > li.creation-failed .pending-label {
+  font-size: 11px;
+  color: #c64545;
+  margin-top: 2px;
+  font-style: italic;
+}
+
 .workspace-repo-list {
   list-style: none;
   margin: 4px 0 0;

@@ -25,12 +25,6 @@ import { useTauriEvent } from "./useTauriEvent";
 import { isReadyToDelete } from "./workspaceDerived";
 import "./App.css";
 
-type PendingCreate = {
-  tempId: string;
-  branch: string;
-  args: CreateWorkspaceArgs;
-};
-
 function App() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [registry, setRegistry] = useState<RegistryStatus | null>(null);
@@ -38,14 +32,16 @@ function App() {
   const [selectedId, setSelectedId] = useState<WorkspaceId | null>(null);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [pendingCreates, setPendingCreates] = useState<PendingCreate[]>([]);
   /**
-   * Unified ordering of the active sidebar list — workspace ids and pending
-   * tempIds intermixed. Source of truth for sidebar render order; reconciled
-   * against `workspaces` and `pendingCreates`, and synced back to the
-   * backend (workspace-only sub-order) by an effect below.
+   * Args for create_workspace invocations the runner is currently driving,
+   * keyed by workspace_id. The backend inserts a `Creating` draft into
+   * `workspaces` from t=0, so this map only carries the args the runner
+   * needs to pass to invoke; sidebar position lives entirely in `workspaces`.
+   * Entries are removed on success (after auto-start) or on user dismissal.
    */
-  const [displayOrder, setDisplayOrder] = useState<string[]>([]);
+  const [creationRuns, setCreationRuns] = useState<
+    Map<WorkspaceId, CreateWorkspaceArgs>
+  >(new Map());
   /**
    * Per-session turn state tracked by listening to `session:turn_changed`
    * globally. Used for the sidebar attention dot without needing to
@@ -227,75 +223,25 @@ function App() {
     () => workspaces.filter((w) => !w.deleted_at),
     [workspaces],
   );
-  const activeWorkspaces = useMemo(
-    () => visibleWorkspaces.filter((w) => !w.archived_at),
-    [visibleWorkspaces],
-  );
-
-  useEffect(() => {
-    setDisplayOrder((prev) => {
-      const wsIdSet = new Set(activeWorkspaces.map((w) => w.id));
-      const pendingIdSet = new Set(pendingCreates.map((p) => p.tempId));
-      const filtered = prev.filter(
-        (id) => wsIdSet.has(id) || pendingIdSet.has(id),
-      );
-      const filteredSet = new Set(filtered);
-      const addedPendings = pendingCreates
-        .filter((p) => !filteredSet.has(p.tempId))
-        .map((p) => p.tempId);
-      const addedWorkspaces = activeWorkspaces
-        .filter((w) => !filteredSet.has(w.id))
-        .map((w) => w.id);
-      if (
-        addedPendings.length === 0 &&
-        addedWorkspaces.length === 0 &&
-        filtered.length === prev.length
-      ) {
-        return prev;
-      }
-      // New pendings prepend (matches the prior "spinner appears at top"
-      // UX). New workspaces append — covers initial load and the rare case
-      // of a workspace appearing without going through a local pending.
-      return [...addedPendings, ...filtered, ...addedWorkspaces];
-    });
-  }, [activeWorkspaces, pendingCreates]);
-
-  // Persist the workspace-only sub-order of `displayOrder` whenever it
-  // diverges from the backend's order. Drives the post-create reorder that
-  // keeps a freshly-created workspace at the position the pending occupied.
-  useEffect(() => {
-    if (activeWorkspaces.length === 0) return;
-    const wsIdSet = new Set(activeWorkspaces.map((w) => w.id));
-    const wsOrder = displayOrder.filter((id) => wsIdSet.has(id));
-    if (wsOrder.length !== activeWorkspaces.length) return;
-    const backendOrder = activeWorkspaces.map((w) => w.id);
-    if (wsOrder.every((id, i) => id === backendOrder[i])) return;
-    invoke("reorder_workspaces", { ids: wsOrder }).catch((e) =>
-      setError(`reorder failed: ${String(e)}`),
-    );
-  }, [activeWorkspaces, displayOrder]);
   const selected = useMemo(() => {
     const ws = workspaces.find((w) => w.id === selectedId);
     if (!ws) return null;
-    // Don't render the detail pane for soft-deleted workspaces — the row
-    // is gone from the sidebar so showing the detail pane would be a
-    // dead-end. Acts as a side-effect-free guard.
     if (ws.deleted_at) return null;
     return ws;
   }, [workspaces, selectedId]);
 
   const handleCreateSuccess = useCallback(
-    async (tempId: string, result: unknown) => {
+    async (workspaceId: WorkspaceId, result: unknown) => {
       const ws = result as Workspace;
-      // Slot the new workspace into the position the pending occupied so
-      // the row stays where the user left it. Removing the pending tempId
-      // and replacing with ws.id in the same setDisplayOrder pass keeps
-      // the reconcile effect from re-prepending ws.id once refresh runs.
-      setDisplayOrder((prev) =>
-        prev.map((id) => (id === tempId ? ws.id : id)),
-      );
-      setPendingCreates((prev) => prev.filter((p) => p.tempId !== tempId));
-      await refresh();
+      // Tear down the runner now that provisioning is done — the workspace
+      // already lives in `workspaces` with status=Ready, so the detail
+      // pane swaps from JobLogPane to WorkspaceDetail naturally.
+      setCreationRuns((prev) => {
+        if (!prev.has(workspaceId)) return prev;
+        const next = new Map(prev);
+        next.delete(workspaceId);
+        return next;
+      });
       // Auto-start a Claude session: in the only repo when the workspace
       // has just one, otherwise at the workspace root.
       const repoKey =
@@ -307,29 +253,48 @@ function App() {
       } catch (e) {
         setError(`auto-start claude failed: ${String(e)}`);
       }
-      // If the user was viewing this pending pane, drop selection rather
-      // than yanking them onto the newly-created workspace.
-      setSelectedId((cur) => (cur === tempId ? null : cur));
     },
-    [refresh],
+    [],
   );
 
-  const handleCreateDismiss = useCallback((tempId: string) => {
-    setPendingCreates((prev) => prev.filter((p) => p.tempId !== tempId));
-    setSelectedId((cur) => (cur === tempId ? null : cur));
-  }, []);
-
-  const handleDelete = useCallback(
-    async (workspace: Workspace) => {
-      setSelectedId((cur) => (cur === workspace.id ? null : cur));
+  const handleCreationDismiss = useCallback(
+    async (workspaceId: WorkspaceId) => {
+      setCreationRuns((prev) => {
+        if (!prev.has(workspaceId)) return prev;
+        const next = new Map(prev);
+        next.delete(workspaceId);
+        return next;
+      });
+      setSelectedId((cur) => (cur === workspaceId ? null : cur));
+      // Drop the failed draft from state. `forget_workspace` is a hard
+      // delete with no grace window — the right call here since there are
+      // no worktrees on disk for a CreationFailed entry (the backend
+      // already tore them down) and no purger semantics to preserve.
       try {
-        await invoke("delete_workspace", { id: workspace.id });
+        await invoke("forget_workspace", { id: workspaceId });
       } catch (e) {
-        setError(`delete failed: ${String(e)}`);
+        // Workspace may already be gone (e.g. invoke rejected before the
+        // draft was even inserted) — not fatal, just log and move on.
+        console.warn("forget_workspace failed:", e);
       }
     },
     [],
   );
+
+  const handleDelete = useCallback(async (workspace: Workspace) => {
+    setSelectedId((cur) => (cur === workspace.id ? null : cur));
+    // CreationFailed entries have no worktrees on disk, so skip the
+    // soft-delete + 1-hour grace window and just drop from state.
+    const command =
+      workspace.status.kind === "creation_failed"
+        ? "forget_workspace"
+        : "delete_workspace";
+    try {
+      await invoke(command, { id: workspace.id });
+    } catch (e) {
+      setError(`delete failed: ${String(e)}`);
+    }
+  }, []);
 
   const handleArchiveToggle = useCallback(async (workspace: Workspace) => {
     try {
@@ -342,19 +307,30 @@ function App() {
     }
   }, []);
 
-  // Receives the unified order (workspace ids and pending tempIds mixed)
-  // from the sidebar drag handler. Persistence happens via the displayOrder
-  // sync effect — this just commits the new order to React state.
-  const handleReorder = useCallback((newOrder: string[]) => {
-    setDisplayOrder(newOrder);
+  const handleReorder = useCallback(async (ids: WorkspaceId[]) => {
+    // Optimistically reorder so the drop animation lands on the right row,
+    // then fire the backend command. The `workspace:reordered` event also
+    // drives a refresh — doing this here avoids the round-trip flicker.
+    setWorkspaces((prev) => {
+      const byId = new Map(prev.map((w) => [w.id, w]));
+      const moved: Workspace[] = [];
+      for (const id of ids) {
+        const w = byId.get(id);
+        if (w) moved.push(w);
+      }
+      const idsSet = new Set(ids);
+      const rest = prev.filter((w) => !idsSet.has(w.id));
+      return [...moved, ...rest];
+    });
+    try {
+      await invoke("reorder_workspaces", { ids });
+    } catch (e) {
+      setError(`reorder failed: ${String(e)}`);
+    }
   }, []);
 
   const registryOk = registry?.kind === "ok";
-  const showingPendingId = useMemo(
-    () =>
-      pendingCreates.find((p) => p.tempId === selectedId)?.tempId ?? null,
-    [pendingCreates, selectedId],
-  );
+  const selectedRun = selectedId ? creationRuns.get(selectedId) ?? null : null;
 
   return (
     <ThemeContext.Provider value={theme}>
@@ -374,13 +350,7 @@ function App() {
         <Sidebar
           workspaces={visibleWorkspaces}
           selectedId={selectedId}
-          pendingCreates={pendingCreates.map((p) => ({
-            tempId: p.tempId,
-            branch: p.branch,
-          }))}
-          displayOrder={displayOrder}
           onSelect={setSelectedId}
-          onSelectPending={(tempId) => setSelectedId(tempId)}
           onReorder={handleReorder}
           onArchiveToggle={handleArchiveToggle}
           onDelete={handleDelete}
@@ -407,20 +377,22 @@ function App() {
             />
           )}
         {/*
-          Mount one runner per pending create so each job stays alive
-          regardless of which pane is visible. The runner only renders its
-          JobLogPane when its tempId matches the current selection.
+          Mount one runner per in-flight creation so the invoke stays
+          alive — and its JobEvents stay in component state — regardless
+          of which pane is visible. The runner only renders its
+          JobLogPane when its workspace id is the current selection.
         */}
-        {pendingCreates.map((p) => (
-          <PendingCreateRunner
-            key={p.tempId}
-            pending={p}
-            isShown={p.tempId === showingPendingId}
+        {Array.from(creationRuns.entries()).map(([id, args]) => (
+          <CreationRunner
+            key={id}
+            workspaceId={id}
+            args={args}
+            isShown={id === selectedId}
             onSuccess={handleCreateSuccess}
-            onDismiss={() => handleCreateDismiss(p.tempId)}
+            onDismiss={() => handleCreationDismiss(id)}
           />
         ))}
-        {!showingPendingId && selected && (
+        {!selectedRun && selected && selected.status.kind === "ready" && (
           <WorkspaceDetail
             workspace={selected}
             sessions={sessionsByWorkspace.get(selected.id) ?? []}
@@ -437,7 +409,7 @@ function App() {
             onRepoAdded={refresh}
           />
         )}
-        {!showingPendingId && !selected && registryOk && (
+        {!selectedRun && !selected && registryOk && (
           <div className="placeholder">
             Select a workspace, or create one to get started.
           </div>
@@ -448,14 +420,19 @@ function App() {
         <CreateWorkspaceDialog
           repos={registry.registry.repos}
           onClose={() => setCreating(false)}
-          onSubmit={(args) => {
+          onSubmit={(partial) => {
             setCreating(false);
-            const tempId = `pending:${crypto.randomUUID()}`;
-            setPendingCreates((prev) => [
-              ...prev,
-              { tempId, branch: args.branch, args },
-            ]);
-            setSelectedId(tempId);
+            // Mint the workspace id on the frontend so we can select the
+            // row before the backend has even started provisioning. The
+            // backend uses the same id when it inserts the Creating draft.
+            const id = crypto.randomUUID();
+            const args: CreateWorkspaceArgs = { ...partial, workspace_id: id };
+            setCreationRuns((prev) => {
+              const next = new Map(prev);
+              next.set(id, args);
+              return next;
+            });
+            setSelectedId(id);
           }}
         />
       )}
@@ -465,37 +442,39 @@ function App() {
 }
 
 /**
- * Drives one in-flight `create_workspace` job. Stays mounted for the full
- * lifetime of the pending entry so the job keeps running while the user
- * navigates around; renders the JobLogPane only when its tempId is the
- * selected pane.
+ * Drives one in-flight `create_workspace` invoke. Stays mounted for the
+ * full lifetime of the entry in `creationRuns`, so JobEvents accumulate in
+ * component state regardless of navigation; renders the JobLogPane only
+ * when its workspace id is the current selection.
  */
-function PendingCreateRunner({
-  pending,
+function CreationRunner({
+  workspaceId,
+  args,
   isShown,
   onSuccess,
   onDismiss,
 }: {
-  pending: PendingCreate;
+  workspaceId: WorkspaceId;
+  args: CreateWorkspaceArgs;
   isShown: boolean;
-  onSuccess: (tempId: string, result: unknown) => void;
+  onSuccess: (workspaceId: WorkspaceId, result: unknown) => void;
   onDismiss: () => void;
 }) {
   const descriptor = useMemo<JobDescriptor>(
     () => ({
-      key: pending.tempId,
+      key: workspaceId,
       command: "create_workspace",
-      args: { args: pending.args },
+      args: { args },
     }),
-    [pending.tempId, pending.args],
+    [workspaceId, args],
   );
   const { events, state } = useBackendJob(descriptor, {
-    onSuccess: (_key, result) => onSuccess(pending.tempId, result),
+    onSuccess: (_key, result) => onSuccess(workspaceId, result),
   });
   if (!isShown) return null;
   return (
     <JobLogPane
-      title={`Creating ${pending.branch}`}
+      title={`Creating ${args.branch}`}
       events={events}
       state={state}
       onDismiss={onDismiss}
@@ -1374,6 +1353,10 @@ function loadLastRepoSelection(repos: Repo[]): Set<string> {
   return available;
 }
 
+/** Dialog emits everything *except* the workspace id — App mints that and
+ *  merges it in before invoking. */
+type CreateWorkspaceFormArgs = Omit<CreateWorkspaceArgs, "workspace_id">;
+
 function CreateWorkspaceDialog({
   repos,
   onClose,
@@ -1381,7 +1364,7 @@ function CreateWorkspaceDialog({
 }: {
   repos: Repo[];
   onClose: () => void;
-  onSubmit: (args: CreateWorkspaceArgs) => void;
+  onSubmit: (args: CreateWorkspaceFormArgs) => void;
 }) {
   const [branch, setBranch] = useState("");
   const [selected, setSelected] = useState<Set<string>>(() =>

@@ -23,7 +23,7 @@ use crate::registry::{self, starter_template, RegistryLoad, Repo};
 use crate::sessions::{SessionInfo, SessionSupervisor};
 use crate::setup;
 use crate::state::{
-    new_workspace_id, ClaudeSessionMeta, RepoLink, SystemErrorEntry, Workspace, WorkspaceId,
+    ClaudeSessionMeta, RepoLink, SystemErrorEntry, Workspace, WorkspaceId, WorkspaceStatus,
 };
 use crate::store::Store;
 use crate::theme::Theme;
@@ -131,6 +131,11 @@ pub async fn open_in_vscode(
 
 #[derive(Debug, Deserialize)]
 pub struct CreateWorkspaceArgs {
+    /// Frontend-minted UUID. Lets us insert a `Creating` draft into state
+    /// immediately, so the sidebar row appears in its final position from
+    /// the moment the user clicks Create — no later reorder, no parallel
+    /// "pending" concept.
+    pub workspace_id: WorkspaceId,
     pub branch: String,
     pub repo_selections: Vec<String>,
     /// Optional alternate entry-point binary name (e.g. `claude-hipaa`).
@@ -170,8 +175,24 @@ async fn provision_repo_worktree(ctx: RepoProvision<'_>) -> AppResult<RepoLink> 
         )));
     }
 
-    git::worktree_add(&clone_path, ctx.worktree_path, ctx.branch, ctx.tx, &ctx.repo.key)
-        .await?;
+    // If the branch already exists on the remote, create the local branch
+    // tracking it instead of branching off HEAD — saves the manual
+    // upstream-set + reset dance.
+    let track_from = if git::remote_branch_exists(&clone_path, "origin", ctx.branch).await? {
+        Some(format!("origin/{}", ctx.branch))
+    } else {
+        None
+    };
+
+    git::worktree_add(
+        &clone_path,
+        ctx.worktree_path,
+        ctx.branch,
+        track_from.as_deref(),
+        ctx.tx,
+        &ctx.repo.key,
+    )
+    .await?;
 
     claude_local::install_symlink(
         ctx.worktree_path,
@@ -238,12 +259,13 @@ async fn teardown_repo_worktree(ctx: RepoTeardown<'_>) {
 }
 
 /// Orchestrates clone + worktree add + setup script for every selected repo,
-/// streaming progress to the frontend via `on_event`. On any failure, tears
-/// down every worktree it already created before returning the error.
+/// streaming progress to the frontend via `on_event`.
 ///
-/// The workspace only lands in `AppState` on full success — so a crash mid-way
-/// leaves worktrees on disk but no `state.json` entry (handled by the
-/// boot-time reconciler).
+/// The workspace lands in `AppState` as `Creating` *before* any I/O so the
+/// sidebar row appears at its final position from t=0; on success it flips
+/// to `Ready`, on failure to `CreationFailed { error }` (and the worktrees
+/// get torn down). The boot-time prune in `Store::load` clears any non-Ready
+/// entries left by a crashed run.
 #[tauri::command]
 pub async fn create_workspace(
     app: AppHandle,
@@ -254,6 +276,10 @@ pub async fn create_workspace(
     args: CreateWorkspaceArgs,
     on_event: Channel<JobEvent>,
 ) -> AppResult<Workspace> {
+    let id = args.workspace_id.trim().to_string();
+    if id.is_empty() {
+        return Err(AppError::Other("workspace_id is required".into()));
+    }
     let branch = args.branch.trim().to_string();
     if branch.is_empty() {
         return Err(AppError::Other("branch is required".into()));
@@ -284,7 +310,6 @@ pub async fn create_workspace(
         })
         .collect::<AppResult<Vec<_>>>()?;
 
-    let id = new_workspace_id();
     let workspace_dir = registry::sanitize_branch_for_dir(&branch);
     // Block collisions before we start cloning/fetching. Two workspaces with
     // the same branch on different repo sets would otherwise share a parent
@@ -297,6 +322,36 @@ pub async fn create_workspace(
             workspace_root.display()
         )));
     }
+
+    // Insert the draft now so the sidebar row exists for the entire
+    // provisioning lifetime. `status=Creating` drives the spinner UI; later
+    // mutations flip it to `Ready` or `CreationFailed` in place — id and
+    // position never change.
+    let draft = Workspace {
+        id: id.clone(),
+        branch: branch.clone(),
+        created_at: Utc::now(),
+        repo_links: Vec::new(),
+        sessions: Vec::new(),
+        claude_binary: claude_binary.clone(),
+        deleted_at: None,
+        archived_at: None,
+        status: WorkspaceStatus::Creating,
+    };
+    store
+        .mutate(|s| {
+            if s.workspaces.iter().any(|w| w.id == draft.id) {
+                return Err(AppError::Other(format!(
+                    "workspace_id collision: {} is already in state",
+                    draft.id
+                )));
+            }
+            s.workspaces.insert(0, draft.clone());
+            Ok(())
+        })
+        .await?;
+    emit_workspace_changed(&app, &id);
+
     // Register as in-progress so the reconciler doesn't flag our worktree
     // dirs as orphans mid-create. Guard removes the entry on drop — normal
     // return, `?`, panic, or task cancellation.
@@ -322,21 +377,14 @@ pub async fn create_workspace(
 
     match orchestrate.await {
         Ok(created_links) => {
-            let workspace = Workspace {
-                id: id.clone(),
-                branch,
-                created_at: Utc::now(),
-                repo_links: created_links,
-                sessions: Vec::new(),
-                claude_binary,
-                deleted_at: None,
-                archived_at: None,
-            };
-
             let stored = store
                 .mutate(|s| {
-                    s.workspaces.insert(0, workspace.clone());
-                    Ok(workspace.clone())
+                    let ws = s
+                        .find_workspace_mut(&id)
+                        .ok_or_else(|| AppError::WorkspaceNotFound(id.clone()))?;
+                    ws.repo_links = created_links;
+                    ws.status = WorkspaceStatus::Ready;
+                    Ok(ws.clone())
                 })
                 .await?;
 
@@ -376,6 +424,24 @@ pub async fn create_workspace(
                     warn!(path = %parent.display(), error = %e, "failed to remove partial workspace dir");
                 }
             }
+
+            // Flip the draft to CreationFailed so the row stays put with the
+            // error visible in the detail pane. The user dismisses via the
+            // existing `forget_workspace` command.
+            let mutate_result = store
+                .mutate(|s| {
+                    if let Some(ws) = s.find_workspace_mut(&id) {
+                        ws.status = WorkspaceStatus::CreationFailed {
+                            error: msg.clone(),
+                        };
+                    }
+                    Ok(())
+                })
+                .await;
+            if let Err(mutate_err) = mutate_result {
+                warn!(error = %mutate_err, "failed to mark workspace as CreationFailed");
+            }
+            emit_workspace_changed(&app, &id);
 
             let _ = tx.0.send(JobEvent::Failed { error: msg });
             Err(e)

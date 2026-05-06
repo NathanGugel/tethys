@@ -205,12 +205,21 @@ pub async fn pull_clone(clone_path: &Path, tx: &JobTx, repo: &str) -> AppResult<
     Ok(())
 }
 
-/// `git -C <clone_path> worktree add <worktree_path> -b <branch>`.
-/// Creates a new branch `<branch>` off the clone's current HEAD.
+/// Creates a new branch `<branch>` and a worktree checking it out.
+///
+/// With `track_from = None`: `git worktree add <worktree_path> -b <branch>` —
+/// new branch starts at the clone's current HEAD with no upstream.
+///
+/// With `track_from = Some("origin/<branch>")`:
+/// `git worktree add --track -b <branch> <worktree_path> origin/<branch>` —
+/// new branch starts at the remote ref and is set to track it. Used when the
+/// caller has already verified the remote branch exists, so the worktree
+/// lands on the remote's commit with upstream wired up in one step.
 pub async fn worktree_add(
     clone_path: &Path,
     worktree_path: &Path,
     branch: &str,
+    track_from: Option<&str>,
     tx: &JobTx,
     repo: &str,
 ) -> AppResult<()> {
@@ -223,22 +232,23 @@ pub async fn worktree_add(
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    let status = run_streamed(
-        "git",
-        [
-            "-C".as_ref(),
-            clone_path.as_os_str(),
-            "worktree".as_ref(),
-            "add".as_ref(),
-            worktree_path.as_os_str(),
-            "-b".as_ref(),
-            branch.as_ref(),
-        ],
-        None,
-        tx,
-        Some(repo),
-    )
-    .await?;
+    let mut args: Vec<&OsStr> = vec![
+        "-C".as_ref(),
+        clone_path.as_os_str(),
+        "worktree".as_ref(),
+        "add".as_ref(),
+    ];
+    if track_from.is_some() {
+        args.push("--track".as_ref());
+    }
+    args.push("-b".as_ref());
+    args.push(branch.as_ref());
+    args.push(worktree_path.as_os_str());
+    if let Some(start_point) = track_from {
+        args.push(start_point.as_ref());
+    }
+
+    let status = run_streamed("git", args, None, tx, Some(repo)).await?;
 
     if !status.success() {
         return Err(AppError::Other(format!(
@@ -254,14 +264,29 @@ pub async fn worktree_add(
 /// Returns true if the branch exists locally in the clone. Non-zero exit
 /// means the branch doesn't exist — not an error.
 pub async fn branch_exists(clone_path: &Path, branch: &str) -> AppResult<bool> {
-    let refspec = format!("refs/heads/{branch}");
+    show_ref_exists(clone_path, &format!("refs/heads/{branch}")).await
+}
+
+/// `git -C <clone_path> show-ref --verify --quiet refs/remotes/<remote>/<branch>`.
+/// Returns true if the remote-tracking branch exists in the clone. The clone
+/// is expected to be freshly pulled before this is called, so a `true` here
+/// means the branch is genuinely present on the remote.
+pub async fn remote_branch_exists(
+    clone_path: &Path,
+    remote: &str,
+    branch: &str,
+) -> AppResult<bool> {
+    show_ref_exists(clone_path, &format!("refs/remotes/{remote}/{branch}")).await
+}
+
+async fn show_ref_exists(clone_path: &Path, refspec: &str) -> AppResult<bool> {
     let output = tokio::process::Command::new("git")
         .arg("-C")
         .arg(clone_path)
         .arg("show-ref")
         .arg("--verify")
         .arg("--quiet")
-        .arg(&refspec)
+        .arg(refspec)
         .output()
         .await
         .map_err(|e| AppError::Other(format!("git show-ref: {e}")))?;
