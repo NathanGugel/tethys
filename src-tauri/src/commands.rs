@@ -202,6 +202,8 @@ async fn provision_repo_worktree(ctx: RepoProvision<'_>) -> AppResult<RepoLink> 
     )
     .await?;
 
+    copy_env_from_clone(&clone_path, ctx.worktree_path, ctx.tx, &ctx.repo.key).await?;
+
     let mut link = RepoLink {
         repo_key: ctx.repo.key.clone(),
         worktree_path: ctx.worktree_path.to_path_buf(),
@@ -227,6 +229,34 @@ async fn provision_repo_worktree(ctx: RepoProvision<'_>) -> AppResult<RepoLink> 
     }
 
     Ok(link)
+}
+
+/// Copy `<clone_path>/.env` into the new worktree if it exists. `.env` is
+/// gitignored in most repos, so `git worktree add` won't carry it over —
+/// but setup scripts and dev servers usually need it. Missing source is a
+/// silent no-op; an existing `.env` in the worktree is left alone.
+async fn copy_env_from_clone(
+    clone_path: &Path,
+    worktree_path: &Path,
+    tx: &JobTx,
+    repo_key: &str,
+) -> AppResult<()> {
+    let src = clone_path.join(".env");
+    match tokio::fs::symlink_metadata(&src).await {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(AppError::Io(e)),
+    }
+
+    let dst = worktree_path.join(".env");
+    if tokio::fs::try_exists(&dst).await? {
+        return Ok(());
+    }
+
+    tokio::fs::copy(&src, &dst).await?;
+    tx.status("copied .env from clone", Some(repo_key));
+    Ok(())
 }
 
 struct RepoTeardown<'a> {
