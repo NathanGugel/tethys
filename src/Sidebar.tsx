@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   DndContext,
+  DragOverlay,
   KeyboardSensor,
   PointerSensor,
   closestCenter,
   useSensor,
   useSensors,
   type DragEndEvent,
+  type DragStartEvent,
   type DraggableAttributes,
 } from "@dnd-kit/core";
 import type { SyntheticListenerMap } from "@dnd-kit/core/dist/hooks/utilities";
@@ -63,6 +65,7 @@ export function Sidebar({
     x: number;
     y: number;
   } | null>(null);
+  const [activeId, setActiveId] = useState<WorkspaceId | null>(null);
 
   const sensors = useSensors(
     // 5px activation distance prevents a single click from being interpreted
@@ -73,7 +76,12 @@ export function Sidebar({
     }),
   );
 
+  const handleDragStart = (event: DragStartEvent) => {
+    setActiveId(event.active.id as WorkspaceId);
+  };
+
   const handleDragEnd = (event: DragEndEvent) => {
+    setActiveId(null);
     const { active: dragged, over } = event;
     if (!over || dragged.id === over.id) return;
     const from = active.findIndex((w) => w.id === dragged.id);
@@ -81,6 +89,10 @@ export function Sidebar({
     if (from < 0 || to < 0) return;
     onReorder(arrayMove(active, from, to).map((w) => w.id));
   };
+
+  const activeWorkspace = activeId
+    ? active.find((w) => w.id === activeId) ?? null
+    : null;
 
   return (
     <>
@@ -91,7 +103,9 @@ export function Sidebar({
         <DndContext
           sensors={sensors}
           collisionDetection={closestCenter}
+          onDragStart={handleDragStart}
           onDragEnd={handleDragEnd}
+          onDragCancel={() => setActiveId(null)}
         >
           <SortableContext
             items={active.map((w) => w.id)}
@@ -108,6 +122,18 @@ export function Sidebar({
               />
             ))}
           </SortableContext>
+          <DragOverlay>
+            {activeWorkspace ? (
+              <WorkspaceRow
+                workspace={activeWorkspace}
+                selected={activeWorkspace.id === selectedId}
+                needsTurn={workspaceNeedsTurn(activeWorkspace)}
+                isDragging
+                onSelect={() => {}}
+                onContextMenu={() => {}}
+              />
+            ) : null}
+          </DragOverlay>
         </DndContext>
 
         {archived.length > 0 && (
@@ -170,7 +196,7 @@ function SortableWorkspaceRow({
   const style = {
     transform: CSS.Transform.toString(transform),
     transition,
-    zIndex: isDragging ? 10 : undefined,
+    opacity: isDragging ? 0 : undefined,
   };
 
   return (
