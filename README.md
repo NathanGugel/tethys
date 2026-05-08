@@ -19,4 +19,4 @@ State lives at `~/Library/Application Support/app.tethys.dev/`. On boot, Tethys 
 
 ## Status
 
-Personal tool, macOS-only, not packaged for distribution. Public so friends can poke around the code.
+Personal tool, macOS-only, not packaged for distribution
