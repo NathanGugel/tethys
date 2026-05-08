@@ -1263,7 +1263,11 @@ button.danger.primary:hover:not(:disabled) {
   opacity: 0.55;
 }
 
-.workspace-list > li.is-dragging {
+/* `.is-dragging` is matched without the `.workspace-list >` prefix so the
+   styles still apply when dnd-kit's DragOverlay wraps the row in its own
+   positioning div, breaking the direct-child relationship. */
+.workspace-list > li.is-dragging,
+li.is-dragging {
   cursor: grabbing;
   background: var(--sidebar-bg);
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);

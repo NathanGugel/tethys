@@ -76,6 +76,21 @@ export function Sidebar({
     }),
   );
 
+  // Defensive: clear stuck drag state if the dragged workspace falls out of
+  // the list (archived/deleted mid-drag), or if the window loses focus.
+  useEffect(() => {
+    if (activeId && !active.some((w) => w.id === activeId)) {
+      setActiveId(null);
+    }
+  }, [activeId, active]);
+
+  useEffect(() => {
+    if (!activeId) return;
+    const clear = () => setActiveId(null);
+    window.addEventListener("blur", clear);
+    return () => window.removeEventListener("blur", clear);
+  }, [activeId]);
+
   const handleDragStart = (event: DragStartEvent) => {
     setActiveId(event.active.id as WorkspaceId);
   };
