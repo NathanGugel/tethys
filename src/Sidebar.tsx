@@ -269,7 +269,9 @@ function WorkspaceRow({
     >
       <div className="workspace-name">
         {status === "creating" && <Spinner />}
-        {workspace.branch}
+        <span className="workspace-name-text" title={workspace.branch}>
+          {workspace.branch}
+        </span>
         {status === "ready" && needsTurn && (
           <span
             className="turn-dot"

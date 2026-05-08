@@ -106,6 +106,14 @@ html,
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
+}
+
+.workspace-name-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .workspace-list > li.pending {
