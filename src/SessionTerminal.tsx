@@ -163,24 +163,30 @@ export function SessionTerminal({ sessionId }: Props) {
         return false;
       }
 
-      // Cmd+Delete (mac "Delete" = Backspace) → delete previous word.
-      if (ev.key === "Backspace" && ev.metaKey && !ev.altKey && !ev.ctrlKey) {
+      // macOS line/word editing. Convention: Cmd = whole line, Alt = word.
+      // Each row maps a (key + modifier) pair to a readline byte sequence
+      // that the underlying shell / Claude Code / TUI app understands.
+      const onlyCmd = ev.metaKey && !ev.altKey && !ev.ctrlKey && !ev.shiftKey;
+      const onlyAlt = ev.altKey && !ev.metaKey && !ev.ctrlKey && !ev.shiftKey;
+      type EditBind = { key: string; mod: "cmd" | "alt"; bytes: number[] };
+      const edits: EditBind[] = [
+        // Cmd → line operations.
+        { key: "ArrowLeft", mod: "cmd", bytes: [0x01] }, // Ctrl-A: beginning of line
+        { key: "ArrowRight", mod: "cmd", bytes: [0x05] }, // Ctrl-E: end of line
+        { key: "Backspace", mod: "cmd", bytes: [0x15] }, // Ctrl-U: kill to start of line
+        { key: "Delete", mod: "cmd", bytes: [0x0b] }, // Ctrl-K: kill to end of line
+        // Alt → word operations (the bindings Cmd used to do).
+        { key: "ArrowLeft", mod: "alt", bytes: [0x1b, 0x62] }, // Esc-b: previous word
+        { key: "ArrowRight", mod: "alt", bytes: [0x1b, 0x66] }, // Esc-f: next word
+        { key: "Backspace", mod: "alt", bytes: [0x17] }, // Ctrl-W: backward-kill-word
+        { key: "Delete", mod: "alt", bytes: [0x1b, 0x64] }, // Esc-d: kill-word forward
+      ];
+      for (const { key, mod, bytes } of edits) {
+        if (ev.key !== key) continue;
+        if (mod === "cmd" && !onlyCmd) continue;
+        if (mod === "alt" && !onlyAlt) continue;
         ev.preventDefault();
-        sendRaw([0x17]); // Ctrl-W / readline backward-kill-word
-        return false;
-      }
-
-      // Cmd+Left → previous word (Alt-b).
-      if (ev.key === "ArrowLeft" && ev.metaKey && !ev.altKey && !ev.ctrlKey) {
-        ev.preventDefault();
-        sendRaw([0x1b, 0x62]);
-        return false;
-      }
-
-      // Cmd+Right → next word (Alt-f).
-      if (ev.key === "ArrowRight" && ev.metaKey && !ev.altKey && !ev.ctrlKey) {
-        ev.preventDefault();
-        sendRaw([0x1b, 0x66]);
+        sendRaw(bytes);
         return false;
       }
 
