@@ -145,6 +145,8 @@ export interface SessionInfo {
   running: boolean;
   runtime_state: SessionRuntimeState;
   notification_type: string | null;
+  /** User dismissed the "your turn" indicator; reset on next state transition. */
+  turn_acknowledged: boolean;
 }
 
 export interface TurnChangedEvent {
@@ -152,6 +154,7 @@ export interface TurnChangedEvent {
   session_id: string;
   runtime_state: SessionRuntimeState;
   notification_type: string | null;
+  turn_acknowledged: boolean;
 }
 
 export interface GithubStatusChangedEvent {

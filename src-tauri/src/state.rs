@@ -110,6 +110,13 @@ pub struct ClaudeSessionMeta {
     /// leaves `WaitingInput`.
     #[serde(default)]
     pub notification_type: Option<String>,
+    /// User dismissed the "your turn" indicator for this session via the
+    /// sidebar context menu. Reset to `false` on the next `runtime_state`
+    /// transition (a state change is the user-facing signal that something
+    /// fresh happened, so the dot should re-light). Persisted so the
+    /// dismissal survives a Tethys restart.
+    #[serde(default)]
+    pub turn_acknowledged: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -200,6 +207,7 @@ mod tests {
         let session = &parsed.workspaces[0].sessions[0];
         assert!(session.runtime_state.is_none());
         assert!(session.notification_type.is_none());
+        assert!(!session.turn_acknowledged);
     }
 
     #[test]

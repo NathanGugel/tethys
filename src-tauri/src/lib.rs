@@ -243,6 +243,7 @@ pub fn run() {
             commands::remove_orphan_dir,
             commands::forget_workspace,
             commands::list_sessions,
+            commands::acknowledge_session_turn,
             commands::start_claude_session,
             commands::resume_claude_session,
             commands::set_claude_session_hidden,
@@ -275,6 +276,7 @@ fn prewarm_live_sessions(
         cwd: std::path::PathBuf,
         runtime_state: Option<crate::state::SessionRuntimeState>,
         notification_type: Option<String>,
+        turn_acknowledged: bool,
     }
 
     let candidates: Vec<PrewarmCandidate> = tauri::async_runtime::block_on(async {
@@ -290,6 +292,7 @@ fn prewarm_live_sessions(
                             cwd: meta.cwd.clone(),
                             runtime_state: meta.runtime_state,
                             notification_type: meta.notification_type.clone(),
+                            turn_acknowledged: meta.turn_acknowledged,
                         });
                     }
                 }
@@ -315,7 +318,12 @@ fn prewarm_live_sessions(
                 // restarts. `reattach_tmux` defaults the entry to Working;
                 // override it here. If nothing was persisted, leave Working.
                 if let Some(state) = c.runtime_state {
-                    supervisor.seed_turn(&c.session_id, state, c.notification_type);
+                    supervisor.seed_turn(
+                        &c.session_id,
+                        state,
+                        c.notification_type,
+                        c.turn_acknowledged,
+                    );
                 }
             }
             Err(e) => warn!(session_id = %c.session_id, error = %e, "pre-warm reattach failed"),

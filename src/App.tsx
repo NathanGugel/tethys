@@ -45,18 +45,20 @@ function App() {
   /**
    * Per-session turn state tracked by listening to `session:turn_changed`
    * globally. Used for the sidebar attention dot without needing to
-   * fetch sessions for every workspace.
+   * fetch sessions for every workspace. `acknowledged` mirrors the
+   * persisted `turn_acknowledged` flag — the user's dismissal of the dot,
+   * cleared server-side on the next runtime_state transition.
    */
   const [turnStates, setTurnStates] = useState<
-    Map<string, { workspaceId: string; state: SessionRuntimeState }>
+    Map<
+      string,
+      {
+        workspaceId: string;
+        state: SessionRuntimeState;
+        acknowledged: boolean;
+      }
+    >
   >(new Map());
-  /**
-   * Session IDs whose attention state the user dismissed via the sidebar
-   * right-click "Clear notification". Any subsequent `turn_changed` event
-   * for the session re-enables the dot — this is a one-shot mute, not a
-   * persistent pause.
-   */
-  const [clearedTurns, setClearedTurns] = useState<Set<string>>(new Set());
   /**
    * Sessions for every workspace, cached so switching into a workspace
    * shows the terminal immediately instead of flashing "Dormant" during
@@ -84,8 +86,13 @@ function App() {
   });
 
   useTauriEvent<TurnChangedEvent>("session:turn_changed", (event) => {
-    const { workspace_id, session_id, runtime_state, notification_type } =
-      event.payload;
+    const {
+      workspace_id,
+      session_id,
+      runtime_state,
+      notification_type,
+      turn_acknowledged,
+    } = event.payload;
     setTurnStates((prev) => {
       const next = new Map(prev);
       if (runtime_state === "dormant") {
@@ -94,17 +101,9 @@ function App() {
         next.set(session_id, {
           workspaceId: workspace_id,
           state: runtime_state,
+          acknowledged: turn_acknowledged,
         });
       }
-      return next;
-    });
-    // Any new event for this session lifts a prior "Clear notification" —
-    // a state change is the user-facing signal that something fresh
-    // happened.
-    setClearedTurns((prev) => {
-      if (!prev.has(session_id)) return prev;
-      const next = new Set(prev);
-      next.delete(session_id);
       return next;
     });
     // Keep the cached SessionInfo[] in sync so WorkspaceDetail sees the
@@ -121,6 +120,7 @@ function App() {
                 ...s,
                 runtime_state,
                 notification_type: notification_type ?? null,
+                turn_acknowledged,
               }
             : s,
         ),
@@ -147,28 +147,33 @@ function App() {
   const workspaceNeedsTurn = useCallback(
     (w: Workspace): boolean => {
       if (w.archived_at) return false;
-      for (const [sessionId, info] of turnStates) {
+      for (const info of turnStates.values()) {
         if (info.workspaceId !== w.id) continue;
         if (info.state !== "idle" && info.state !== "waiting_input") continue;
-        if (clearedTurns.has(sessionId)) continue;
+        if (info.acknowledged) continue;
         return true;
       }
       return false;
     },
-    [turnStates, clearedTurns],
+    [turnStates],
   );
 
   const handleClearTurn = useCallback(
     (workspace: Workspace) => {
-      setClearedTurns((prev) => {
-        const next = new Set(prev);
-        for (const [sessionId, info] of turnStates) {
-          if (info.workspaceId !== workspace.id) continue;
-          if (info.state !== "idle" && info.state !== "waiting_input") continue;
-          next.add(sessionId);
-        }
-        return next;
-      });
+      // Backend persists turn_acknowledged + emits session:turn_changed
+      // back, which updates turnStates. No optimistic local update needed —
+      // the round-trip is fast and the persisted flag is the source of truth.
+      for (const [sessionId, info] of turnStates) {
+        if (info.workspaceId !== workspace.id) continue;
+        if (info.state !== "idle" && info.state !== "waiting_input") continue;
+        if (info.acknowledged) continue;
+        invoke("acknowledge_session_turn", {
+          workspaceId: workspace.id,
+          sessionId,
+        }).catch((e) =>
+          console.error("acknowledge_session_turn failed:", e),
+        );
+      }
     },
     [turnStates],
   );
@@ -191,7 +196,11 @@ function App() {
       setTurnStates((prev) => {
         let next: Map<
           string,
-          { workspaceId: string; state: SessionRuntimeState }
+          {
+            workspaceId: string;
+            state: SessionRuntimeState;
+            acknowledged: boolean;
+          }
         > | null = null;
         const ensure = () => {
           if (!next) next = new Map(prev);
@@ -206,9 +215,14 @@ function App() {
           if (
             !cur ||
             cur.state !== s.runtime_state ||
-            cur.workspaceId !== workspaceId
+            cur.workspaceId !== workspaceId ||
+            cur.acknowledged !== s.turn_acknowledged
           ) {
-            ensure().set(s.id, { workspaceId, state: s.runtime_state });
+            ensure().set(s.id, {
+              workspaceId,
+              state: s.runtime_state,
+              acknowledged: s.turn_acknowledged,
+            });
           }
         }
         return next ?? prev;

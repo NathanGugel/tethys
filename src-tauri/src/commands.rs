@@ -879,6 +879,17 @@ pub fn list_sessions(
     supervisor.list_for_workspace(&workspace_id)
 }
 
+#[tauri::command]
+pub async fn acknowledge_session_turn(
+    supervisor: State<'_, Arc<SessionSupervisor>>,
+    workspace_id: WorkspaceId,
+    session_id: String,
+) -> AppResult<()> {
+    supervisor
+        .acknowledge_turn(&session_id, &workspace_id)
+        .await
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct StartClaudeArgs {
     pub workspace_id: WorkspaceId,
@@ -1069,6 +1080,7 @@ async fn spawn_claude(
         hidden: false,
         runtime_state: None,
         notification_type: None,
+        turn_acknowledged: false,
     };
 
     store
