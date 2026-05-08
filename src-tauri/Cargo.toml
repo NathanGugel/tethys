@@ -2,7 +2,7 @@
 name = "tethys"
 version = "0.1.0"
 description = "Tethys — manage multiple Claude Code sessions across git worktrees"
-authors = ["Ryan Baxley <ryan.baxley@newlantern.ai>"]
+authors = ["Ryan Baxley"]
 edition = "2021"
 
 [lib]

@@ -161,24 +161,4 @@ mod tests {
         assert_eq!(clamp_byte(-0.1), 0);
         assert_eq!(clamp_byte(1.1), 255);
     }
-
-    #[test]
-    fn parses_catppuccin_mocha_if_available() {
-        // Skipped unless the known-good fixture is on disk. Keeps the smoke
-        // test local without shipping a copy.
-        let path = std::path::Path::new(
-            "/Users/ryan/code/iterm-themes/catppuccin/colors/catppuccin-mocha.itermcolors",
-        );
-        if !path.exists() {
-            return;
-        }
-        let theme = Theme::load_from_file(path).unwrap();
-        assert_eq!(theme.name, "catppuccin-mocha");
-        assert!(theme.colors.background.starts_with('#'));
-        assert_eq!(theme.colors.background.len(), 7);
-        assert_eq!(theme.colors.ansi.len(), 16);
-        for c in &theme.colors.ansi {
-            assert_eq!(c.len(), 7, "expected #rrggbb, got {c}");
-        }
-    }
 }

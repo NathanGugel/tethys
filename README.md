@@ -1,15 +1,22 @@
 # Tethys
 
-Tethys is going to be a UI for running multiple claude code instances in parallel. this is what i have so far:
+A macOS desktop app for running multiple Claude Code CLI sessions in parallel across git worktrees.
 
-there is a concept of a workspace
+Each "workspace" bundles N git worktrees (one per repo) with the Claude sessions running inside them. A companion hook binary listens to Claude Code's hook events so the app can flag "your turn" when a session is waiting on you, alongside live PR/CI status from GitHub.
 
-- a workspace has:
-  - a worktree for both the frontend + backend + other repos that are paired
-    - when creating a workspace, i can select which of these i want to create. they will each have their own startup script that does stuff like install deps
-  - some number (typically 1) claude instances that i can easily find and resume
-- i can delete the worktrees when i'm done and it cleans everything up
-- see pr status for whatever prs are attached to that workspace
-- i can open vscode for any of the repos in the worktree easily
-- if it's my turn (claude is asking question, or completed), its flagged
-- i can mark a workspace as "paused", it will not be flagged, until i revive one of the claude chats
+## Stack
+
+Tauri 2 · Rust (`src-tauri/`) · React + TypeScript (`src/`) · xterm.js for terminal rendering · `portable-pty` for PTY spawning · JSON file persistence · `tethys-hook` companion binary (`crates/tethys-hook/`) that forwards Claude Code hooks over a Unix socket.
+
+## Running
+
+```
+pnpm install
+pnpm tauri dev
+```
+
+State lives at `~/Library/Application Support/app.tethys.dev/`. On boot, Tethys writes idempotent hook entries into `~/.claude/settings.json` (keyed by `description: "Tethys session monitor"`).
+
+## Status
+
+Personal tool, macOS-only, not packaged for distribution. Public so friends can poke around the code.
