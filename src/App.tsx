@@ -223,6 +223,77 @@ function App() {
     () => workspaces.filter((w) => !w.deleted_at),
     [workspaces],
   );
+  // Navigable list for hotkeys: same set the sidebar's main "active"
+  // section shows (drops archived). Order matches the sidebar.
+  const navigableWorkspaces = useMemo(
+    () => visibleWorkspaces.filter((w) => !w.archived_at),
+    [visibleWorkspaces],
+  );
+
+  // Keep the latest values reachable from a stable keydown handler so we
+  // don't re-bind (and tear down) the window listener on every render.
+  const navRef = useRef({
+    list: navigableWorkspaces,
+    selectedId,
+    needsTurn: workspaceNeedsTurn,
+  });
+  navRef.current = {
+    list: navigableWorkspaces,
+    selectedId,
+    needsTurn: workspaceNeedsTurn,
+  };
+
+  useEffect(() => {
+    const step = (direction: 1 | -1, attentionOnly: boolean) => {
+      const { list, selectedId: cur, needsTurn } = navRef.current;
+      const pool = attentionOnly ? list.filter((w) => needsTurn(w)) : list;
+      if (pool.length === 0) return;
+      // Find the anchor inside the pool. When attentionOnly and the
+      // current selection has no dot, anchor by its position in the full
+      // list so direction still feels right.
+      let anchor = pool.findIndex((w) => w.id === cur);
+      if (anchor === -1 && attentionOnly && cur) {
+        const fullIdx = list.findIndex((w) => w.id === cur);
+        if (fullIdx !== -1) {
+          // Walk in `direction` until we hit a pool member.
+          for (
+            let i = direction === 1 ? fullIdx + 1 : fullIdx - 1;
+            i >= 0 && i < list.length;
+            i += direction
+          ) {
+            const hit = pool.findIndex((w) => w.id === list[i].id);
+            if (hit !== -1) {
+              setSelectedId(pool[hit].id);
+              return;
+            }
+          }
+          // Nothing in that direction — wrap.
+          setSelectedId(
+            direction === 1 ? pool[0].id : pool[pool.length - 1].id,
+          );
+          return;
+        }
+      }
+      if (anchor === -1) anchor = direction === 1 ? -1 : 0;
+      const next = (anchor + direction + pool.length) % pool.length;
+      setSelectedId(pool[next].id);
+    };
+
+    const handler = (e: KeyboardEvent) => {
+      // Cmd+Alt(+Shift) + J/K. `e.code` ignores Option's character
+      // remapping on macOS (Alt+J → ˝), so the binding survives layout.
+      if (!e.metaKey || !e.altKey || e.ctrlKey) return;
+      if (e.code !== "KeyJ" && e.code !== "KeyK") return;
+      const direction: 1 | -1 = e.code === "KeyK" ? 1 : -1;
+      e.preventDefault();
+      e.stopPropagation();
+      step(direction, e.shiftKey);
+    };
+    window.addEventListener("keydown", handler, { capture: true });
+    return () =>
+      window.removeEventListener("keydown", handler, { capture: true });
+  }, []);
+
   const selected = useMemo(() => {
     const ws = workspaces.find((w) => w.id === selectedId);
     if (!ws) return null;
