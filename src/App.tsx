@@ -183,6 +183,36 @@ function App() {
         next.set(workspaceId, list);
         return next;
       });
+      // Seed turnStates from the listing. The backend restores
+      // runtime_state from disk on boot via seed_turn but intentionally
+      // doesn't emit session:turn_changed (the frontend isn't subscribed
+      // yet) — without this, the sidebar dot stays dark across restarts
+      // until the next live event fires for that session.
+      setTurnStates((prev) => {
+        let next: Map<
+          string,
+          { workspaceId: string; state: SessionRuntimeState }
+        > | null = null;
+        const ensure = () => {
+          if (!next) next = new Map(prev);
+          return next;
+        };
+        for (const s of list) {
+          if (s.runtime_state === "dormant") {
+            if (prev.has(s.id)) ensure().delete(s.id);
+            continue;
+          }
+          const cur = prev.get(s.id);
+          if (
+            !cur ||
+            cur.state !== s.runtime_state ||
+            cur.workspaceId !== workspaceId
+          ) {
+            ensure().set(s.id, { workspaceId, state: s.runtime_state });
+          }
+        }
+        return next ?? prev;
+      });
     } catch (e) {
       console.error("list_sessions:", e);
     }
