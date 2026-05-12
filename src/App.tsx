@@ -4,15 +4,18 @@ import type {
   CreateWorkspaceArgs,
   Discrepancies,
   GithubStatusChangedEvent,
+  MemorySnapshot,
   RegistryStatus,
   Repo,
   SessionInfo,
+  SessionKind,
   SessionRuntimeState,
   Theme,
   TurnChangedEvent,
   Workspace,
   WorkspaceId,
 } from "./types";
+import { DevServerActions, SidebarMemoryPressure } from "./DevServerControls";
 import { GithubAuthFooter } from "./GithubAuthFooter";
 import { GithubChip } from "./GithubChip";
 import { JobLogPane } from "./JobLogPane";
@@ -32,6 +35,22 @@ function App() {
   const [selectedId, setSelectedId] = useState<WorkspaceId | null>(null);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * Latest memory snapshot. Subscribed once at the app level and passed
+   * down to Sidebar (footer pressure + per-row RAM chips) and to the
+   * dev-server action buttons (for the start gate). The 5s poll lands
+   * here; per-workspace bits flow out via `memory.per_workspace`.
+   */
+  const [memory, setMemory] = useState<MemorySnapshot | null>(null);
+  useTauriEvent<MemorySnapshot>("devserver:memory_updated", (e) => {
+    setMemory(e.payload);
+  });
+  // Seed the snapshot once so the UI isn't blank before the first poll.
+  useEffect(() => {
+    invoke<MemorySnapshot>("get_memory_snapshot")
+      .then(setMemory)
+      .catch(() => {});
+  }, []);
   /**
    * Args for create_workspace invocations the runner is currently driving,
    * keyed by workspace_id. The backend inserts a `Creating` draft into
@@ -471,8 +490,10 @@ function App() {
           onDelete={handleDelete}
           onClearTurn={handleClearTurn}
           workspaceNeedsTurn={workspaceNeedsTurn}
+          memory={memory}
         />
         <div className="sidebar-footer">
+          <SidebarMemoryPressure memory={memory} />
           <SystemStatus allWorkspaces={workspaces} />
           <GithubAuthFooter />
         </div>
@@ -826,7 +847,16 @@ function WorkspaceDetail({
   const liveById = new Map(sessions.map((s) => [s.id, s]));
   // Newest first — the most recently started session is usually what you
   // want to see. `workspace.sessions` is append-ordered on the backend.
-  const ordered = [...workspace.sessions].reverse();
+  // Claude sessions newest-first (existing behavior), then FE/BE Build
+  // sessions pinned to the end so the dev-server tabs don't push Claude
+  // chats around when you start dev servers.
+  const reversed = [...workspace.sessions].reverse();
+  const isDev = (m: typeof reversed[number]) =>
+    m.kind === "frontend_build" || m.kind === "backend_build";
+  const ordered = [
+    ...reversed.filter((m) => !isDev(m)),
+    ...reversed.filter(isDev),
+  ];
   const visibleOrdered = ordered.filter((m) => !m.hidden);
   const hiddenOrdered = ordered.filter((m) => m.hidden);
   const [showHidden, setShowHidden] = useState(false);
@@ -954,6 +984,7 @@ function WorkspaceDetail({
           >
             {workspace.archived_at ? "Unarchive" : "Archive"}
           </button>
+          <DevServerActions workspace={workspace} onChanged={onRepoAdded} />
           <button
             type="button"
             className="danger"
@@ -1041,7 +1072,13 @@ function WorkspaceDetail({
                   )}
                 </div>
               )}
-              <SessionTerminal sessionId={selectedLive.id} />
+              <SessionTerminal
+                sessionId={selectedLive.id}
+                readOnly={
+                  selected.kind === "frontend_build" ||
+                  selected.kind === "backend_build"
+                }
+              />
             </>
           ) : (
             <div className="session-dormant">
@@ -1090,6 +1127,10 @@ type ChipMeta = {
   id: string;
   repo_key: string | null;
   claude_session_id: string | null;
+  /** Defaults to "claude" on older state.json entries; non-claude kinds
+   *  (frontend_build / backend_build) render with a fixed label instead
+   *  of the id-slice, and skip the hide/unhide affordance. */
+  kind?: SessionKind;
 };
 
 function SessionChip({
@@ -1107,14 +1148,22 @@ function SessionChip({
   onSelect: (id: string) => void;
   onSetHidden: (id: string, hidden: boolean) => void;
 }) {
-  const label = meta.id.slice(0, 8);
+  const isDevServer =
+    meta.kind === "frontend_build" || meta.kind === "backend_build";
+  const label = isDevServer
+    ? meta.kind === "frontend_build"
+      ? "FE build"
+      : "BE build"
+    : meta.id.slice(0, 8);
   const needsTurn =
+    !isDevServer &&
     live?.running &&
     (live.runtime_state === "idle" || live.runtime_state === "waiting_input");
   const chipClass = [
     "session-chip",
     selected ? "active" : "",
     hidden ? "hidden" : "",
+    isDevServer ? "dev-server" : "",
   ]
     .filter(Boolean)
     .join(" ");
@@ -1137,19 +1186,21 @@ function SessionChip({
       <code>{label}</code>
       {needsTurn && <span className="turn-dot" />}
       {live && !live.running && <span className="chip-state">exited</span>}
-      {!live && <span className="chip-state">dormant</span>}
-      <button
-        type="button"
-        className="chip-x"
-        title={hidden ? "Show this chat" : "Hide this chat"}
-        aria-label={hidden ? "Show this chat" : "Hide this chat"}
-        onClick={(e) => {
-          e.stopPropagation();
-          onSetHidden(meta.id, !hidden);
-        }}
-      >
-        {hidden ? "↺" : "×"}
-      </button>
+      {!live && !isDevServer && <span className="chip-state">dormant</span>}
+      {!isDevServer && (
+        <button
+          type="button"
+          className="chip-x"
+          title={hidden ? "Show this chat" : "Hide this chat"}
+          aria-label={hidden ? "Show this chat" : "Hide this chat"}
+          onClick={(e) => {
+            e.stopPropagation();
+            onSetHidden(meta.id, !hidden);
+          }}
+        >
+          {hidden ? "↺" : "×"}
+        </button>
+      )}
     </div>
   );
 }
