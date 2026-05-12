@@ -21,8 +21,9 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 
-import type { Workspace, WorkspaceId } from "./types";
+import type { MemorySnapshot, Workspace, WorkspaceId } from "./types";
 import { GithubChip } from "./GithubChip";
+import { SidebarWorkspaceMemoryChip } from "./DevServerControls";
 
 type Props = {
   /** Workspaces that should appear in the sidebar (soft-deleted already filtered out). */
@@ -34,6 +35,10 @@ type Props = {
   onDelete: (ws: Workspace) => void;
   onClearTurn: (ws: Workspace) => void;
   workspaceNeedsTurn: (ws: Workspace) => boolean;
+  /** Latest poller snapshot. Used to render per-row RAM chips for
+   *  workspaces with dev servers running. `null` until the first
+   *  snapshot lands. */
+  memory: MemorySnapshot | null;
 };
 
 export function Sidebar({
@@ -45,6 +50,7 @@ export function Sidebar({
   onDelete,
   onClearTurn,
   workspaceNeedsTurn,
+  memory,
 }: Props) {
   const { active, archived } = useMemo(() => {
     const active: Workspace[] = [];
@@ -75,6 +81,21 @@ export function Sidebar({
       coordinateGetter: sortableKeyboardCoordinates,
     }),
   );
+
+  // Defensive: clear stuck drag state if the dragged workspace falls out of
+  // the list (archived/deleted mid-drag), or if the window loses focus.
+  useEffect(() => {
+    if (activeId && !active.some((w) => w.id === activeId)) {
+      setActiveId(null);
+    }
+  }, [activeId, active]);
+
+  useEffect(() => {
+    if (!activeId) return;
+    const clear = () => setActiveId(null);
+    window.addEventListener("blur", clear);
+    return () => window.removeEventListener("blur", clear);
+  }, [activeId]);
 
   const handleDragStart = (event: DragStartEvent) => {
     setActiveId(event.active.id as WorkspaceId);
@@ -117,6 +138,7 @@ export function Sidebar({
                 workspace={w}
                 selected={w.id === selectedId}
                 needsTurn={workspaceNeedsTurn(w)}
+                memory={memory}
                 onSelect={() => onSelect(w.id)}
                 onContextMenu={(x, y) => setMenu({ ws: w, x, y })}
               />
@@ -128,6 +150,7 @@ export function Sidebar({
                 workspace={activeWorkspace}
                 selected={activeWorkspace.id === selectedId}
                 needsTurn={workspaceNeedsTurn(activeWorkspace)}
+                memory={memory}
                 isDragging
                 onSelect={() => {}}
                 onContextMenu={() => {}}
@@ -155,6 +178,7 @@ export function Sidebar({
               workspace={w}
               selected={w.id === selectedId}
               needsTurn={workspaceNeedsTurn(w)}
+              memory={memory}
               isArchived
               onSelect={() => onSelect(w.id)}
               onContextMenu={(x, y) => setMenu({ ws: w, x, y })}
@@ -181,12 +205,14 @@ function SortableWorkspaceRow({
   workspace,
   selected,
   needsTurn,
+  memory,
   onSelect,
   onContextMenu,
 }: {
   workspace: Workspace;
   selected: boolean;
   needsTurn: boolean;
+  memory: MemorySnapshot | null;
   onSelect: () => void;
   onContextMenu: (x: number, y: number) => void;
 }) {
@@ -204,6 +230,7 @@ function SortableWorkspaceRow({
       workspace={workspace}
       selected={selected}
       needsTurn={needsTurn}
+      memory={memory}
       isDragging={isDragging}
       onSelect={onSelect}
       onContextMenu={onContextMenu}
@@ -228,6 +255,7 @@ function WorkspaceRow({
   workspace,
   selected,
   needsTurn,
+  memory,
   isArchived = false,
   isDragging = false,
   onSelect,
@@ -237,6 +265,7 @@ function WorkspaceRow({
   workspace: Workspace;
   selected: boolean;
   needsTurn: boolean;
+  memory: MemorySnapshot | null;
   isArchived?: boolean;
   isDragging?: boolean;
   onSelect: () => void;
@@ -269,7 +298,9 @@ function WorkspaceRow({
     >
       <div className="workspace-name">
         {status === "creating" && <Spinner />}
-        {workspace.branch}
+        <span className="workspace-name-text" title={workspace.branch}>
+          {workspace.branch}
+        </span>
         {status === "ready" && needsTurn && (
           <span
             className="turn-dot"
@@ -295,6 +326,9 @@ function WorkspaceRow({
             </li>
           ))}
         </ul>
+      )}
+      {status === "ready" && (
+        <SidebarWorkspaceMemoryChip workspace={workspace} memory={memory} />
       )}
     </li>
   );

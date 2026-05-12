@@ -4,15 +4,18 @@ import type {
   CreateWorkspaceArgs,
   Discrepancies,
   GithubStatusChangedEvent,
+  MemorySnapshot,
   RegistryStatus,
   Repo,
   SessionInfo,
+  SessionKind,
   SessionRuntimeState,
   Theme,
   TurnChangedEvent,
   Workspace,
   WorkspaceId,
 } from "./types";
+import { DevServerActions, SidebarMemoryPressure } from "./DevServerControls";
 import { GithubAuthFooter } from "./GithubAuthFooter";
 import { GithubChip } from "./GithubChip";
 import { JobLogPane } from "./JobLogPane";
@@ -33,6 +36,22 @@ function App() {
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   /**
+   * Latest memory snapshot. Subscribed once at the app level and passed
+   * down to Sidebar (footer pressure + per-row RAM chips) and to the
+   * dev-server action buttons (for the start gate). The 5s poll lands
+   * here; per-workspace bits flow out via `memory.per_workspace`.
+   */
+  const [memory, setMemory] = useState<MemorySnapshot | null>(null);
+  useTauriEvent<MemorySnapshot>("devserver:memory_updated", (e) => {
+    setMemory(e.payload);
+  });
+  // Seed the snapshot once so the UI isn't blank before the first poll.
+  useEffect(() => {
+    invoke<MemorySnapshot>("get_memory_snapshot")
+      .then(setMemory)
+      .catch(() => {});
+  }, []);
+  /**
    * Args for create_workspace invocations the runner is currently driving,
    * keyed by workspace_id. The backend inserts a `Creating` draft into
    * `workspaces` from t=0, so this map only carries the args the runner
@@ -45,18 +64,20 @@ function App() {
   /**
    * Per-session turn state tracked by listening to `session:turn_changed`
    * globally. Used for the sidebar attention dot without needing to
-   * fetch sessions for every workspace.
+   * fetch sessions for every workspace. `acknowledged` mirrors the
+   * persisted `turn_acknowledged` flag — the user's dismissal of the dot,
+   * cleared server-side on the next runtime_state transition.
    */
   const [turnStates, setTurnStates] = useState<
-    Map<string, { workspaceId: string; state: SessionRuntimeState }>
+    Map<
+      string,
+      {
+        workspaceId: string;
+        state: SessionRuntimeState;
+        acknowledged: boolean;
+      }
+    >
   >(new Map());
-  /**
-   * Session IDs whose attention state the user dismissed via the sidebar
-   * right-click "Clear notification". Any subsequent `turn_changed` event
-   * for the session re-enables the dot — this is a one-shot mute, not a
-   * persistent pause.
-   */
-  const [clearedTurns, setClearedTurns] = useState<Set<string>>(new Set());
   /**
    * Sessions for every workspace, cached so switching into a workspace
    * shows the terminal immediately instead of flashing "Dormant" during
@@ -84,8 +105,13 @@ function App() {
   });
 
   useTauriEvent<TurnChangedEvent>("session:turn_changed", (event) => {
-    const { workspace_id, session_id, runtime_state, notification_type } =
-      event.payload;
+    const {
+      workspace_id,
+      session_id,
+      runtime_state,
+      notification_type,
+      turn_acknowledged,
+    } = event.payload;
     setTurnStates((prev) => {
       const next = new Map(prev);
       if (runtime_state === "dormant") {
@@ -94,17 +120,9 @@ function App() {
         next.set(session_id, {
           workspaceId: workspace_id,
           state: runtime_state,
+          acknowledged: turn_acknowledged,
         });
       }
-      return next;
-    });
-    // Any new event for this session lifts a prior "Clear notification" —
-    // a state change is the user-facing signal that something fresh
-    // happened.
-    setClearedTurns((prev) => {
-      if (!prev.has(session_id)) return prev;
-      const next = new Set(prev);
-      next.delete(session_id);
       return next;
     });
     // Keep the cached SessionInfo[] in sync so WorkspaceDetail sees the
@@ -121,6 +139,7 @@ function App() {
                 ...s,
                 runtime_state,
                 notification_type: notification_type ?? null,
+                turn_acknowledged,
               }
             : s,
         ),
@@ -147,28 +166,33 @@ function App() {
   const workspaceNeedsTurn = useCallback(
     (w: Workspace): boolean => {
       if (w.archived_at) return false;
-      for (const [sessionId, info] of turnStates) {
+      for (const info of turnStates.values()) {
         if (info.workspaceId !== w.id) continue;
         if (info.state !== "idle" && info.state !== "waiting_input") continue;
-        if (clearedTurns.has(sessionId)) continue;
+        if (info.acknowledged) continue;
         return true;
       }
       return false;
     },
-    [turnStates, clearedTurns],
+    [turnStates],
   );
 
   const handleClearTurn = useCallback(
     (workspace: Workspace) => {
-      setClearedTurns((prev) => {
-        const next = new Set(prev);
-        for (const [sessionId, info] of turnStates) {
-          if (info.workspaceId !== workspace.id) continue;
-          if (info.state !== "idle" && info.state !== "waiting_input") continue;
-          next.add(sessionId);
-        }
-        return next;
-      });
+      // Backend persists turn_acknowledged + emits session:turn_changed
+      // back, which updates turnStates. No optimistic local update needed —
+      // the round-trip is fast and the persisted flag is the source of truth.
+      for (const [sessionId, info] of turnStates) {
+        if (info.workspaceId !== workspace.id) continue;
+        if (info.state !== "idle" && info.state !== "waiting_input") continue;
+        if (info.acknowledged) continue;
+        invoke("acknowledge_session_turn", {
+          workspaceId: workspace.id,
+          sessionId,
+        }).catch((e) =>
+          console.error("acknowledge_session_turn failed:", e),
+        );
+      }
     },
     [turnStates],
   );
@@ -182,6 +206,45 @@ function App() {
         const next = new Map(prev);
         next.set(workspaceId, list);
         return next;
+      });
+      // Seed turnStates from the listing. The backend restores
+      // runtime_state from disk on boot via seed_turn but intentionally
+      // doesn't emit session:turn_changed (the frontend isn't subscribed
+      // yet) — without this, the sidebar dot stays dark across restarts
+      // until the next live event fires for that session.
+      setTurnStates((prev) => {
+        let next: Map<
+          string,
+          {
+            workspaceId: string;
+            state: SessionRuntimeState;
+            acknowledged: boolean;
+          }
+        > | null = null;
+        const ensure = () => {
+          if (!next) next = new Map(prev);
+          return next;
+        };
+        for (const s of list) {
+          if (s.runtime_state === "dormant") {
+            if (prev.has(s.id)) ensure().delete(s.id);
+            continue;
+          }
+          const cur = prev.get(s.id);
+          if (
+            !cur ||
+            cur.state !== s.runtime_state ||
+            cur.workspaceId !== workspaceId ||
+            cur.acknowledged !== s.turn_acknowledged
+          ) {
+            ensure().set(s.id, {
+              workspaceId,
+              state: s.runtime_state,
+              acknowledged: s.turn_acknowledged,
+            });
+          }
+        }
+        return next ?? prev;
       });
     } catch (e) {
       console.error("list_sessions:", e);
@@ -223,6 +286,77 @@ function App() {
     () => workspaces.filter((w) => !w.deleted_at),
     [workspaces],
   );
+  // Navigable list for hotkeys: same set the sidebar's main "active"
+  // section shows (drops archived). Order matches the sidebar.
+  const navigableWorkspaces = useMemo(
+    () => visibleWorkspaces.filter((w) => !w.archived_at),
+    [visibleWorkspaces],
+  );
+
+  // Keep the latest values reachable from a stable keydown handler so we
+  // don't re-bind (and tear down) the window listener on every render.
+  const navRef = useRef({
+    list: navigableWorkspaces,
+    selectedId,
+    needsTurn: workspaceNeedsTurn,
+  });
+  navRef.current = {
+    list: navigableWorkspaces,
+    selectedId,
+    needsTurn: workspaceNeedsTurn,
+  };
+
+  useEffect(() => {
+    const step = (direction: 1 | -1, attentionOnly: boolean) => {
+      const { list, selectedId: cur, needsTurn } = navRef.current;
+      const pool = attentionOnly ? list.filter((w) => needsTurn(w)) : list;
+      if (pool.length === 0) return;
+      // Find the anchor inside the pool. When attentionOnly and the
+      // current selection has no dot, anchor by its position in the full
+      // list so direction still feels right.
+      let anchor = pool.findIndex((w) => w.id === cur);
+      if (anchor === -1 && attentionOnly && cur) {
+        const fullIdx = list.findIndex((w) => w.id === cur);
+        if (fullIdx !== -1) {
+          // Walk in `direction` until we hit a pool member.
+          for (
+            let i = direction === 1 ? fullIdx + 1 : fullIdx - 1;
+            i >= 0 && i < list.length;
+            i += direction
+          ) {
+            const hit = pool.findIndex((w) => w.id === list[i].id);
+            if (hit !== -1) {
+              setSelectedId(pool[hit].id);
+              return;
+            }
+          }
+          // Nothing in that direction — wrap.
+          setSelectedId(
+            direction === 1 ? pool[0].id : pool[pool.length - 1].id,
+          );
+          return;
+        }
+      }
+      if (anchor === -1) anchor = direction === 1 ? -1 : 0;
+      const next = (anchor + direction + pool.length) % pool.length;
+      setSelectedId(pool[next].id);
+    };
+
+    const handler = (e: KeyboardEvent) => {
+      // Cmd+Alt(+Shift) + J/K. `e.code` ignores Option's character
+      // remapping on macOS (Alt+J → ˝), so the binding survives layout.
+      if (!e.metaKey || !e.altKey || e.ctrlKey) return;
+      if (e.code !== "KeyJ" && e.code !== "KeyK") return;
+      const direction: 1 | -1 = e.code === "KeyK" ? 1 : -1;
+      e.preventDefault();
+      e.stopPropagation();
+      step(direction, e.shiftKey);
+    };
+    window.addEventListener("keydown", handler, { capture: true });
+    return () =>
+      window.removeEventListener("keydown", handler, { capture: true });
+  }, []);
+
   const selected = useMemo(() => {
     const ws = workspaces.find((w) => w.id === selectedId);
     if (!ws) return null;
@@ -356,8 +490,10 @@ function App() {
           onDelete={handleDelete}
           onClearTurn={handleClearTurn}
           workspaceNeedsTurn={workspaceNeedsTurn}
+          memory={memory}
         />
         <div className="sidebar-footer">
+          <SidebarMemoryPressure memory={memory} />
           <SystemStatus allWorkspaces={workspaces} />
           <GithubAuthFooter />
         </div>
@@ -711,7 +847,16 @@ function WorkspaceDetail({
   const liveById = new Map(sessions.map((s) => [s.id, s]));
   // Newest first — the most recently started session is usually what you
   // want to see. `workspace.sessions` is append-ordered on the backend.
-  const ordered = [...workspace.sessions].reverse();
+  // Claude sessions newest-first (existing behavior), then FE/BE Build
+  // sessions pinned to the end so the dev-server tabs don't push Claude
+  // chats around when you start dev servers.
+  const reversed = [...workspace.sessions].reverse();
+  const isDev = (m: typeof reversed[number]) =>
+    m.kind === "frontend_build" || m.kind === "backend_build";
+  const ordered = [
+    ...reversed.filter((m) => !isDev(m)),
+    ...reversed.filter(isDev),
+  ];
   const visibleOrdered = ordered.filter((m) => !m.hidden);
   const hiddenOrdered = ordered.filter((m) => m.hidden);
   const [showHidden, setShowHidden] = useState(false);
@@ -839,6 +984,7 @@ function WorkspaceDetail({
           >
             {workspace.archived_at ? "Unarchive" : "Archive"}
           </button>
+          <DevServerActions workspace={workspace} onChanged={onRepoAdded} />
           <button
             type="button"
             className="danger"
@@ -926,7 +1072,13 @@ function WorkspaceDetail({
                   )}
                 </div>
               )}
-              <SessionTerminal sessionId={selectedLive.id} />
+              <SessionTerminal
+                sessionId={selectedLive.id}
+                readOnly={
+                  selected.kind === "frontend_build" ||
+                  selected.kind === "backend_build"
+                }
+              />
             </>
           ) : (
             <div className="session-dormant">
@@ -975,6 +1127,10 @@ type ChipMeta = {
   id: string;
   repo_key: string | null;
   claude_session_id: string | null;
+  /** Defaults to "claude" on older state.json entries; non-claude kinds
+   *  (frontend_build / backend_build) render with a fixed label instead
+   *  of the id-slice, and skip the hide/unhide affordance. */
+  kind?: SessionKind;
 };
 
 function SessionChip({
@@ -992,14 +1148,22 @@ function SessionChip({
   onSelect: (id: string) => void;
   onSetHidden: (id: string, hidden: boolean) => void;
 }) {
-  const label = meta.id.slice(0, 8);
+  const isDevServer =
+    meta.kind === "frontend_build" || meta.kind === "backend_build";
+  const label = isDevServer
+    ? meta.kind === "frontend_build"
+      ? "FE build"
+      : "BE build"
+    : meta.id.slice(0, 8);
   const needsTurn =
+    !isDevServer &&
     live?.running &&
     (live.runtime_state === "idle" || live.runtime_state === "waiting_input");
   const chipClass = [
     "session-chip",
     selected ? "active" : "",
     hidden ? "hidden" : "",
+    isDevServer ? "dev-server" : "",
   ]
     .filter(Boolean)
     .join(" ");
@@ -1022,19 +1186,21 @@ function SessionChip({
       <code>{label}</code>
       {needsTurn && <span className="turn-dot" />}
       {live && !live.running && <span className="chip-state">exited</span>}
-      {!live && <span className="chip-state">dormant</span>}
-      <button
-        type="button"
-        className="chip-x"
-        title={hidden ? "Show this chat" : "Hide this chat"}
-        aria-label={hidden ? "Show this chat" : "Hide this chat"}
-        onClick={(e) => {
-          e.stopPropagation();
-          onSetHidden(meta.id, !hidden);
-        }}
-      >
-        {hidden ? "↺" : "×"}
-      </button>
+      {!live && !isDevServer && <span className="chip-state">dormant</span>}
+      {!isDevServer && (
+        <button
+          type="button"
+          className="chip-x"
+          title={hidden ? "Show this chat" : "Hide this chat"}
+          aria-label={hidden ? "Show this chat" : "Hide this chat"}
+          onClick={(e) => {
+            e.stopPropagation();
+            onSetHidden(meta.id, !hidden);
+          }}
+        >
+          {hidden ? "↺" : "×"}
+        </button>
+      )}
     </div>
   );
 }

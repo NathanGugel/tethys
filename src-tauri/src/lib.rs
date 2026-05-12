@@ -1,6 +1,8 @@
 mod claude;
 mod claude_local;
 mod commands;
+mod dev_orchestrator;
+mod dev_servers;
 mod error;
 mod git;
 mod github;
@@ -9,6 +11,7 @@ mod hook_listener;
 mod inprogress;
 mod job;
 mod logging;
+mod memory_poller;
 mod paths;
 mod purge;
 mod reconcile;
@@ -30,7 +33,10 @@ use tauri_plugin_dialog::DialogExt;
 use tracing::{error, info, warn};
 
 use crate::commands::ClaudeBin;
+use crate::dev_orchestrator::OrchestratorConfig;
+use crate::dev_servers::DevServerLocks;
 use crate::github::GithubPoller;
+use crate::memory_poller::MemoryPoller;
 use crate::paths::Paths;
 use crate::purge::Purger;
 use crate::registry::RegistryLoad;
@@ -192,6 +198,22 @@ pub fn run() {
             let warmer = Arc::new(SetupWarmer::new(paths.clone(), registry_for_warmer));
             tauri::async_runtime::spawn(warmer.run());
 
+            // --- dev-server orchestrator state -----------------------------
+            // OrchestratorConfig is hardcoded to ::newlantern() today. To
+            // support other teams' stacks, replace with a config-file loader.
+            let orchestrator_cfg = Arc::new(OrchestratorConfig::newlantern());
+            app.manage(orchestrator_cfg.clone());
+            app.manage(Arc::new(DevServerLocks::new()));
+
+            // --- memory poller (5s tick: pressure + per-workspace RAM) -----
+            let memory_poller = MemoryPoller::new(
+                store.clone(),
+                orchestrator_cfg.clone(),
+                handle.clone(),
+            );
+            app.manage(memory_poller.clone());
+            tauri::async_runtime::spawn(memory_poller.run());
+
             app.manage(paths);
             app.manage(inprogress::InProgressWorkspaces::new());
 
@@ -243,6 +265,7 @@ pub fn run() {
             commands::remove_orphan_dir,
             commands::forget_workspace,
             commands::list_sessions,
+            commands::acknowledge_session_turn,
             commands::start_claude_session,
             commands::resume_claude_session,
             commands::set_claude_session_hidden,
@@ -251,6 +274,11 @@ pub fn run() {
             commands::resize_session,
             commands::get_theme,
             commands::read_clipboard_file_paths,
+            commands::start_dev_servers,
+            commands::stop_dev_servers,
+            commands::get_dev_state,
+            commands::detect_be_changes,
+            commands::get_memory_snapshot,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -275,6 +303,7 @@ fn prewarm_live_sessions(
         cwd: std::path::PathBuf,
         runtime_state: Option<crate::state::SessionRuntimeState>,
         notification_type: Option<String>,
+        turn_acknowledged: bool,
     }
 
     let candidates: Vec<PrewarmCandidate> = tauri::async_runtime::block_on(async {
@@ -290,6 +319,7 @@ fn prewarm_live_sessions(
                             cwd: meta.cwd.clone(),
                             runtime_state: meta.runtime_state,
                             notification_type: meta.notification_type.clone(),
+                            turn_acknowledged: meta.turn_acknowledged,
                         });
                     }
                 }
@@ -315,7 +345,12 @@ fn prewarm_live_sessions(
                 // restarts. `reattach_tmux` defaults the entry to Working;
                 // override it here. If nothing was persisted, leave Working.
                 if let Some(state) = c.runtime_state {
-                    supervisor.seed_turn(&c.session_id, state, c.notification_type);
+                    supervisor.seed_turn(
+                        &c.session_id,
+                        state,
+                        c.notification_type,
+                        c.turn_acknowledged,
+                    );
                 }
             }
             Err(e) => warn!(session_id = %c.session_id, error = %e, "pre-warm reattach failed"),
