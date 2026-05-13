@@ -1150,11 +1150,10 @@ function SessionChip({
 }) {
   const isDevServer =
     meta.kind === "frontend_build" || meta.kind === "backend_build";
-  const label = isDevServer
-    ? meta.kind === "frontend_build"
-      ? "FE build"
-      : "BE build"
-    : meta.id.slice(0, 8);
+  // Dev-server chips use a generic "Local Build" label — the chip's
+  // existing `repo_key` prefix ("frontend" / "backend") already
+  // distinguishes the two, so a more specific label would be redundant.
+  const label = isDevServer ? "Local Build" : meta.id.slice(0, 8);
   const needsTurn =
     !isDevServer &&
     live?.running &&
