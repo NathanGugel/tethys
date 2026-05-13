@@ -1254,8 +1254,9 @@ function SessionChip({
         if (isRenaming) return;
         onSelect(meta.id);
       }}
-      onContextMenu={(e) => {
+      onDoubleClick={(e) => {
         e.preventDefault();
+        e.stopPropagation();
         onStartRename(meta.id);
       }}
       onKeyDown={(e) => {
@@ -1396,14 +1397,57 @@ function SessionBar({
       coordinateGetter: sortableKeyboardCoordinates,
     }),
   );
+
+  // Optimistic local order. On drop we apply the new order *immediately*
+  // so dnd-kit's drop animation lands on the correct geometry — without
+  // this, the chip strip keeps rendering the old order until the
+  // backend's `workspace:changed` event lands, and the visible
+  // collapse-then-re-expand looks like a flicker. Cleared once the
+  // props catch up (so a server-side reconcile can still re-order).
+  const [optimisticOrder, setOptimisticOrder] = useState<string[] | null>(
+    null,
+  );
+  const visibleIds = visibleSessions.map((m) => m.id);
+  useEffect(() => {
+    if (!optimisticOrder) return;
+    if (
+      visibleIds.length === optimisticOrder.length &&
+      visibleIds.every((id, i) => id === optimisticOrder[i])
+    ) {
+      setOptimisticOrder(null);
+    }
+    // visibleIds is derived; deep-compare via the joined string.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visibleIds.join(""), optimisticOrder]);
+
+  const effectiveVisible = (() => {
+    if (!optimisticOrder) return visibleSessions;
+    const byId = new Map(visibleSessions.map((s) => [s.id, s]));
+    const result: ChipMeta[] = [];
+    const seen = new Set<string>();
+    for (const id of optimisticOrder) {
+      const s = byId.get(id);
+      if (s && !seen.has(id)) {
+        result.push(s);
+        seen.add(id);
+      }
+    }
+    for (const s of visibleSessions) {
+      if (!seen.has(s.id)) result.push(s);
+    }
+    return result;
+  })();
+
   const handleDragEnd = (event: DragEndEvent) => {
     const { active, over } = event;
     if (!over || active.id === over.id) return;
-    const ids = visibleSessions.map((m) => m.id);
+    const ids = effectiveVisible.map((m) => m.id);
     const from = ids.indexOf(active.id as string);
     const to = ids.indexOf(over.id as string);
     if (from < 0 || to < 0) return;
-    onReorder(arrayMove(ids, from, to));
+    const next = arrayMove(ids, from, to);
+    setOptimisticOrder(next);
+    onReorder(next);
   };
   const [menuOpen, setMenuOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement | null>(null);
@@ -1437,10 +1481,10 @@ function SessionBar({
         onDragEnd={handleDragEnd}
       >
         <SortableContext
-          items={visibleSessions.map((m) => m.id)}
+          items={effectiveVisible.map((m) => m.id)}
           strategy={horizontalListSortingStrategy}
         >
-          {visibleSessions.map((m) => (
+          {effectiveVisible.map((m) => (
             <SessionChip
               key={m.id}
               meta={m}
