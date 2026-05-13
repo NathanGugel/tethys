@@ -23,15 +23,18 @@ import type {
   CreateWorkspaceArgs,
   Discrepancies,
   GithubStatusChangedEvent,
+  MemorySnapshot,
   RegistryStatus,
   Repo,
   SessionInfo,
+  SessionKind,
   SessionRuntimeState,
   Theme,
   TurnChangedEvent,
   Workspace,
   WorkspaceId,
 } from "./types";
+import { DevServerActions, SidebarMemoryPressure } from "./DevServerControls";
 import { GithubAuthFooter } from "./GithubAuthFooter";
 import { GithubChip } from "./GithubChip";
 import { JobLogPane } from "./JobLogPane";
@@ -51,6 +54,22 @@ function App() {
   const [selectedId, setSelectedId] = useState<WorkspaceId | null>(null);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * Latest memory snapshot. Subscribed once at the app level and passed
+   * down to Sidebar (footer pressure + per-row RAM chips) and to the
+   * dev-server action buttons (for the start gate). The 5s poll lands
+   * here; per-workspace bits flow out via `memory.per_workspace`.
+   */
+  const [memory, setMemory] = useState<MemorySnapshot | null>(null);
+  useTauriEvent<MemorySnapshot>("devserver:memory_updated", (e) => {
+    setMemory(e.payload);
+  });
+  // Seed the snapshot once so the UI isn't blank before the first poll.
+  useEffect(() => {
+    invoke<MemorySnapshot>("get_memory_snapshot")
+      .then(setMemory)
+      .catch(() => {});
+  }, []);
   /**
    * Args for create_workspace invocations the runner is currently driving,
    * keyed by workspace_id. The backend inserts a `Creating` draft into
@@ -490,8 +509,10 @@ function App() {
           onDelete={handleDelete}
           onClearTurn={handleClearTurn}
           workspaceNeedsTurn={workspaceNeedsTurn}
+          memory={memory}
         />
         <div className="sidebar-footer">
+          <SidebarMemoryPressure memory={memory} />
           <SystemStatus allWorkspaces={workspaces} />
           <GithubAuthFooter />
         </div>
@@ -843,20 +864,27 @@ function WorkspaceDetail({
   const autoResumedRef = useRef<Set<string>>(new Set());
 
   const liveById = new Map(sessions.map((s) => [s.id, s]));
-  // Apply the user's pinned order if there is one; otherwise default to
-  // newest-first (the most recently started session is usually what you
-  // want to see). `workspace.sessions` is append-ordered on the backend.
-  // Any session id not in `session_order` is appended on render so newly
-  // spawned sessions show up without the user having to re-drag.
+  // Ordering:
+  //   - If `session_order` is set (user has manually dragged), use that
+  //     verbatim. Any session id present in `workspace.sessions` but not
+  //     in the pin gets appended so newly-spawned sessions appear.
+  //   - Otherwise, default to "Claude newest-first, then FE/BE Build
+  //     chips at the end" so dev-server tabs don't push Claude chats
+  //     around when servers start.
+  const isDev = (m: typeof workspace.sessions[number]) =>
+    m.kind === "frontend_build" || m.kind === "backend_build";
   const ordered = (() => {
-    const sessions = workspace.sessions;
+    const reversed = [...workspace.sessions].reverse();
     const pin = workspace.session_order;
     if (!pin || pin.length === 0) {
-      return [...sessions].reverse();
+      return [
+        ...reversed.filter((m) => !isDev(m)),
+        ...reversed.filter(isDev),
+      ];
     }
-    const byId = new Map(sessions.map((s) => [s.id, s]));
+    const byId = new Map(workspace.sessions.map((s) => [s.id, s]));
     const seen = new Set<string>();
-    const result: typeof sessions = [];
+    const result: typeof workspace.sessions = [];
     for (const id of pin) {
       const s = byId.get(id);
       if (s && !seen.has(id)) {
@@ -864,10 +892,14 @@ function WorkspaceDetail({
         seen.add(id);
       }
     }
-    for (const s of [...sessions].reverse()) {
-      if (!seen.has(s.id)) result.push(s);
-    }
-    return result;
+    // Append any unseen sessions — keep the "Claude before dev" tiebreak
+    // for the new ones so they don't all clump at the end mid-list.
+    const tail = reversed.filter((s) => !seen.has(s.id));
+    return [
+      ...result,
+      ...tail.filter((m) => !isDev(m)),
+      ...tail.filter(isDev),
+    ];
   })();
   const visibleOrdered = ordered.filter((m) => !m.hidden);
   const hiddenOrdered = ordered.filter((m) => m.hidden);
@@ -1035,6 +1067,7 @@ function WorkspaceDetail({
           >
             {workspace.archived_at ? "Unarchive" : "Archive"}
           </button>
+          <DevServerActions workspace={workspace} onChanged={onRepoAdded} />
           <button
             type="button"
             className="danger"
@@ -1130,7 +1163,13 @@ function WorkspaceDetail({
                   )}
                 </div>
               )}
-              <SessionTerminal sessionId={selectedLive.id} />
+              <SessionTerminal
+                sessionId={selectedLive.id}
+                readOnly={
+                  selected.kind === "frontend_build" ||
+                  selected.kind === "backend_build"
+                }
+              />
             </>
           ) : (
             <div className="session-dormant">
@@ -1179,7 +1218,12 @@ type ChipMeta = {
   id: string;
   repo_key: string | null;
   claude_session_id: string | null;
+  /** User-set chip label override. Ignored for dev-server kinds. */
   display_name?: string | null;
+  /** Defaults to "claude" on older state.json entries; non-claude kinds
+   *  (frontend_build / backend_build) render with a fixed "Local Build"
+   *  label, skip the hide/rename/drag affordances. */
+  kind?: SessionKind;
 };
 
 function SessionChip({
@@ -1212,7 +1256,15 @@ function SessionChip({
   onCommitRename: (id: string, name: string | null) => void;
   onCancelRename: () => void;
 }) {
-  const sortable = useSortable({ id: meta.id, disabled: !draggable });
+  const isDevServer =
+    meta.kind === "frontend_build" || meta.kind === "backend_build";
+  // Dev-server chips don't participate in drag-to-reorder or rename —
+  // they're pinned to the end by default and carry a fixed label.
+  // `useSortable` is still called (hook rule) but disabled.
+  const sortable = useSortable({
+    id: meta.id,
+    disabled: !draggable || isDevServer,
+  });
   const {
     attributes,
     listeners,
@@ -1221,10 +1273,11 @@ function SessionChip({
     transition,
     isDragging,
   } = sortable;
-  const defaultLabel = meta.id.slice(0, 8);
-  const customLabel = meta.display_name?.trim();
+  const defaultLabel = isDevServer ? "Local Build" : meta.id.slice(0, 8);
+  const customLabel = isDevServer ? null : meta.display_name?.trim();
   const labelText = customLabel || defaultLabel;
   const needsTurn =
+    !isDevServer &&
     live?.running &&
     (live.runtime_state === "idle" || live.runtime_state === "waiting_input");
   const chipClass = [
@@ -1233,6 +1286,7 @@ function SessionChip({
     hidden ? "hidden" : "",
     isDragging ? "is-dragging" : "",
     customLabel ? "renamed" : "",
+    isDevServer ? "dev-server" : "",
   ]
     .filter(Boolean)
     .join(" ");
@@ -1260,6 +1314,7 @@ function SessionChip({
         onSelect(meta.id);
       }}
       onDoubleClick={(e) => {
+        if (isDevServer) return;
         e.preventDefault();
         e.stopPropagation();
         onStartRename(meta.id);
@@ -1291,22 +1346,24 @@ function SessionChip({
       )}
       {needsTurn && <span className="turn-dot" />}
       {live && !live.running && <span className="chip-state">exited</span>}
-      {!live && <span className="chip-state">dormant</span>}
-      <button
-        type="button"
-        className="chip-x"
-        title={hidden ? "Show this chat" : "Hide this chat"}
-        aria-label={hidden ? "Show this chat" : "Hide this chat"}
-        onClick={(e) => {
-          e.stopPropagation();
-          onSetHidden(meta.id, !hidden);
-        }}
-        // Prevent the dnd-kit drag listener from picking up clicks on
-        // the close button (otherwise dragging the X moves the chip).
-        onPointerDown={(e) => e.stopPropagation()}
-      >
-        {hidden ? "↺" : "×"}
-      </button>
+      {!live && !isDevServer && <span className="chip-state">dormant</span>}
+      {!isDevServer && (
+        <button
+          type="button"
+          className="chip-x"
+          title={hidden ? "Show this chat" : "Hide this chat"}
+          aria-label={hidden ? "Show this chat" : "Hide this chat"}
+          onClick={(e) => {
+            e.stopPropagation();
+            onSetHidden(meta.id, !hidden);
+          }}
+          // Prevent the dnd-kit drag listener from picking up clicks on
+          // the close button (otherwise dragging the X moves the chip).
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          {hidden ? "↺" : "×"}
+        </button>
+      )}
     </div>
   );
 }
