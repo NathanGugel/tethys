@@ -56,6 +56,10 @@ export interface ClaudeSessionMeta {
   /** Cosmetic: when true the session is filtered out of the chip bar
    *  unless the user toggles "show hidden". The tmux session keeps running. */
   hidden: boolean;
+  /** User-set chip label override. `null`/missing falls back to the
+   *  default (first 8 chars of `id`). Set via the chip's right-click
+   *  Rename menu. */
+  display_name?: string | null;
 }
 
 export type WorkspaceStatus =
@@ -82,6 +86,11 @@ export interface Workspace {
    *  and a JobLogPane in the detail; `creation_failed` rows render the
    *  failed log so the user can read the error before dismissing. */
   status: WorkspaceStatus;
+  /** User-pinned chip order. `null`/missing falls back to the default
+   *  newest-first display. Any session id in `sessions` but not in
+   *  this list is appended on render in its existing order, so new
+   *  sessions don't have to be retroactively inserted. */
+  session_order?: string[] | null;
 }
 
 export interface SystemErrorEntry {

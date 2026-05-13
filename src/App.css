@@ -957,6 +957,34 @@ button.danger.primary:hover:not(:disabled) {
   background: var(--danger-bg, rgba(255, 80, 80, 0.18));
 }
 
+/* Drag state: the dnd-kit overlay uses transform; we also drop the
+   opacity so the original position visually steps back. */
+.session-chip.is-dragging {
+  cursor: grabbing;
+}
+
+/* Slight visual tag when a chip has a user-set display name so it's
+   discoverable that the override exists (tooltip shows the default
+   id). */
+.session-chip.renamed code {
+  font-style: italic;
+}
+
+/* Right-click rename: replaces the <code> label with an <input>. Keep
+   the geometry close to the default label so the chip doesn't jump. */
+.chip-rename-input {
+  font: inherit;
+  font-family: "SF Mono", ui-monospace, Menlo, monospace;
+  background: var(--surface-2, #1d1d1d);
+  color: inherit;
+  border: 1px solid var(--accent-blue, #3a6ea5);
+  border-radius: 3px;
+  padding: 0 4px;
+  min-width: 60px;
+  max-width: 140px;
+  outline: none;
+}
+
 .session-chip.hidden {
   opacity: 0.55;
   border-style: dotted;

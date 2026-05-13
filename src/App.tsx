@@ -1,5 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import {
+  DndContext,
+  KeyboardSensor,
+  PointerSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  arrayMove,
+  horizontalListSortingStrategy,
+  sortableKeyboardCoordinates,
+  useSortable,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import type {
   CreateWorkspaceArgs,
   Discrepancies,
@@ -824,12 +841,74 @@ function WorkspaceDetail({
   const autoResumedRef = useRef<Set<string>>(new Set());
 
   const liveById = new Map(sessions.map((s) => [s.id, s]));
-  // Newest first — the most recently started session is usually what you
-  // want to see. `workspace.sessions` is append-ordered on the backend.
-  const ordered = [...workspace.sessions].reverse();
+  // Apply the user's pinned order if there is one; otherwise default to
+  // newest-first (the most recently started session is usually what you
+  // want to see). `workspace.sessions` is append-ordered on the backend.
+  // Any session id not in `session_order` is appended on render so newly
+  // spawned sessions show up without the user having to re-drag.
+  const ordered = (() => {
+    const sessions = workspace.sessions;
+    const pin = workspace.session_order;
+    if (!pin || pin.length === 0) {
+      return [...sessions].reverse();
+    }
+    const byId = new Map(sessions.map((s) => [s.id, s]));
+    const seen = new Set<string>();
+    const result: typeof sessions = [];
+    for (const id of pin) {
+      const s = byId.get(id);
+      if (s && !seen.has(id)) {
+        result.push(s);
+        seen.add(id);
+      }
+    }
+    for (const s of [...sessions].reverse()) {
+      if (!seen.has(s.id)) result.push(s);
+    }
+    return result;
+  })();
   const visibleOrdered = ordered.filter((m) => !m.hidden);
   const hiddenOrdered = ordered.filter((m) => m.hidden);
   const [showHidden, setShowHidden] = useState(false);
+  const [renamingSessionId, setRenamingSessionId] = useState<string | null>(
+    null,
+  );
+
+  const persistOrder = useCallback(
+    async (newVisibleOrder: string[]) => {
+      // Merge: persist the visible order followed by the current hidden
+      // order. The backend dedupes if anything overlaps.
+      const hiddenIds = hiddenOrdered.map((m) => m.id);
+      try {
+        await invoke("reorder_sessions", {
+          args: {
+            workspace_id: workspace.id,
+            session_ids: [...newVisibleOrder, ...hiddenIds],
+          },
+        });
+      } catch (e) {
+        console.error("reorder_sessions:", e);
+      }
+    },
+    [workspace.id, hiddenOrdered],
+  );
+
+  const renameSession = useCallback(
+    async (sessionId: string, displayName: string | null) => {
+      try {
+        await invoke("rename_session", {
+          args: {
+            workspace_id: workspace.id,
+            session_id: sessionId,
+            display_name: displayName,
+          },
+        });
+      } catch (e) {
+        console.error("rename_session:", e);
+      }
+    },
+    [workspace.id],
+  );
 
   // Effective selection: prefer the user's explicit pick when it's still
   // visible, else fall through to first live, else newest. When hiding
@@ -1008,6 +1087,14 @@ function WorkspaceDetail({
           onSelect={selectSession}
           onStartInRepo={startInRepo}
           onSetHidden={setSessionHidden}
+          onReorder={persistOrder}
+          renamingSessionId={renamingSessionId}
+          onStartRename={(id) => setRenamingSessionId(id)}
+          onCommitRename={async (id, name) => {
+            await renameSession(id, name);
+            setRenamingSessionId(null);
+          }}
+          onCancelRename={() => setRenamingSessionId(null)}
           busy={busy}
         />
         {error && <div className="error-banner">{error}</div>}
@@ -1090,6 +1177,7 @@ type ChipMeta = {
   id: string;
   repo_key: string | null;
   claude_session_id: string | null;
+  display_name?: string | null;
 };
 
 function SessionChip({
@@ -1097,17 +1185,43 @@ function SessionChip({
   hidden,
   selected,
   live,
+  isRenaming,
+  draggable,
   onSelect,
   onSetHidden,
+  onStartRename,
+  onCommitRename,
+  onCancelRename,
 }: {
   meta: ChipMeta;
   hidden: boolean;
   selected: boolean;
   live: SessionInfo | undefined;
+  /** True when this chip is the one currently being renamed. Shows
+   *  an inline <input> in place of the default label. */
+  isRenaming: boolean;
+  /** True when the chip should be a dnd-kit sortable item. Hidden
+   *  chips (in the "show hidden" drawer) aren't draggable in V1 to
+   *  keep the reorder UX scoped to what the user normally sees. */
+  draggable: boolean;
   onSelect: (id: string) => void;
   onSetHidden: (id: string, hidden: boolean) => void;
+  onStartRename: (id: string) => void;
+  onCommitRename: (id: string, name: string | null) => void;
+  onCancelRename: () => void;
 }) {
-  const label = meta.id.slice(0, 8);
+  const sortable = useSortable({ id: meta.id, disabled: !draggable });
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = sortable;
+  const defaultLabel = meta.id.slice(0, 8);
+  const customLabel = meta.display_name?.trim();
+  const labelText = customLabel || defaultLabel;
   const needsTurn =
     live?.running &&
     (live.runtime_state === "idle" || live.runtime_state === "waiting_input");
@@ -1115,16 +1229,37 @@ function SessionChip({
     "session-chip",
     selected ? "active" : "",
     hidden ? "hidden" : "",
+    isDragging ? "is-dragging" : "",
+    customLabel ? "renamed" : "",
   ]
     .filter(Boolean)
     .join(" ");
+  const style: React.CSSProperties = draggable
+    ? {
+        transform: CSS.Transform.toString(transform),
+        transition,
+        opacity: isDragging ? 0.6 : undefined,
+      }
+    : {};
   return (
     <div
+      ref={draggable ? setNodeRef : undefined}
+      style={style}
+      {...(draggable ? attributes : {})}
+      {...(draggable ? listeners : {})}
       role="button"
       tabIndex={0}
       className={chipClass}
-      onClick={() => onSelect(meta.id)}
+      onClick={() => {
+        if (isRenaming) return;
+        onSelect(meta.id);
+      }}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        onStartRename(meta.id);
+      }}
       onKeyDown={(e) => {
+        if (isRenaming) return;
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
           onSelect(meta.id);
@@ -1134,7 +1269,20 @@ function SessionChip({
       <span className={`chip-repo${meta.repo_key === null ? " root" : ""}`}>
         {meta.repo_key ?? "root"}
       </span>
-      <code>{label}</code>
+      {isRenaming ? (
+        <ChipRenameInput
+          initial={customLabel ?? ""}
+          placeholder={defaultLabel}
+          onCommit={(value) =>
+            onCommitRename(meta.id, value.trim() || null)
+          }
+          onCancel={onCancelRename}
+        />
+      ) : (
+        <code title={customLabel ? `Default: ${defaultLabel}` : undefined}>
+          {labelText}
+        </code>
+      )}
       {needsTurn && <span className="turn-dot" />}
       {live && !live.running && <span className="chip-state">exited</span>}
       {!live && <span className="chip-state">dormant</span>}
@@ -1147,10 +1295,58 @@ function SessionChip({
           e.stopPropagation();
           onSetHidden(meta.id, !hidden);
         }}
+        // Prevent the dnd-kit drag listener from picking up clicks on
+        // the close button (otherwise dragging the X moves the chip).
+        onPointerDown={(e) => e.stopPropagation()}
       >
         {hidden ? "↺" : "×"}
       </button>
     </div>
+  );
+}
+
+/** Tiny controlled-input used during chip rename. Mounts focused, saves
+ *  on Enter / blur, cancels on Escape. */
+function ChipRenameInput({
+  initial,
+  placeholder,
+  onCommit,
+  onCancel,
+}: {
+  initial: string;
+  placeholder: string;
+  onCommit: (value: string) => void;
+  onCancel: () => void;
+}) {
+  const [value, setValue] = useState(initial);
+  const ref = useRef<HTMLInputElement | null>(null);
+  useEffect(() => {
+    ref.current?.focus();
+    ref.current?.select();
+  }, []);
+  return (
+    <input
+      ref={ref}
+      className="chip-rename-input"
+      value={value}
+      placeholder={placeholder}
+      onChange={(e) => setValue(e.target.value)}
+      onClick={(e) => e.stopPropagation()}
+      onPointerDown={(e) => e.stopPropagation()}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          onCommit(value);
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          onCancel();
+        }
+        // Stop the chip's outer keydown handler from running (it would
+        // select the chip on Enter/Space).
+        e.stopPropagation();
+      }}
+      onBlur={() => onCommit(value)}
+    />
   );
 }
 
@@ -1165,6 +1361,11 @@ function SessionBar({
   onSelect,
   onStartInRepo,
   onSetHidden,
+  onReorder,
+  renamingSessionId,
+  onStartRename,
+  onCommitRename,
+  onCancelRename,
   busy,
 }: {
   visibleSessions: ChipMeta[];
@@ -1178,8 +1379,32 @@ function SessionBar({
   /** `null` => start at the workspace root. */
   onStartInRepo: (repoKey: string | null) => void;
   onSetHidden: (id: string, hidden: boolean) => void;
+  /** Persist a new chip order. Receives the visible chips' new order;
+   *  the caller is responsible for appending hidden ids if any. */
+  onReorder: (newVisibleOrder: string[]) => void;
+  renamingSessionId: string | null;
+  onStartRename: (id: string) => void;
+  onCommitRename: (id: string, name: string | null) => void;
+  onCancelRename: () => void;
   busy: boolean;
 }) {
+  // dnd-kit horizontal sortable. 5px activation distance is the same
+  // value the Sidebar uses to avoid swallowing chip clicks.
+  const dndSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    }),
+  );
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    const ids = visibleSessions.map((m) => m.id);
+    const from = ids.indexOf(active.id as string);
+    const to = ids.indexOf(over.id as string);
+    if (from < 0 || to < 0) return;
+    onReorder(arrayMove(ids, from, to));
+  };
   const [menuOpen, setMenuOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement | null>(null);
 
@@ -1206,17 +1431,33 @@ function SessionBar({
 
   return (
     <div className="session-chip-bar">
-      {visibleSessions.map((m) => (
-        <SessionChip
-          key={m.id}
-          meta={m}
-          hidden={false}
-          selected={selectedId === m.id}
-          live={liveById.get(m.id)}
-          onSelect={onSelect}
-          onSetHidden={onSetHidden}
-        />
-      ))}
+      <DndContext
+        sensors={dndSensors}
+        collisionDetection={closestCenter}
+        onDragEnd={handleDragEnd}
+      >
+        <SortableContext
+          items={visibleSessions.map((m) => m.id)}
+          strategy={horizontalListSortingStrategy}
+        >
+          {visibleSessions.map((m) => (
+            <SessionChip
+              key={m.id}
+              meta={m}
+              hidden={false}
+              selected={selectedId === m.id}
+              live={liveById.get(m.id)}
+              isRenaming={renamingSessionId === m.id}
+              draggable
+              onSelect={onSelect}
+              onSetHidden={onSetHidden}
+              onStartRename={onStartRename}
+              onCommitRename={onCommitRename}
+              onCancelRename={onCancelRename}
+            />
+          ))}
+        </SortableContext>
+      </DndContext>
       {showHidden &&
         hiddenSessions.map((m) => (
           <SessionChip
@@ -1225,8 +1466,13 @@ function SessionBar({
             hidden={true}
             selected={selectedId === m.id}
             live={liveById.get(m.id)}
+            isRenaming={renamingSessionId === m.id}
+            draggable={false}
             onSelect={onSelect}
             onSetHidden={onSetHidden}
+            onStartRename={onStartRename}
+            onCommitRename={onCommitRename}
+            onCancelRename={onCancelRename}
           />
         ))}
       <div className="new-session-wrap" ref={wrapRef}>

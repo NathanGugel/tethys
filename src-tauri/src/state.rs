@@ -48,6 +48,15 @@ pub struct Workspace {
     /// every pre-existing workspace via the field default.
     #[serde(default)]
     pub status: WorkspaceStatus,
+    /// User-pinned session chip order. `None` falls back to the default
+    /// ordering (newest first via `sessions.reverse()` in the UI).
+    /// Once the user manually drags a chip, we persist the resulting
+    /// order here so it survives Tethys restarts. Any session id that
+    /// appears in `sessions` but not in this list is appended to the
+    /// end on render — new sessions don't have to be retroactively
+    /// inserted into the override.
+    #[serde(default)]
+    pub session_order: Option<Vec<SessionId>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -117,6 +126,12 @@ pub struct ClaudeSessionMeta {
     /// dismissal survives a Tethys restart.
     #[serde(default)]
     pub turn_acknowledged: bool,
+    /// User-set display name for the chip. `None` falls back to the
+    /// default label (the first 8 chars of the Tethys session id). Set
+    /// via the chip's right-click → Rename menu. Trimmed/empty values
+    /// are treated as None.
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -255,5 +270,74 @@ mod tests {
         let bytes = serde_json::to_vec(&failed).expect("serialize");
         let back: WorkspaceStatus = serde_json::from_slice(&bytes).expect("deserialize");
         assert_eq!(failed, back);
+    }
+
+    #[test]
+    fn pre_session_order_defaults_to_none() {
+        // state.json from before session_order + display_name landed
+        // must still deserialize, with both fields defaulting to None.
+        let raw = r#"{
+            "workspaces": [
+                {
+                    "id": "abc-123",
+                    "branch": "feat/foo",
+                    "created_at": "2026-04-01T12:00:00Z",
+                    "repo_links": [],
+                    "sessions": [
+                        {
+                            "id": "sess-1",
+                            "cwd": "/tmp/wt/abc-123/frontend",
+                            "claude_session_id": null,
+                            "transcript_path": null
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let parsed: AppState = serde_json::from_str(raw).expect("must deserialize");
+        assert!(parsed.workspaces[0].session_order.is_none());
+        assert!(parsed.workspaces[0].sessions[0].display_name.is_none());
+    }
+
+    #[test]
+    fn session_order_and_display_name_round_trip() {
+        let raw = r#"{
+            "workspaces": [
+                {
+                    "id": "abc-123",
+                    "branch": "feat/foo",
+                    "created_at": "2026-04-01T12:00:00Z",
+                    "repo_links": [],
+                    "sessions": [
+                        {
+                            "id": "sess-1",
+                            "cwd": "/tmp/wt/abc-123/frontend",
+                            "claude_session_id": null,
+                            "transcript_path": null,
+                            "display_name": "code review"
+                        },
+                        {
+                            "id": "sess-2",
+                            "cwd": "/tmp/wt/abc-123/frontend",
+                            "claude_session_id": null,
+                            "transcript_path": null
+                        }
+                    ],
+                    "session_order": ["sess-2", "sess-1"]
+                }
+            ]
+        }"#;
+        let parsed: AppState = serde_json::from_str(raw).expect("must deserialize");
+        let ws = &parsed.workspaces[0];
+        assert_eq!(
+            ws.session_order.as_ref().map(|v| v.as_slice()),
+            Some(&["sess-2".to_string(), "sess-1".to_string()][..])
+        );
+        assert_eq!(ws.sessions[0].display_name.as_deref(), Some("code review"));
+        assert!(ws.sessions[1].display_name.is_none());
+        // Re-serialize + re-deserialize cleanly.
+        let bytes = serde_json::to_vec(&parsed).expect("serialize");
+        let back: AppState = serde_json::from_slice(&bytes).expect("re-deserialize");
+        assert_eq!(back.workspaces[0].session_order, ws.session_order);
     }
 }

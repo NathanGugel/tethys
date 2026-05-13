@@ -252,6 +252,8 @@ pub fn run() {
             commands::resize_session,
             commands::get_theme,
             commands::read_clipboard_file_paths,
+            commands::reorder_sessions,
+            commands::rename_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

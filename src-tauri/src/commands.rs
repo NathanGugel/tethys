@@ -379,6 +379,7 @@ pub async fn create_workspace(
         deleted_at: None,
         archived_at: None,
         status: WorkspaceStatus::Creating,
+        session_order: None,
     };
     store
         .mutate(|s| {
@@ -1081,6 +1082,7 @@ async fn spawn_claude(
         runtime_state: None,
         notification_type: None,
         turn_acknowledged: false,
+        display_name: None,
     };
 
     store
@@ -1272,4 +1274,99 @@ fn spawn_event_forwarder(channel: Channel<JobEvent>) -> JobTx {
         }
     });
     JobTx(tx)
+}
+
+// ── Session tab reorder + rename ─────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ReorderSessionsArgs {
+    pub workspace_id: WorkspaceId,
+    /// The full desired chip order, top/leftmost first. Caller passes
+    /// the visible-on-screen order; the backend just persists it. Ids
+    /// not in this list are appended on render in their existing order,
+    /// so a partial list (e.g. only the user's pinned IDs) is also
+    /// valid — but the UI sends the full order.
+    pub session_ids: Vec<String>,
+}
+
+/// Commit a new session-chip order to the workspace. Persisted in
+/// `Workspace.session_order`; `None` (un-set) means "fall back to the
+/// default newest-first ordering".
+#[tauri::command]
+pub async fn reorder_sessions(
+    app: AppHandle,
+    store: State<'_, Arc<Store>>,
+    args: ReorderSessionsArgs,
+) -> AppResult<()> {
+    let wid = args.workspace_id.clone();
+    let order = args.session_ids;
+    store
+        .mutate(move |s| {
+            let ws = s
+                .find_workspace_mut(&wid)
+                .ok_or_else(|| AppError::WorkspaceNotFound(wid.clone()))?;
+            // De-duplicate while preserving order — the dnd-kit caller
+            // shouldn't send dupes, but be defensive.
+            let mut seen = std::collections::HashSet::new();
+            let cleaned: Vec<String> = order
+                .into_iter()
+                .filter(|id| seen.insert(id.clone()))
+                .collect();
+            ws.session_order = if cleaned.is_empty() {
+                None
+            } else {
+                Some(cleaned)
+            };
+            Ok(())
+        })
+        .await?;
+    emit_workspace_changed(&app, &args.workspace_id);
+    Ok(())
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct RenameSessionArgs {
+    pub workspace_id: WorkspaceId,
+    pub session_id: String,
+    /// `None` (or an empty/whitespace string, which we treat as None)
+    /// clears the override and the chip falls back to its default label.
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+/// Set or clear the user's display name override for one session chip.
+#[tauri::command]
+pub async fn rename_session(
+    app: AppHandle,
+    store: State<'_, Arc<Store>>,
+    args: RenameSessionArgs,
+) -> AppResult<()> {
+    let wid = args.workspace_id.clone();
+    let sid = args.session_id.clone();
+    let trimmed = args
+        .display_name
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    store
+        .mutate(move |s| {
+            let ws = s
+                .find_workspace_mut(&wid)
+                .ok_or_else(|| AppError::WorkspaceNotFound(wid.clone()))?;
+            let meta = ws
+                .sessions
+                .iter_mut()
+                .find(|m| m.id == sid)
+                .ok_or_else(|| {
+                    AppError::Other(format!(
+                        "no session {} in workspace {}",
+                        sid, wid
+                    ))
+                })?;
+            meta.display_name = trimmed;
+            Ok(())
+        })
+        .await?;
+    emit_workspace_changed(&app, &args.workspace_id);
+    Ok(())
 }
