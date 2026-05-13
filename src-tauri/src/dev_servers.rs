@@ -135,6 +135,7 @@ pub async fn start(
         runtime_state: None,
         notification_type: None,
         turn_acknowledged: false,
+        display_name: None,
     };
     let be_meta = prep.be.as_ref().map(|b| ClaudeSessionMeta {
         id: b.session_id.clone(),
@@ -147,6 +148,7 @@ pub async fn start(
         runtime_state: None,
         notification_type: None,
         turn_acknowledged: false,
+        display_name: None,
     });
 
     let wid = workspace_id.to_string();
