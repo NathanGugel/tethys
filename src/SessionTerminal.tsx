@@ -25,6 +25,13 @@ function escapeDroppedPath(p: string): string {
 
 interface Props {
   sessionId: string;
+  /** When true, the terminal is view-only: keystrokes are not forwarded
+   *  to the PTY, the paste handler is disabled, and the custom keybind
+   *  handler returns control to xterm (which itself doesn't echo input
+   *  when `disableStdin` is set). The user can still scroll, copy, and
+   *  search. Used for dev-server output panes (yarn dev / docker compose
+   *  up) where input would risk killing the running process. */
+  readOnly?: boolean;
 }
 
 /**
@@ -36,7 +43,7 @@ interface Props {
  *   4. Write scrollback into xterm, then drain the channel straight into it.
  * Keystrokes go via `send_input`, resize events via `resize_session`.
  */
-export function SessionTerminal({ sessionId }: Props) {
+export function SessionTerminal({ sessionId, readOnly = false }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -63,7 +70,8 @@ export function SessionTerminal({ sessionId }: Props) {
       fontFamily: '"SF Mono", ui-monospace, Menlo, monospace',
       fontSize: 13,
       theme: initialTheme,
-      cursorBlink: true,
+      cursorBlink: !readOnly,
+      disableStdin: readOnly,
       // xterm.js owns scrollback end-to-end. Tmux is only a process
       // keeper (mouse off, no copy-mode) — wheel events fall through to
       // xterm.js and scroll its buffer natively. Claude writes to the
@@ -137,7 +145,9 @@ export function SessionTerminal({ sessionId }: Props) {
           console.error("file paste failed:", e);
         });
     };
-    helperTextarea?.addEventListener("paste", onPaste, true);
+    if (!readOnly) {
+      helperTextarea?.addEventListener("paste", onPaste, true);
+    }
 
     // macOS-friendly keybindings over and above xterm's defaults.
     // Returning false suppresses xterm's default dispatch for that key;
@@ -163,24 +173,30 @@ export function SessionTerminal({ sessionId }: Props) {
         return false;
       }
 
-      // Cmd+Delete (mac "Delete" = Backspace) → delete previous word.
-      if (ev.key === "Backspace" && ev.metaKey && !ev.altKey && !ev.ctrlKey) {
+      // macOS line/word editing. Convention: Cmd = whole line, Alt = word.
+      // Each row maps a (key + modifier) pair to a readline byte sequence
+      // that the underlying shell / Claude Code / TUI app understands.
+      const onlyCmd = ev.metaKey && !ev.altKey && !ev.ctrlKey && !ev.shiftKey;
+      const onlyAlt = ev.altKey && !ev.metaKey && !ev.ctrlKey && !ev.shiftKey;
+      type EditBind = { key: string; mod: "cmd" | "alt"; bytes: number[] };
+      const edits: EditBind[] = [
+        // Cmd → line operations.
+        { key: "ArrowLeft", mod: "cmd", bytes: [0x01] }, // Ctrl-A: beginning of line
+        { key: "ArrowRight", mod: "cmd", bytes: [0x05] }, // Ctrl-E: end of line
+        { key: "Backspace", mod: "cmd", bytes: [0x15] }, // Ctrl-U: kill to start of line
+        { key: "Delete", mod: "cmd", bytes: [0x0b] }, // Ctrl-K: kill to end of line
+        // Alt → word operations (the bindings Cmd used to do).
+        { key: "ArrowLeft", mod: "alt", bytes: [0x1b, 0x62] }, // Esc-b: previous word
+        { key: "ArrowRight", mod: "alt", bytes: [0x1b, 0x66] }, // Esc-f: next word
+        { key: "Backspace", mod: "alt", bytes: [0x17] }, // Ctrl-W: backward-kill-word
+        { key: "Delete", mod: "alt", bytes: [0x1b, 0x64] }, // Esc-d: kill-word forward
+      ];
+      for (const { key, mod, bytes } of edits) {
+        if (ev.key !== key) continue;
+        if (mod === "cmd" && !onlyCmd) continue;
+        if (mod === "alt" && !onlyAlt) continue;
         ev.preventDefault();
-        sendRaw([0x17]); // Ctrl-W / readline backward-kill-word
-        return false;
-      }
-
-      // Cmd+Left → previous word (Alt-b).
-      if (ev.key === "ArrowLeft" && ev.metaKey && !ev.altKey && !ev.ctrlKey) {
-        ev.preventDefault();
-        sendRaw([0x1b, 0x62]);
-        return false;
-      }
-
-      // Cmd+Right → next word (Alt-f).
-      if (ev.key === "ArrowRight" && ev.metaKey && !ev.altKey && !ev.ctrlKey) {
-        ev.preventDefault();
-        sendRaw([0x1b, 0x66]);
+        sendRaw(bytes);
         return false;
       }
 
@@ -190,13 +206,16 @@ export function SessionTerminal({ sessionId }: Props) {
     termRef.current = term;
     fitRef.current = fit;
 
-    // Keystrokes → backend.
-    const dataSub = term.onData((data) => {
-      const bytes = Array.from(new TextEncoder().encode(data));
-      invoke("send_input", { sessionId, data: bytes }).catch((e) => {
-        console.error("send_input failed:", e);
-      });
-    });
+    // Keystrokes → backend. Skipped in read-only mode so dev-server
+    // panes don't accidentally forward input to yarn dev / docker compose.
+    const dataSub = readOnly
+      ? null
+      : term.onData((data) => {
+          const bytes = Array.from(new TextEncoder().encode(data));
+          invoke("send_input", { sessionId, data: bytes }).catch((e) => {
+            console.error("send_input failed:", e);
+          });
+        });
 
     // Resize → backend.
     const resizeSub = term.onResize(({ cols, rows }) => {
@@ -273,7 +292,7 @@ export function SessionTerminal({ sessionId }: Props) {
     return () => {
       cancelled = true;
       ro.disconnect();
-      dataSub.dispose();
+      dataSub?.dispose();
       resizeSub.dispose();
       dragDisposed = true;
       try {
@@ -287,7 +306,10 @@ export function SessionTerminal({ sessionId }: Props) {
       // backend detects the dead channel on its next send and removes the
       // subscriber.
     };
-  }, [sessionId]);
+    // readOnly is intentionally part of the deps so toggling it
+    // (rare — basically only for hot-reload while developing) rebuilds
+    // the terminal with the right options.
+  }, [sessionId, readOnly]);
 
   return <div className="session-terminal" ref={containerRef} />;
 }

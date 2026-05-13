@@ -25,6 +25,8 @@ use crate::setup;
 use crate::state::{
     ClaudeSessionMeta, RepoLink, SystemErrorEntry, Workspace, WorkspaceId, WorkspaceStatus,
 };
+use crate::dev_orchestrator::{self, BeMode, OrchestratorConfig};
+use crate::dev_servers::{self, DevServerLocks, DevStateSnapshot};
 use crate::store::Store;
 use crate::theme::Theme;
 use crate::tmux::{self, TmuxBin};
@@ -379,6 +381,7 @@ pub async fn create_workspace(
         deleted_at: None,
         archived_at: None,
         status: WorkspaceStatus::Creating,
+        dev_servers: None,
     };
     store
         .mutate(|s| {
@@ -879,6 +882,17 @@ pub fn list_sessions(
     supervisor.list_for_workspace(&workspace_id)
 }
 
+#[tauri::command]
+pub async fn acknowledge_session_turn(
+    supervisor: State<'_, Arc<SessionSupervisor>>,
+    workspace_id: WorkspaceId,
+    session_id: String,
+) -> AppResult<()> {
+    supervisor
+        .acknowledge_turn(&session_id, &workspace_id)
+        .await
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct StartClaudeArgs {
     pub workspace_id: WorkspaceId,
@@ -1062,6 +1076,7 @@ async fn spawn_claude(
     // so the UI and supervisor use a shared identifier.
     let meta = ClaudeSessionMeta {
         id: info.id.clone(),
+        kind: crate::state::SessionKind::Claude,
         repo_key: args.repo_key.clone(),
         cwd: cwd.clone(),
         claude_session_id: None,
@@ -1069,6 +1084,7 @@ async fn spawn_claude(
         hidden: false,
         runtime_state: None,
         notification_type: None,
+        turn_acknowledged: false,
     };
 
     store
@@ -1260,4 +1276,92 @@ fn spawn_event_forwarder(channel: Channel<JobEvent>) -> JobTx {
         }
     });
     JobTx(tx)
+}
+
+// ── Dev-server orchestration commands ─────────────────────────────────
+
+#[derive(Debug, serde::Deserialize)]
+pub struct StartDevServersArgs {
+    pub workspace_id: WorkspaceId,
+    /// Auto = git diff decides; ForceInclude = always start BE;
+    /// ForceExclude = FE only. Defaults to Auto when missing.
+    #[serde(default)]
+    pub mode: BeMode,
+}
+
+#[tauri::command]
+pub async fn start_dev_servers(
+    app: AppHandle,
+    supervisor: State<'_, Arc<SessionSupervisor>>,
+    store: State<'_, Arc<Store>>,
+    tmux_bin: State<'_, TmuxBin>,
+    locks: State<'_, Arc<DevServerLocks>>,
+    cfg: State<'_, Arc<OrchestratorConfig>>,
+    args: StartDevServersArgs,
+) -> AppResult<crate::state::DevServersMeta> {
+    dev_servers::start(
+        &app,
+        supervisor.inner(),
+        store.inner(),
+        tmux_bin.inner(),
+        locks.inner(),
+        &args.workspace_id,
+        args.mode,
+        cfg.inner(),
+    )
+    .await
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct WorkspaceIdArg {
+    pub workspace_id: WorkspaceId,
+}
+
+#[tauri::command]
+pub async fn stop_dev_servers(
+    app: AppHandle,
+    store: State<'_, Arc<Store>>,
+    tmux_bin: State<'_, TmuxBin>,
+    locks: State<'_, Arc<DevServerLocks>>,
+    cfg: State<'_, Arc<OrchestratorConfig>>,
+    args: WorkspaceIdArg,
+) -> AppResult<()> {
+    dev_servers::stop(
+        &app,
+        store.inner(),
+        tmux_bin.inner(),
+        locks.inner(),
+        &args.workspace_id,
+        cfg.inner(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn get_dev_state(
+    supervisor: State<'_, Arc<SessionSupervisor>>,
+    store: State<'_, Arc<Store>>,
+    args: WorkspaceIdArg,
+) -> AppResult<DevStateSnapshot> {
+    dev_servers::snapshot(supervisor.inner(), store.inner(), &args.workspace_id).await
+}
+
+#[tauri::command]
+pub async fn detect_be_changes(
+    store: State<'_, Arc<Store>>,
+    cfg: State<'_, Arc<OrchestratorConfig>>,
+    args: WorkspaceIdArg,
+) -> AppResult<bool> {
+    dev_servers::detect_be_changes(store.inner(), &args.workspace_id, cfg.inner()).await
+}
+
+/// Snapshot of memory pressure + per-workspace RAM. Cheap; the same
+/// data the poller emits as `devserver:memory_updated` events. Useful
+/// for the UI to fetch on mount before the first poller tick lands.
+#[tauri::command]
+pub async fn get_memory_snapshot(
+    store: State<'_, Arc<Store>>,
+    cfg: State<'_, Arc<OrchestratorConfig>>,
+) -> AppResult<crate::memory_poller::MemorySnapshot> {
+    Ok(crate::memory_poller::snapshot_now(store.inner(), cfg.inner()).await)
 }

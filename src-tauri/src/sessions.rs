@@ -50,6 +50,9 @@ pub struct SessionInfo {
     /// Populated by the last Notification hook (e.g. `permission_prompt`).
     /// Set to `None` when state transitions away from `WaitingInput`.
     pub notification_type: Option<String>,
+    /// User dismissed the "your turn" dot for this session. Reset on the
+    /// next runtime_state transition.
+    pub turn_acknowledged: bool,
 }
 
 struct SessionHandle {
@@ -74,13 +77,14 @@ struct PendingSpawn {
 
 const PENDING_TTL: Duration = Duration::from_secs(30);
 
-/// Per-session ephemeral UI state (turn + last notification subtype).
-/// Kept in-memory in the supervisor, not persisted — it's reconstructed
-/// from scratch each run via new hook events.
+/// Per-session UI state (turn + last notification subtype + the user's
+/// dismissal of the "your turn" dot). Held in memory; the persisted
+/// mirror lives on `ClaudeSessionMeta` so all three survive restarts.
 #[derive(Debug, Default, Clone)]
 struct TurnState {
     state: SessionRuntimeState,
     notification_type: Option<String>,
+    acknowledged: bool,
 }
 
 pub struct SessionSupervisor {
@@ -116,6 +120,7 @@ impl SessionSupervisor {
         session_id: &str,
         state: SessionRuntimeState,
         notification_type: Option<String>,
+        acknowledged: bool,
     ) {
         let mut map = self.turn.lock().unwrap();
         map.insert(
@@ -123,6 +128,7 @@ impl SessionSupervisor {
             TurnState {
                 state,
                 notification_type,
+                acknowledged,
             },
         );
     }
@@ -145,6 +151,9 @@ impl SessionSupervisor {
             } else {
                 current.state = state;
                 current.notification_type = notification_type.clone();
+                // A state transition is the user-facing signal that something
+                // fresh happened — re-light any dismissed indicator.
+                current.acknowledged = false;
                 true
             }
         };
@@ -158,6 +167,7 @@ impl SessionSupervisor {
                 "session_id": session_id,
                 "runtime_state": state,
                 "notification_type": notification_type,
+                "turn_acknowledged": false,
             }),
         );
         let persist = self
@@ -167,6 +177,7 @@ impl SessionSupervisor {
                     if let Some(meta) = ws.sessions.iter_mut().find(|m| m.id == session_id) {
                         meta.runtime_state = Some(state);
                         meta.notification_type = notification_type.clone();
+                        meta.turn_acknowledged = false;
                     }
                 }
                 Ok(())
@@ -175,6 +186,46 @@ impl SessionSupervisor {
         if let Err(e) = persist {
             warn!(error = %e, session_id, "persist turn state failed");
         }
+    }
+
+    /// User dismissed the "your turn" indicator. Sets `turn_acknowledged`
+    /// in memory, persists it, and emits a `session:turn_changed` event so
+    /// the sidebar dot vanishes immediately. The flag is cleared again on
+    /// the next runtime_state transition (see `set_turn`).
+    pub async fn acknowledge_turn(
+        &self,
+        session_id: &str,
+        workspace_id: &str,
+    ) -> AppResult<()> {
+        let (state, notification_type) = {
+            let mut map = self.turn.lock().unwrap();
+            let current = map.entry(session_id.to_string()).or_default();
+            if current.acknowledged {
+                return Ok(());
+            }
+            current.acknowledged = true;
+            (current.state, current.notification_type.clone())
+        };
+        let _ = self.app.emit(
+            "session:turn_changed",
+            serde_json::json!({
+                "workspace_id": workspace_id,
+                "session_id": session_id,
+                "runtime_state": state,
+                "notification_type": notification_type,
+                "turn_acknowledged": true,
+            }),
+        );
+        self.store
+            .mutate(|s| {
+                if let Some(ws) = s.find_workspace_mut(workspace_id) {
+                    if let Some(meta) = ws.sessions.iter_mut().find(|m| m.id == session_id) {
+                        meta.turn_acknowledged = true;
+                    }
+                }
+                Ok(())
+            })
+            .await
     }
 
     /// Inner spawn: opens a PTY, runs `program args`, wires up reader/
@@ -232,6 +283,7 @@ impl SessionSupervisor {
             running: true,
             runtime_state: SessionRuntimeState::Working,
             notification_type: None,
+            turn_acknowledged: false,
         };
 
         let ring = Arc::new(Mutex::new(VecDeque::with_capacity(RING_CAPACITY)));
@@ -273,6 +325,7 @@ impl SessionSupervisor {
             TurnState {
                 state: SessionRuntimeState::Working,
                 notification_type: None,
+                acknowledged: false,
             },
         );
         let _ = self.app.emit(
@@ -353,6 +406,62 @@ impl SessionSupervisor {
         );
 
         Ok((info, token))
+    }
+
+    /// Spawn a non-Claude dev-server inside a fresh tmux session.
+    /// Mirrors `spawn_claude` but runs `/bin/zsh -ilc <shell_command>`
+    /// as the tmux child process (login + interactive shell so direnv /
+    /// yarn / docker resolve), and lets the caller inject per-session
+    /// env vars (e.g. `NL_PROXY_TARGET=http://localhost:8001`).
+    ///
+    /// `session_id` is caller-provided + deterministic
+    /// (`tethys-fe-<workspace_id>` / `tethys-be-<workspace_id>`), so the
+    /// session can be looked up / killed / reattached without an
+    /// external id table.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_dev_server(
+        &self,
+        session_id: SessionId,
+        workspace_id: String,
+        repo_key: Option<String>,
+        cwd: &Path,
+        tmux_bin: &Path,
+        shell_command: &str,
+        env: &[(String, String)],
+    ) -> AppResult<SessionInfo> {
+        let mut args: Vec<String> = vec!["-L".into(), tmux::SOCKET_LABEL.into()];
+        args.extend(tmux::server_init_args());
+        args.extend([
+            "new-session".into(),
+            "-A".into(), // attach if a session with this name somehow exists
+            "-D".into(), // ...and detach any other clients on that session
+            "-s".into(),
+            session_id.clone(),
+            "-x".into(),
+            "200".into(),
+            "-y".into(),
+            "50".into(),
+        ]);
+        for (k, v) in env {
+            args.push("-e".into());
+            args.push(format!("{k}={v}"));
+        }
+        args.extend([
+            "--".into(),
+            "/bin/zsh".into(),
+            "-ilc".into(),
+            shell_command.to_string(),
+        ]);
+        self.spawn_with_id(SpawnRequest {
+            id: session_id,
+            workspace_id,
+            repo_key,
+            cwd,
+            program: tmux_bin,
+            args: &args,
+            tmux_bin: tmux_bin.to_path_buf(),
+            seed_bytes: &[],
+        })
     }
 
     /// Attach a fresh tmux client to an existing session. Used when the
@@ -660,6 +769,7 @@ impl SessionSupervisor {
                 let turn = turn_map.get(&h.info.id).cloned().unwrap_or_default();
                 info.runtime_state = turn.state;
                 info.notification_type = turn.notification_type;
+                info.turn_acknowledged = turn.acknowledged;
                 info
             })
             .collect()
