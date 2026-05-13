@@ -106,6 +106,26 @@ pub async fn open_in_vscode(
     store: State<'_, Arc<Store>>,
     id: WorkspaceId,
 ) -> AppResult<()> {
+    open_workspace_in(store, id, "Visual Studio Code", "VS Code").await
+}
+
+#[tauri::command]
+pub async fn open_in_cursor(
+    store: State<'_, Arc<Store>>,
+    id: WorkspaceId,
+) -> AppResult<()> {
+    open_workspace_in(store, id, "Cursor", "Cursor").await
+}
+
+/// Shared helper: launch the workspace root in the given macOS app.
+/// `app_bundle_name` is what `open -a` expects (the app's display name
+/// or bundle id); `pretty` is for the error message.
+async fn open_workspace_in(
+    store: State<'_, Arc<Store>>,
+    id: WorkspaceId,
+    app_bundle_name: &str,
+    pretty: &str,
+) -> AppResult<()> {
     let workspace_root: PathBuf = store
         .read(|s| {
             s.find_workspace(&id).and_then(|w| {
@@ -118,12 +138,12 @@ pub async fn open_in_vscode(
         .ok_or_else(|| AppError::WorkspaceNotFound(id.clone()))?;
 
     std::process::Command::new("open")
-        .args(["-a", "Visual Studio Code"])
+        .args(["-a", app_bundle_name])
         .arg(&workspace_root)
         .status()
         .map_err(|e| {
             AppError::Other(format!(
-                "failed to open {} in VS Code: {e}",
+                "failed to open {} in {pretty}: {e}",
                 workspace_root.display()
             ))
         })?;

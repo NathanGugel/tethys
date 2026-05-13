@@ -868,18 +868,24 @@ function WorkspaceDetail({
   //   - If `session_order` is set (user has manually dragged), use that
   //     verbatim. Any session id present in `workspace.sessions` but not
   //     in the pin gets appended so newly-spawned sessions appear.
-  //   - Otherwise, default to "Claude newest-first, then FE/BE Build
-  //     chips at the end" so dev-server tabs don't push Claude chats
-  //     around when servers start.
+  //   - Otherwise, default to "Claude newest-first, then FE Build, then
+  //     BE Build" so dev-server tabs are always last and the
+  //     conventional FE-before-BE order is preserved (workspace.sessions
+  //     can append in either order depending on spawn timing).
+  const isFeDev = (m: typeof workspace.sessions[number]) =>
+    m.kind === "frontend_build";
+  const isBeDev = (m: typeof workspace.sessions[number]) =>
+    m.kind === "backend_build";
   const isDev = (m: typeof workspace.sessions[number]) =>
-    m.kind === "frontend_build" || m.kind === "backend_build";
+    isFeDev(m) || isBeDev(m);
   const ordered = (() => {
     const reversed = [...workspace.sessions].reverse();
     const pin = workspace.session_order;
     if (!pin || pin.length === 0) {
       return [
         ...reversed.filter((m) => !isDev(m)),
-        ...reversed.filter(isDev),
+        ...reversed.filter(isFeDev),
+        ...reversed.filter(isBeDev),
       ];
     }
     const byId = new Map(workspace.sessions.map((s) => [s.id, s]));
@@ -892,13 +898,14 @@ function WorkspaceDetail({
         seen.add(id);
       }
     }
-    // Append any unseen sessions — keep the "Claude before dev" tiebreak
-    // for the new ones so they don't all clump at the end mid-list.
+    // Append any unseen sessions — keep the "Claude before FE before BE"
+    // tiebreak for the new ones so they don't clump arbitrarily.
     const tail = reversed.filter((s) => !seen.has(s.id));
     return [
       ...result,
       ...tail.filter((m) => !isDev(m)),
-      ...tail.filter(isDev),
+      ...tail.filter(isFeDev),
+      ...tail.filter(isBeDev),
     ];
   })();
   const visibleOrdered = ordered.filter((m) => !m.hidden);
@@ -1047,6 +1054,18 @@ function WorkspaceDetail({
             }
           >
             Add repo
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              invoke("open_in_cursor", { id: workspace.id }).catch((e) =>
+                setError(String(e)),
+              )
+            }
+            disabled={workspace.repo_links.length === 0}
+            title="Open every worktree in Cursor"
+          >
+            Open in Cursor
           </button>
           <button
             type="button"
