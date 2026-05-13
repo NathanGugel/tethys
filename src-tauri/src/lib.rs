@@ -274,6 +274,8 @@ pub fn run() {
             commands::resize_session,
             commands::get_theme,
             commands::read_clipboard_file_paths,
+            commands::reorder_sessions,
+            commands::rename_session,
             commands::start_dev_servers,
             commands::stop_dev_servers,
             commands::get_dev_state,
