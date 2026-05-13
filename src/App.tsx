@@ -2,12 +2,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   DndContext,
+  DragOverlay,
   KeyboardSensor,
   PointerSensor,
   closestCenter,
   useSensor,
   useSensors,
   type DragEndEvent,
+  type DragStartEvent,
 } from "@dnd-kit/core";
 import {
   SortableContext,
@@ -1238,7 +1240,10 @@ function SessionChip({
     ? {
         transform: CSS.Transform.toString(transform),
         transition,
-        opacity: isDragging ? 0.6 : undefined,
+        // With DragOverlay handling the visual preview, the in-place
+        // chip is just a placeholder. Fade it more so the slot reads
+        // as "reserved" rather than "two duplicates of this chip".
+        opacity: isDragging ? 0.25 : undefined,
       }
     : {};
   return (
@@ -1438,7 +1443,22 @@ function SessionBar({
     return result;
   })();
 
+  // The id of the chip currently being dragged. Rendered into a
+  // DragOverlay below so the visible "preview" stays its natural size
+  // — without the overlay, dnd-kit shifts neighbors by the dragged
+  // chip's width, which on a variable-width row makes the moving chip
+  // appear to stretch/shrink to match each chip it crosses.
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const draggingItem = draggingId
+    ? effectiveVisible.find((m) => m.id === draggingId) ?? null
+    : null;
+
+  const handleDragStart = (event: DragStartEvent) => {
+    setDraggingId(event.active.id as string);
+  };
+
   const handleDragEnd = (event: DragEndEvent) => {
+    setDraggingId(null);
     const { active, over } = event;
     if (!over || active.id === over.id) return;
     const ids = effectiveVisible.map((m) => m.id);
@@ -1478,7 +1498,9 @@ function SessionBar({
       <DndContext
         sensors={dndSensors}
         collisionDetection={closestCenter}
+        onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
+        onDragCancel={() => setDraggingId(null)}
       >
         <SortableContext
           items={effectiveVisible.map((m) => m.id)}
@@ -1501,6 +1523,23 @@ function SessionBar({
             />
           ))}
         </SortableContext>
+        <DragOverlay>
+          {draggingItem ? (
+            <SessionChip
+              meta={draggingItem}
+              hidden={false}
+              selected={selectedId === draggingItem.id}
+              live={liveById.get(draggingItem.id)}
+              isRenaming={false}
+              draggable={false}
+              onSelect={() => {}}
+              onSetHidden={() => {}}
+              onStartRename={() => {}}
+              onCommitRename={() => {}}
+              onCancelRename={() => {}}
+            />
+          ) : null}
+        </DragOverlay>
       </DndContext>
       {showHidden &&
         hiddenSessions.map((m) => (
