@@ -151,6 +151,66 @@ async fn open_workspace_in(
     Ok(())
 }
 
+/// Bring every worktree in the workspace up to date with its repo's default
+/// branch on origin (typically `master`). For each linked worktree: fetch
+/// origin, resolve origin's default branch, and merge `origin/<default>` into
+/// the worktree's branch. Progress streams over `on_event`. A failure in any
+/// repo aborts that repo's merge (leaving its worktree unchanged) and stops
+/// the run — repos processed before it keep their merges.
+#[tauri::command]
+pub async fn update_workspace_worktrees(
+    store: State<'_, Arc<Store>>,
+    id: WorkspaceId,
+    on_event: Channel<JobEvent>,
+) -> AppResult<()> {
+    let links: Vec<(String, PathBuf)> = store
+        .read(|s| {
+            s.find_workspace(&id).map(|w| {
+                w.repo_links
+                    .iter()
+                    .map(|r| (r.repo_key.clone(), r.worktree_path.clone()))
+                    .collect()
+            })
+        })
+        .await
+        .ok_or_else(|| AppError::WorkspaceNotFound(id.clone()))?;
+
+    if links.is_empty() {
+        return Err(AppError::Other(
+            "this workspace has no worktrees to update".into(),
+        ));
+    }
+
+    let tx = spawn_event_forwarder(on_event);
+
+    let run = async {
+        for (repo_key, worktree_path) in &links {
+            git::fetch_origin(worktree_path, &tx, repo_key).await?;
+            let default_branch = git::origin_default_branch(worktree_path).await?;
+            git::merge_origin_branch(worktree_path, &default_branch, &tx, repo_key).await?;
+            tx.status(
+                format!("{repo_key} is up to date with origin/{default_branch}"),
+                Some(repo_key),
+            );
+        }
+        Ok::<_, AppError>(())
+    };
+
+    match run.await {
+        Ok(()) => {
+            info!(id = %id, repos = links.len(), "updated workspace worktrees from origin");
+            let _ = tx.0.send(JobEvent::Success);
+            Ok(())
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            warn!(error = %msg, "update workspace worktrees failed");
+            let _ = tx.0.send(JobEvent::Failed { error: msg });
+            Err(e)
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateWorkspaceArgs {
     /// Frontend-minted UUID. Lets us insert a `Creating` draft into state

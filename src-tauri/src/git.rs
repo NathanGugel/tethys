@@ -260,6 +260,106 @@ pub async fn worktree_add(
     Ok(())
 }
 
+/// Resolve the name of origin's default branch for the repo at `cwd` (a
+/// worktree or a clone — worktrees share the clone's refs). Tries
+/// `git symbolic-ref refs/remotes/origin/HEAD` first (yields e.g.
+/// `origin/master`, from which we strip the `origin/` prefix). If origin/HEAD
+/// isn't set locally, falls back to probing `origin/master` then `origin/main`.
+pub async fn origin_default_branch(cwd: &Path) -> AppResult<String> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
+        .output()
+        .await
+        .map_err(|e| AppError::Other(format!("git symbolic-ref: {e}")))?;
+    if output.status.success() {
+        let referent = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if let Some(branch) = referent.strip_prefix("origin/") {
+            if !branch.is_empty() {
+                return Ok(branch.to_string());
+            }
+        }
+    }
+
+    for candidate in ["master", "main"] {
+        if show_ref_exists(cwd, &format!("refs/remotes/origin/{candidate}")).await? {
+            return Ok(candidate.to_string());
+        }
+    }
+
+    Err(AppError::Other(
+        "could not determine origin's default branch (no origin/HEAD, \
+         origin/master, or origin/main)"
+            .into(),
+    ))
+}
+
+/// `git -C <cwd> fetch origin --prune`, streamed. Updates the remote-tracking
+/// refs shared by all worktrees of the clone so a subsequent merge sees the
+/// latest origin commits.
+pub async fn fetch_origin(cwd: &Path, tx: &JobTx, repo: &str) -> AppResult<()> {
+    tx.status("fetching origin", Some(repo));
+    let args: [&OsStr; 6] = [
+        "-C".as_ref(),
+        cwd.as_os_str(),
+        "fetch".as_ref(),
+        "origin".as_ref(),
+        "--prune".as_ref(),
+        "--progress".as_ref(),
+    ];
+    let status = run_streamed("git", args, None, tx, Some(repo)).await?;
+    if !status.success() {
+        return Err(AppError::Other(format!(
+            "git fetch origin in {} exited with {:?}",
+            cwd.display(),
+            status.code()
+        )));
+    }
+    Ok(())
+}
+
+/// Merge `origin/<branch>` into the worktree's currently checked-out branch
+/// with `git -C <cwd> merge --no-edit origin/<branch>`. On a non-zero exit
+/// (conflicts, or a dirty working tree that blocked the merge from starting)
+/// run `git merge --abort` so the worktree is left clean, then bubble an error
+/// describing what happened. Callers are expected to `fetch_origin` first.
+pub async fn merge_origin_branch(
+    cwd: &Path,
+    branch: &str,
+    tx: &JobTx,
+    repo: &str,
+) -> AppResult<()> {
+    tx.status(format!("merging origin/{branch}"), Some(repo));
+    let merge_ref = format!("origin/{branch}");
+    let args: [&OsStr; 5] = [
+        "-C".as_ref(),
+        cwd.as_os_str(),
+        "merge".as_ref(),
+        "--no-edit".as_ref(),
+        merge_ref.as_ref(),
+    ];
+    let status = run_streamed("git", args, None, tx, Some(repo)).await?;
+    if !status.success() {
+        // Abort so we never leave the worktree mid-merge with conflict
+        // markers. If no merge was actually in progress (e.g. a dirty tree
+        // blocked it from starting), `merge --abort` errors — harmless here.
+        let _ = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(["merge", "--abort"])
+            .output()
+            .await;
+        return Err(AppError::Other(format!(
+            "git merge origin/{branch} in {} failed — resolve conflicts or \
+             commit/stash local changes, then retry. The worktree was left \
+             unchanged.",
+            cwd.display()
+        )));
+    }
+    Ok(())
+}
+
 /// `git -C <clone_path> show-ref --verify --quiet refs/heads/<branch>`.
 /// Returns true if the branch exists locally in the clone. Non-zero exit
 /// means the branch doesn't exist — not an error.
