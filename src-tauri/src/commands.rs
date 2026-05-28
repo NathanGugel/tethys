@@ -23,7 +23,8 @@ use crate::registry::{self, starter_template, RegistryLoad, Repo};
 use crate::sessions::{SessionInfo, SessionSupervisor};
 use crate::setup;
 use crate::state::{
-    ClaudeSessionMeta, RepoLink, SystemErrorEntry, Workspace, WorkspaceId, WorkspaceStatus,
+    AppSettings, ClaudeSessionMeta, IdeChoice, RepoLink, SystemErrorEntry, Workspace, WorkspaceId,
+    WorkspaceStatus,
 };
 use crate::dev_orchestrator::{self, BeMode, OrchestratorConfig};
 use crate::dev_servers::{self, DevServerLocks, DevStateSnapshot};
@@ -102,19 +103,43 @@ pub fn open_repos_config(paths: State<'_, Paths>) -> AppResult<()> {
 }
 
 #[tauri::command]
-pub async fn open_in_vscode(
-    store: State<'_, Arc<Store>>,
-    id: WorkspaceId,
-) -> AppResult<()> {
-    open_workspace_in(store, id, "Visual Studio Code", "VS Code").await
+pub async fn get_settings(store: State<'_, Arc<Store>>) -> AppResult<AppSettings> {
+    Ok(store.read(|s| s.settings.clone()).await)
 }
 
 #[tauri::command]
-pub async fn open_in_cursor(
+pub async fn set_settings(
     store: State<'_, Arc<Store>>,
-    id: WorkspaceId,
-) -> AppResult<()> {
-    open_workspace_in(store, id, "Cursor", "Cursor").await
+    settings: AppSettings,
+) -> AppResult<AppSettings> {
+    store
+        .mutate(|s| {
+            s.settings = settings.clone();
+            Ok(())
+        })
+        .await?;
+    Ok(settings)
+}
+
+/// Launch the workspace root in the user's configured IDE (Settings → IDE).
+#[tauri::command]
+pub async fn open_in_ide(store: State<'_, Arc<Store>>, id: WorkspaceId) -> AppResult<()> {
+    let ide = store.read(|s| s.settings.ide.clone()).await;
+    let (app, pretty): (String, String) = match ide {
+        IdeChoice::Cursor => ("Cursor".into(), "Cursor".into()),
+        IdeChoice::VsCode => ("Visual Studio Code".into(), "VS Code".into()),
+        IdeChoice::Custom { app } => {
+            let app = app.trim().to_string();
+            if app.is_empty() {
+                return Err(AppError::Other(
+                    "No IDE configured. Pick one in Settings.".into(),
+                ));
+            }
+            let pretty = app.clone();
+            (app, pretty)
+        }
+    };
+    open_workspace_in(store, id, &app, &pretty).await
 }
 
 /// Shared helper: launch the workspace root in the given macOS app.

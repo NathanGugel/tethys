@@ -16,6 +16,30 @@ pub struct AppState {
     /// a soft-deleted workspace. Surfaced in the system status modal.
     #[serde(default)]
     pub system_errors: Vec<SystemErrorEntry>,
+    /// App-wide user preferences (e.g. which IDE the "Open in IDE" button
+    /// launches). Defaults are applied for pre-existing `state.json` files
+    /// that predate this field.
+    #[serde(default)]
+    pub settings: AppSettings,
+}
+
+/// App-wide user preferences, persisted in `state.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AppSettings {
+    /// Which editor the workspace "Open in IDE" button launches.
+    #[serde(default)]
+    pub ide: IdeChoice,
+}
+
+/// The editor launched by "Open in IDE". `Custom` carries an application
+/// name or a path to a `.app` bundle (whatever `open -a` accepts).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IdeChoice {
+    #[default]
+    Cursor,
+    VsCode,
+    Custom { app: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
