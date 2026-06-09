@@ -1,10 +1,11 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { WebLinksAddon } from "@xterm/addon-web-links";
+import { SearchAddon, type ISearchOptions } from "@xterm/addon-search";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 import { themeToXterm, useTheme } from "./theme";
@@ -12,6 +13,21 @@ import { themeToXterm, useTheme } from "./theme";
 const DEFAULT_XTERM_THEME = {
   background: "#0a0a0a",
   foreground: "#e8e8e8",
+};
+
+// Highlight colors for search hits. Yellow match / orange active-match reads
+// on both light and dark themes, matching the iTerm2 find convention. Passed
+// to the search addon, which paints overlay decorations over the buffer and
+// ticks on the scroll overview ruler.
+const SEARCH_OPTIONS: ISearchOptions = {
+  decorations: {
+    matchBackground: "#9e7b00",
+    matchBorder: "transparent",
+    matchOverviewRuler: "#9e7b00",
+    activeMatchBackground: "#ff8c00",
+    activeMatchBorder: "transparent",
+    activeMatchColorOverviewRuler: "#ff8c00",
+  },
 };
 
 /**
@@ -47,6 +63,16 @@ export function SessionTerminal({ sessionId, readOnly = false }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  const searchRef = useRef<SearchAddon | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  // Find-bar state. `query` is mirrored into a ref so the (mount-time, never
+  // re-registered) xterm key handler can read the live value for Cmd+G
+  // next/prev without being a hook dependency.
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const queryRef = useRef(query);
+  queryRef.current = query;
+  const [results, setResults] = useState({ resultIndex: -1, resultCount: 0 });
   const theme = useTheme();
   // Snapshot the current theme for the mount-time init so the main useEffect
   // doesn't need `theme` as a dep (which would rebuild xterm on every change).
@@ -92,6 +118,12 @@ export function SessionTerminal({ sessionId, readOnly = false }: Props) {
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.loadAddon(new ClipboardAddon());
+    // Cmd+F search across the full 50k-line scrollback (xterm owns the
+    // buffer, so this is entirely client-side — no backend round-trip).
+    const search = new SearchAddon();
+    term.loadAddon(search);
+    searchRef.current = search;
+    const resultsSub = search.onDidChangeResults((r) => setResults(r));
     // Ctrl/Cmd+Click a URL → open in the default browser. We route through
     // plugin-opener so WKWebView doesn't try to intercept navigation and
     // prompt via `dialog.confirm` (which isn't in our capability set).
@@ -159,6 +191,28 @@ export function SessionTerminal({ sessionId, readOnly = false }: Props) {
     };
     term.attachCustomKeyEventHandler((ev) => {
       if (ev.type !== "keydown") return true;
+
+      // Cmd+F → open the find bar (suppress WKWebView's own page find).
+      if (ev.key === "f" && ev.metaKey && !ev.altKey && !ev.ctrlKey) {
+        ev.preventDefault();
+        setSearchOpen(true);
+        // Defer focus/select to after the overlay mounts.
+        queueMicrotask(() => searchInputRef.current?.select());
+        return false;
+      }
+
+      // Cmd+G / Cmd+Shift+G → next / previous match (iTerm2 muscle memory).
+      // Reads the live query from the ref since this handler is registered
+      // once and never sees re-rendered state.
+      if (ev.key === "g" && ev.metaKey && !ev.altKey && !ev.ctrlKey) {
+        ev.preventDefault();
+        const q = queryRef.current;
+        if (q) {
+          if (ev.shiftKey) search.findPrevious(q, SEARCH_OPTIONS);
+          else search.findNext(q, SEARCH_OPTIONS);
+        }
+        return false;
+      }
 
       // Shift+Enter → newline (Option+Enter equivalent in Claude Code).
       if (
@@ -294,6 +348,8 @@ export function SessionTerminal({ sessionId, readOnly = false }: Props) {
       ro.disconnect();
       dataSub?.dispose();
       resizeSub.dispose();
+      resultsSub.dispose();
+      searchRef.current = null;
       dragDisposed = true;
       try {
         dragUnlisten?.();
@@ -311,5 +367,90 @@ export function SessionTerminal({ sessionId, readOnly = false }: Props) {
     // the terminal with the right options.
   }, [sessionId, readOnly]);
 
-  return <div className="session-terminal" ref={containerRef} />;
+  // Incremental find: re-search from the current position as the query
+  // changes so highlights and the match counter track each keystroke.
+  useEffect(() => {
+    if (!searchOpen) return;
+    searchRef.current?.findNext(query, {
+      ...SEARCH_OPTIONS,
+      incremental: true,
+    });
+  }, [query, searchOpen]);
+
+  const findNext = useCallback(() => {
+    searchRef.current?.findNext(queryRef.current, SEARCH_OPTIONS);
+  }, []);
+  const findPrevious = useCallback(() => {
+    searchRef.current?.findPrevious(queryRef.current, SEARCH_OPTIONS);
+  }, []);
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    searchRef.current?.clearDecorations();
+    termRef.current?.focus();
+  }, []);
+
+  const matchLabel = query
+    ? results.resultCount === 0
+      ? "No results"
+      : `${results.resultIndex >= 0 ? results.resultIndex + 1 : 0}/${results.resultCount}`
+    : "";
+
+  return (
+    <div className="session-terminal">
+      <div className="session-terminal-surface" ref={containerRef} />
+      {searchOpen && (
+        <div className="terminal-find" role="search">
+          <input
+            ref={searchInputRef}
+            className="terminal-find-input"
+            type="text"
+            placeholder="Find"
+            value={query}
+            autoFocus
+            spellCheck={false}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                if (e.shiftKey) findPrevious();
+                else findNext();
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                closeSearch();
+              } else if (e.key === "f" && e.metaKey) {
+                // Cmd+F while the bar is open re-selects rather than
+                // letting WKWebView open its own find.
+                e.preventDefault();
+                searchInputRef.current?.select();
+              }
+            }}
+          />
+          <span className="terminal-find-count">{matchLabel}</span>
+          <button
+            className="terminal-find-btn"
+            title="Previous match (Shift+Enter)"
+            onClick={findPrevious}
+            disabled={!query}
+          >
+            ↑
+          </button>
+          <button
+            className="terminal-find-btn"
+            title="Next match (Enter)"
+            onClick={findNext}
+            disabled={!query}
+          >
+            ↓
+          </button>
+          <button
+            className="terminal-find-btn"
+            title="Close (Esc)"
+            onClick={closeSearch}
+          >
+            ✕
+          </button>
+        </div>
+      )}
+    </div>
+  );
 }
