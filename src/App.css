@@ -941,6 +941,73 @@ button.danger.primary:hover:not(:disabled) {
   overflow: hidden;
   margin-bottom: -24px;
   background: var(--bg);
+  position: relative;
+}
+
+/* xterm renders into this; it fills the positioned wrapper so the find bar
+   can float over the terminal without disturbing layout/fit. */
+.session-terminal-surface {
+  position: absolute;
+  inset: 0;
+}
+
+/* iTerm2-style find bar floating in the top-right of the terminal. */
+.terminal-find {
+  position: absolute;
+  top: 8px;
+  right: 16px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  background: var(--sidebar-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+}
+
+.terminal-find-input {
+  width: 180px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 12px;
+  padding: 4px 6px;
+  outline: none;
+}
+
+.terminal-find-input:focus {
+  border-color: var(--accent);
+}
+
+.terminal-find-count {
+  min-width: 48px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.terminal-find-btn {
+  border: none;
+  background: transparent;
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.terminal-find-btn:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--fg) 12%, transparent);
+}
+
+.terminal-find-btn:disabled {
+  color: var(--muted);
+  cursor: default;
 }
 
 /* Fixed-size inline indicators — never shrink in flex rows.
