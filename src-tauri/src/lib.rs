@@ -262,6 +262,7 @@ pub fn run() {
             commands::open_repos_config,
             commands::open_in_vscode,
             commands::open_in_cursor,
+            commands::update_workspace_worktrees,
             commands::list_discrepancies,
             commands::remove_orphan_dir,
             commands::forget_workspace,

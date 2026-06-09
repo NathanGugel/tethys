@@ -843,6 +843,7 @@ function WorkspaceDetail({
   const [busy, setBusy] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
   const [addingRepo, setAddingRepo] = useState(false);
+  const [updatingFromMaster, setUpdatingFromMaster] = useState(false);
   // Per-workspace selection. Derived on render (no effect), so switching
   // back to a workspace paints the remembered pick immediately.
   const [selectedByWorkspace, setSelectedByWorkspace] = useState<
@@ -1057,6 +1058,14 @@ function WorkspaceDetail({
           </button>
           <button
             type="button"
+            onClick={() => setUpdatingFromMaster(true)}
+            disabled={workspace.repo_links.length === 0}
+            title="Fetch origin and merge each repo's default branch into this workspace's worktrees"
+          >
+            Update from master
+          </button>
+          <button
+            type="button"
             onClick={() =>
               invoke("open_in_cursor", { id: workspace.id }).catch((e) =>
                 setError(String(e)),
@@ -1125,6 +1134,13 @@ function WorkspaceDetail({
           workspace={workspace}
           availableRepos={availableRepos}
           onClose={() => setAddingRepo(false)}
+          onSuccess={onRepoAdded}
+        />
+      )}
+      {updatingFromMaster && (
+        <UpdateFromMasterDialog
+          workspace={workspace}
+          onClose={() => setUpdatingFromMaster(false)}
           onSuccess={onRepoAdded}
         />
       )}
@@ -1842,6 +1858,82 @@ function AddRepoDialog({
         ) : (
           <JobLogPane
             title={`Adding ${picked} to ${workspace.branch}`}
+            events={events}
+            state={state}
+            onDismiss={onClose}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Confirms, then streams `update_workspace_worktrees` — fetch origin and
+ * merge each worktree's repo default branch (origin/master etc.) into the
+ * workspace branch. Mirrors `AddRepoDialog`: a confirm step flips to a
+ * JobLogPane once the job is kicked off.
+ */
+function UpdateFromMasterDialog({
+  workspace,
+  onClose,
+  onSuccess,
+}: {
+  workspace: Workspace;
+  onClose: () => void;
+  onSuccess: () => void;
+}) {
+  const [tempId, setTempId] = useState<string | null>(null);
+
+  const descriptor = useMemo<JobDescriptor | null>(() => {
+    if (!tempId) return null;
+    return {
+      key: tempId,
+      command: "update_workspace_worktrees",
+      args: { id: workspace.id },
+    };
+  }, [tempId, workspace.id]);
+
+  const { events, state } = useBackendJob(descriptor, {
+    onSuccess: () => onSuccess(),
+  });
+
+  const isRunning = tempId !== null && state === "running";
+
+  return (
+    <div className="modal-backdrop" onClick={isRunning ? undefined : onClose}>
+      <div
+        className={`modal${tempId ? " add-repo-modal-running" : ""}`}
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+      >
+        {!tempId ? (
+          <>
+            <h3>
+              Update <code>{workspace.branch}</code> from master
+            </h3>
+            <p className="muted">
+              Fetches origin and merges each repo's default branch (
+              <code>origin/master</code>) into this workspace's worktrees. On a
+              conflict the merge is aborted and the worktree left unchanged.
+            </p>
+            <div className="modal-actions">
+              <button type="button" onClick={onClose}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="primary"
+                onClick={() => setTempId(crypto.randomUUID())}
+              >
+                Update
+              </button>
+            </div>
+          </>
+        ) : (
+          <JobLogPane
+            title={`Updating ${workspace.branch} from master`}
             events={events}
             state={state}
             onDismiss={onClose}
