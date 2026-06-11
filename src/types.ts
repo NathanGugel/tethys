@@ -117,6 +117,18 @@ export interface Workspace {
   dev_servers: DevServersMeta | null;
 }
 
+/** Which editor the workspace "Open in IDE" button launches. `custom`
+ *  carries an app name or a path to a `.app` bundle (whatever `open -a`
+ *  accepts). Mirrors the Rust `IdeChoice` enum (serde tag = "kind"). */
+export type IdeChoice =
+  | { kind: "cursor" }
+  | { kind: "vs_code" }
+  | { kind: "custom"; app: string };
+
+export interface AppSettings {
+  ide: IdeChoice;
+}
+
 export interface SystemErrorEntry {
   id: string;
   at: string;

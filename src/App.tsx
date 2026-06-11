@@ -39,6 +39,7 @@ import { GithubAuthFooter } from "./GithubAuthFooter";
 import { GithubChip } from "./GithubChip";
 import { JobLogPane } from "./JobLogPane";
 import { SessionTerminal } from "./SessionTerminal";
+import { SettingsDialog } from "./SettingsDialog";
 import { Sidebar } from "./Sidebar";
 import { SystemStatus } from "./SystemStatus";
 import { applyTheme, ThemeContext } from "./theme";
@@ -53,6 +54,7 @@ function App() {
   const [discrepancies, setDiscrepancies] = useState<Discrepancies | null>(null);
   const [selectedId, setSelectedId] = useState<WorkspaceId | null>(null);
   const [creating, setCreating] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   /**
    * Latest memory snapshot. Subscribed once at the app level and passed
@@ -515,6 +517,13 @@ function App() {
           <SidebarMemoryPressure memory={memory} />
           <SystemStatus allWorkspaces={workspaces} />
           <GithubAuthFooter />
+          <button
+            type="button"
+            className="settings-button"
+            onClick={() => setSettingsOpen(true)}
+          >
+            Settings
+          </button>
         </div>
       </aside>
 
@@ -570,6 +579,10 @@ function App() {
           </div>
         )}
       </main>
+
+      {settingsOpen && (
+        <SettingsDialog onClose={() => setSettingsOpen(false)} />
+      )}
 
       {creating && registry?.kind === "ok" && (
         <CreateWorkspaceDialog
@@ -1058,26 +1071,14 @@ function WorkspaceDetail({
           <button
             type="button"
             onClick={() =>
-              invoke("open_in_cursor", { id: workspace.id }).catch((e) =>
+              invoke("open_in_ide", { id: workspace.id }).catch((e) =>
                 setError(String(e)),
               )
             }
             disabled={workspace.repo_links.length === 0}
-            title="Open every worktree in Cursor"
+            title="Open the workspace in your configured IDE (change it in Settings)"
           >
-            Open in Cursor
-          </button>
-          <button
-            type="button"
-            onClick={() =>
-              invoke("open_in_vscode", { id: workspace.id }).catch((e) =>
-                setError(String(e)),
-              )
-            }
-            disabled={workspace.repo_links.length === 0}
-            title="Open every worktree in VS Code"
-          >
-            Open in VS Code
+            Open in IDE
           </button>
           <button
             type="button"
