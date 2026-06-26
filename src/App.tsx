@@ -24,6 +24,7 @@ import type {
   CreateWorkspaceArgs,
   Discrepancies,
   GithubStatusChangedEvent,
+  ManualPr,
   MemorySnapshot,
   RegistryStatus,
   Repo,
@@ -872,6 +873,7 @@ function WorkspaceDetail({
   const [busy, setBusy] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
   const [addingRepo, setAddingRepo] = useState(false);
+  const [addingPr, setAddingPr] = useState(false);
   // Per-workspace selection. Derived on render (no effect), so switching
   // back to a workspace paints the remembered pick immediately.
   const [selectedByWorkspace, setSelectedByWorkspace] = useState<
@@ -908,7 +910,20 @@ function WorkspaceDetail({
   const isDev = (m: typeof workspace.sessions[number]) =>
     isFeDev(m) || isBeDev(m);
   const ordered = (() => {
-    const reversed = [...workspace.sessions].reverse();
+    // Collapse any duplicate session ids (first occurrence wins) before
+    // ordering. The pinned path below dedups via its id map + `seen` set,
+    // but the default path filters by kind only — so a duplicate id in
+    // `workspace.sessions` would render two identical chips. Dedup at the
+    // source so both paths are safe.
+    const uniqueIds = new Set<string>();
+    const unique: typeof workspace.sessions = [];
+    for (const s of workspace.sessions) {
+      if (!uniqueIds.has(s.id)) {
+        uniqueIds.add(s.id);
+        unique.push(s);
+      }
+    }
+    const reversed = [...unique].reverse();
     const pin = workspace.session_order;
     if (!pin || pin.length === 0) {
       return [
@@ -917,7 +932,7 @@ function WorkspaceDetail({
         ...reversed.filter(isBeDev),
       ];
     }
-    const byId = new Map(workspace.sessions.map((s) => [s.id, s]));
+    const byId = new Map(unique.map((s) => [s.id, s]));
     const seen = new Set<string>();
     const result: typeof workspace.sessions = [];
     for (const id of pin) {
@@ -1067,23 +1082,24 @@ function WorkspaceDetail({
           {workspace.repo_links.map(
             (r) => r.github && <GithubChip key={r.repo_key} status={r.github} />,
           )}
+          {workspace.manual_prs.map((p) => (
+            <ManualPrChip
+              key={`${p.owner}/${p.name}#${p.number}`}
+              workspaceId={workspace.id}
+              pr={p}
+              onError={setError}
+            />
+          ))}
         </h2>
         <div className="actions">
           <button type="button" onClick={() => setShowInfo(true)}>
             Info
           </button>
-          <button
-            type="button"
-            onClick={() => setAddingRepo(true)}
-            disabled={availableRepos.length === 0}
-            title={
-              availableRepos.length === 0
-                ? "Every repo in your registry is already in this workspace"
-                : "Add another repo's worktree to this workspace"
-            }
-          >
-            Add repo
-          </button>
+          <AddMenu
+            addRepoDisabled={availableRepos.length === 0}
+            onAddRepo={() => setAddingRepo(true)}
+            onAddPr={() => setAddingPr(true)}
+          />
           <button
             type="button"
             onClick={() =>
@@ -1158,6 +1174,16 @@ function WorkspaceDetail({
           availableRepos={availableRepos}
           onClose={() => setAddingRepo(false)}
           onSuccess={onRepoAdded}
+        />
+      )}
+      {addingPr && (
+        <AddPrDialog
+          workspace={workspace}
+          onClose={() => setAddingPr(false)}
+          onSuccess={() => {
+            setAddingPr(false);
+            onRepoAdded();
+          }}
         />
       )}
 
@@ -1881,6 +1907,198 @@ function AddRepoDialog({
         )}
       </div>
     </div>
+  );
+}
+
+/** Header "Add ▾" split button: opens a small popover to add a repo worktree
+ *  or attach a PR. Closes on outside-click or Escape. */
+function AddMenu({
+  addRepoDisabled,
+  onAddRepo,
+  onAddPr,
+}: {
+  addRepoDisabled: boolean;
+  onAddRepo: () => void;
+  onAddPr: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const handle = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", handle);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", handle);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  return (
+    <div className="add-menu" ref={ref}>
+      <button type="button" onClick={() => setOpen((v) => !v)}>
+        Add ▾
+      </button>
+      {open && (
+        <div className="add-menu-popover" role="menu">
+          <button
+            type="button"
+            role="menuitem"
+            disabled={addRepoDisabled}
+            title={
+              addRepoDisabled
+                ? "Every repo in your registry is already in this workspace"
+                : "Add another repo's worktree to this workspace"
+            }
+            onClick={() => {
+              setOpen(false);
+              onAddRepo();
+            }}
+          >
+            Add Repo
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            title="Track a PR from another branch on this workspace"
+            onClick={() => {
+              setOpen(false);
+              onAddPr();
+            }}
+          >
+            Add PR
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Dialog to attach a PR by URL. The attach is synchronous (no job log) —
+ *  the backend parses the URL, stores it, and kicks an immediate poll so the
+ *  status squares fill in within a tick. */
+function AddPrDialog({
+  workspace,
+  onClose,
+  onSuccess,
+}: {
+  workspace: Workspace;
+  onClose: () => void;
+  onSuccess: () => void;
+}) {
+  const [url, setUrl] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = url.trim();
+    if (!trimmed || busy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await invoke("attach_manual_pr", {
+        workspaceId: workspace.id,
+        url: trimmed,
+      });
+      onSuccess();
+    } catch (e) {
+      setErr(String(e));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" onClick={busy ? undefined : onClose}>
+      <div
+        className="modal"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+      >
+        <form onSubmit={submit}>
+          <h3>
+            Add PR to <code>{workspace.branch}</code>
+          </h3>
+          <label>
+            PR URL
+            <input
+              type="text"
+              placeholder="https://github.com/owner/repo/pull/123"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              autoFocus
+              disabled={busy}
+            />
+          </label>
+          {err && <p className="modal-error">{err}</p>}
+          <div className="modal-actions">
+            <button type="button" onClick={onClose} disabled={busy}>
+              Cancel
+            </button>
+            <button
+              type="submit"
+              className="primary"
+              disabled={!url.trim() || busy}
+            >
+              {busy ? "Adding…" : "Add"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+/** A manually-attached PR chip: the normal GitHub chip (or a lightweight
+ *  placeholder until the first poll lands) plus a detach affordance. */
+function ManualPrChip({
+  workspaceId,
+  pr,
+  onError,
+}: {
+  workspaceId: WorkspaceId;
+  pr: ManualPr;
+  onError: (msg: string) => void;
+}) {
+  const detach = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    invoke("detach_manual_pr", {
+      workspaceId,
+      owner: pr.owner,
+      name: pr.name,
+      number: pr.number,
+    }).catch((err) => onError(String(err)));
+  };
+
+  return (
+    <span className="manual-pr-chip">
+      {pr.github ? (
+        <GithubChip status={pr.github} />
+      ) : (
+        <span
+          className="gh-chip gh-chip-static"
+          title={`PR #${pr.number} · loading…`}
+        >
+          <span className="gh-pr">#{pr.number}</span>
+        </span>
+      )}
+      <button
+        type="button"
+        className="manual-pr-detach"
+        title="Detach this PR"
+        aria-label="Detach this PR"
+        onClick={detach}
+      >
+        ×
+      </button>
+    </span>
   );
 }
 
