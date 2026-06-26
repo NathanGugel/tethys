@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   DndContext,
   DragOverlay,
@@ -47,6 +48,21 @@ import { useBackendJob, type JobDescriptor } from "./useBackendJob";
 import { useTauriEvent } from "./useTauriEvent";
 import { isReadyToDelete } from "./workspaceDerived";
 import "./App.css";
+
+/**
+ * Derive the Linear ticket URL from a workspace branch name, or null if the
+ * branch contains no ticket ID. Scans the whole branch for the first
+ * ticket-like token (letters-dash-digits) and upper-cases it, so it works
+ * regardless of where the ID sits — e.g. `nathan/nl-7522-acr-score-forms`
+ * → `NL-7522`, `nl-6533-worklist` → `NL-6533`. No fallback to the full ticket
+ * list — if there's no ID, there's simply no button.
+ */
+function linearTicketUrl(branch: string): string | null {
+  const match = branch.match(/[A-Za-z]+-\d+/);
+  return match
+    ? `https://linear.app/newlantern/issue/${match[0].toUpperCase()}`
+    : null;
+}
 
 function App() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
@@ -1080,6 +1096,21 @@ function WorkspaceDetail({
           >
             Open in IDE
           </button>
+          {(() => {
+            const ticketUrl = linearTicketUrl(workspace.branch);
+            if (!ticketUrl) return null;
+            return (
+              <button
+                type="button"
+                onClick={() =>
+                  openUrl(ticketUrl).catch((e) => setError(String(e)))
+                }
+                title={`Open ${ticketUrl} in Linear`}
+              >
+                Open ticket
+              </button>
+            );
+          })()}
           <button
             type="button"
             onClick={onRequestArchive}
