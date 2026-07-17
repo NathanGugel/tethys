@@ -820,6 +820,23 @@ button.danger.primary:hover:not(:disabled) {
   margin-left: auto;
 }
 
+/* Sidebar dot with 2+ lit sessions: grow into a badge carrying the
+   count. Dark text keeps contrast on any theme's (bright) dot color. */
+.turn-dot.has-count {
+  width: auto;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 4px;
+  border-radius: 7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  color: color-mix(in oklab, var(--turn-dot, #e2b23a) 15%, black);
+}
+
 /* Inline error next to the dev-server action buttons in the header. */
 .dev-error-inline {
   color: #e07b6e;

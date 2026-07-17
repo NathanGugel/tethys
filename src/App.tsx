@@ -201,18 +201,27 @@ function App() {
     );
   });
 
-  const workspaceNeedsTurn = useCallback(
-    (w: Workspace): boolean => {
-      if (w.archived_at) return false;
-      for (const info of turnStates.values()) {
+  // Ids of this workspace's sessions with an unacknowledged "your turn"
+  // indicator. The sidebar renders the count in the workspace dot and
+  // names the sessions in its tooltip.
+  const workspaceTurnSessions = useCallback(
+    (w: Workspace): string[] => {
+      if (w.archived_at) return [];
+      const ids: string[] = [];
+      for (const [sessionId, info] of turnStates) {
         if (info.workspaceId !== w.id) continue;
         if (info.state !== "idle" && info.state !== "waiting_input") continue;
         if (info.acknowledged) continue;
-        return true;
+        ids.push(sessionId);
       }
-      return false;
+      return ids;
     },
     [turnStates],
+  );
+
+  const workspaceNeedsTurn = useCallback(
+    (w: Workspace): boolean => workspaceTurnSessions(w).length > 0,
+    [workspaceTurnSessions],
   );
 
   const handleClearTurn = useCallback(
@@ -527,7 +536,7 @@ function App() {
           onArchiveToggle={handleArchiveToggle}
           onDelete={handleDelete}
           onClearTurn={handleClearTurn}
-          workspaceNeedsTurn={workspaceNeedsTurn}
+          workspaceTurnSessions={workspaceTurnSessions}
           memory={memory}
         />
         <div className="sidebar-footer">
