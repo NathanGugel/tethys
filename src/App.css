@@ -1066,6 +1066,7 @@ button.danger.primary:hover:not(:disabled) {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  user-select: none;
 }
 
 .session-chip:hover:not(:disabled) {
