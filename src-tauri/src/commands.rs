@@ -1288,6 +1288,15 @@ pub fn attach_session(
 }
 
 #[tauri::command]
+pub fn detach_session(
+    supervisor: State<'_, Arc<SessionSupervisor>>,
+    session_id: String,
+    channel_id: u32,
+) {
+    supervisor.detach(&session_id, channel_id);
+}
+
+#[tauri::command]
 pub fn send_input(
     supervisor: State<'_, Arc<SessionSupervisor>>,
     session_id: String,
