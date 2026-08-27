@@ -274,6 +274,7 @@ pub fn run() {
             commands::resume_claude_session,
             commands::set_claude_session_hidden,
             commands::attach_session,
+            commands::detach_session,
             commands::send_input,
             commands::resize_session,
             commands::get_theme,
