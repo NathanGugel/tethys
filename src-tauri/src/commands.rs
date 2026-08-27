@@ -17,6 +17,7 @@ use crate::github::parse_github_pr_url;
 use crate::github::poller::{AuthSnapshot, GithubPoller};
 use crate::inprogress::InProgressWorkspaces;
 use crate::job::{JobEvent, JobTx};
+use crate::mcp::McpLaunch;
 use crate::paths::Paths;
 use crate::purge::Purger;
 use crate::reconcile::{self, Discrepancies};
@@ -1083,6 +1084,7 @@ pub async fn start_claude_session(
     store: State<'_, Arc<Store>>,
     claude_bin: State<'_, ClaudeBin>,
     tmux_bin: State<'_, TmuxBin>,
+    mcp: State<'_, Option<McpLaunch>>,
     args: StartClaudeArgs,
 ) -> AppResult<SessionInfo> {
     spawn_claude(
@@ -1093,6 +1095,7 @@ pub async fn start_claude_session(
         &tmux_bin,
         &args,
         None,
+        mcp.inner().as_ref(),
     )
     .await
 }
@@ -1115,6 +1118,7 @@ pub async fn resume_claude_session(
     store: State<'_, Arc<Store>>,
     claude_bin: State<'_, ClaudeBin>,
     tmux_bin: State<'_, TmuxBin>,
+    mcp: State<'_, Option<McpLaunch>>,
     args: ResumeClaudeArgs,
 ) -> AppResult<SessionInfo> {
     // Pull claude_session_id + cwd from the ClaudeSessionMeta we already
@@ -1175,10 +1179,12 @@ pub async fn resume_claude_session(
         &tmux_bin,
         &start,
         Some(&claude_sid),
+        mcp.inner().as_ref(),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_claude(
     app: &AppHandle,
     supervisor: &Arc<SessionSupervisor>,
@@ -1187,6 +1193,7 @@ async fn spawn_claude(
     tmux_bin: &TmuxBin,
     args: &StartClaudeArgs,
     resume_claude_sid: Option<&str>,
+    mcp: Option<&McpLaunch>,
 ) -> AppResult<SessionInfo> {
     if tmux_bin.0.as_os_str().is_empty() {
         return Err(AppError::Other(
@@ -1239,6 +1246,7 @@ async fn spawn_claude(
         &tmux_bin.0,
         &resolved_bin,
         resume_claude_sid,
+        mcp,
     )?;
 
     // Persist a ClaudeSessionMeta entry so resume works across restarts.
