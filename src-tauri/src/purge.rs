@@ -56,7 +56,12 @@ pub async fn purge_workspace(
 
         git::worktree_remove_silent(&clone_path, &link.worktree_path, true).await?;
         git::worktree_prune_best_effort_silent(&clone_path).await;
-        git::branch_delete_best_effort_silent(&clone_path, &workspace.branch).await;
+        // Only delete branches Tethys created — a branch checked out to give
+        // an existing PR its own worktree must survive the purge, or deleting
+        // that workspace would destroy work that lives on GitHub.
+        if link.created_branch {
+            git::branch_delete_best_effort_silent(&clone_path, &workspace.branch).await;
+        }
     }
 
     // Remove the parent dir left behind by `git worktree remove`.
