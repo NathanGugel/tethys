@@ -34,6 +34,9 @@ portable-pty = "0.9"
 bytes = "1"
 fs2 = "0.4"
 fastrand = "2"
+# Wire format only — `default-features = false` drops the `server` feature so
+# the rmcp protocol stack stays in the companion binary, out of the app build.
+tethys-mcp = { path = "../crates/tethys-mcp", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

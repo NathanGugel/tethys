@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
+use crate::mcp::McpLaunch;
 use crate::hook_listener::HookMessage;
 use crate::state::SessionRuntimeState;
 use crate::store::Store;
@@ -344,6 +345,7 @@ impl SessionSupervisor {
     /// The `TETHYS_SPAWN_TOKEN` correlation var reaches claude via tmux's
     /// `-e` flag (per-session env), so the SessionStart hook still maps
     /// back to the right Tethys session.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_claude(
         &self,
         workspace_id: String,
@@ -352,6 +354,7 @@ impl SessionSupervisor {
         tmux_bin: &Path,
         claude_bin: &Path,
         resume_claude_session_id: Option<&str>,
+        mcp: Option<&McpLaunch>,
     ) -> AppResult<(SessionInfo, String)> {
         let token = Uuid::new_v4().to_string();
         let id = new_session_id();
@@ -376,6 +379,12 @@ impl SessionSupervisor {
             "--".into(),
             claude_bin.to_string_lossy().into_owned(),
         ]);
+        // Hands this session the Tethys tools. The identity in the rendered
+        // config is this session's own, which is what stops an agent linking a
+        // PR onto somebody else's workspace.
+        if let Some(mcp) = mcp {
+            args.extend(mcp.claude_args(&workspace_id, &id));
+        }
         if let Some(csid) = resume_claude_session_id {
             args.push("--resume".into());
             args.push(csid.to_string());
