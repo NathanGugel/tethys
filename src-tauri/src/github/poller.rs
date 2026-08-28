@@ -380,6 +380,7 @@ fn build_query(targets: &[Target]) -> (String, BTreeMap<String, String>) {
     const PR_FIELDS: &str = r#"number
           url
           state
+          headRefName
           isDraft
           mergeable
           reviewDecision
@@ -524,6 +525,11 @@ fn parse_pr_fields(pr: &Value) -> Option<GithubPrStatus> {
         _ => return None,
     };
     let is_draft = pr.get("isDraft").and_then(|v| v.as_bool()).unwrap_or(false);
+    let head_branch = pr
+        .get("headRefName")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty());
 
     // GitHub's `mergeable` is `MERGEABLE | CONFLICTING | UNKNOWN`. UNKNOWN
     // shows up briefly after a push while GitHub computes the merge — only
@@ -645,6 +651,7 @@ fn parse_pr_fields(pr: &Value) -> Option<GithubPrStatus> {
         review_decision,
         unresolved_threads,
         head_sha,
+        head_branch,
         fetched_at: Utc::now(),
         last_error: None,
     })
@@ -926,6 +933,7 @@ mod tests {
             review_decision: ReviewDecision::None,
             unresolved_threads: 0,
             head_sha: "sha".into(),
+            head_branch: None,
             fetched_at: Utc::now(),
             last_error: None,
         };
@@ -1221,6 +1229,7 @@ mod tests {
             review_decision: ReviewDecision::None,
             unresolved_threads: 0,
             head_sha: "sha".into(),
+            head_branch: None,
             fetched_at: Utc::now(),
             last_error: None,
         };
@@ -1529,5 +1538,40 @@ mod tests {
         assert_eq!(backoff_for(1), Duration::from_secs(90));
         assert_eq!(backoff_for(2), Duration::from_secs(180));
         assert!(backoff_for(10) <= MAX_BACKOFF);
+    }
+
+    /// The head branch is what tells a PR apart from the worktree it belongs
+    /// to, so a status without it can't answer "is this PR already checked
+    /// out here?".
+    #[test]
+    fn parse_pr_fields_reads_the_head_branch() {
+        let pr = serde_json::json!({
+            "number": 4321,
+            "url": "https://github.com/acme/web/pull/4321",
+            "state": "OPEN",
+            "headRefName": "nathan/bulk-clone-append-only-copy",
+            "isDraft": false,
+        });
+        let status = super::parse_pr_fields(&pr).expect("must parse");
+        assert_eq!(
+            status.head_branch.as_deref(),
+            Some("nathan/bulk-clone-append-only-copy")
+        );
+    }
+
+    /// GitHub omitting the field, or an empty string, must read as "unknown"
+    /// rather than as a branch named "".
+    #[test]
+    fn parse_pr_fields_treats_a_missing_or_empty_head_branch_as_none() {
+        let base = serde_json::json!({
+            "number": 1,
+            "url": "https://github.com/acme/web/pull/1",
+            "state": "OPEN",
+        });
+        assert_eq!(super::parse_pr_fields(&base).expect("parses").head_branch, None);
+
+        let mut empty = base.clone();
+        empty["headRefName"] = serde_json::json!("");
+        assert_eq!(super::parse_pr_fields(&empty).expect("parses").head_branch, None);
     }
 }

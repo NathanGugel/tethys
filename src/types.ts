@@ -35,6 +35,9 @@ export interface GithubPrStatus {
   review_decision: ReviewDecision;
   unresolved_threads: number;
   head_sha: string;
+  /** Branch the PR is opened from. Null for statuses polled before the field
+   *  existed; they refresh on the next poll tick. */
+  head_branch: string | null;
   fetched_at: string;
   last_error: string | null;
 }
