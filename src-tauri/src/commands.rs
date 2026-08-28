@@ -25,8 +25,8 @@ use crate::registry::{self, starter_template, RegistryLoad, Repo};
 use crate::sessions::{SessionInfo, SessionSupervisor};
 use crate::setup;
 use crate::state::{
-    AppSettings, ClaudeSessionMeta, IdeChoice, ManualPr, RepoLink, SystemErrorEntry, Workspace,
-    WorkspaceId, WorkspaceStatus,
+    AppSettings, ClaudeSessionMeta, IdeChoice, ManualPr, RepoLink, SessionId, SessionKind,
+    SessionRuntimeState, SystemErrorEntry, Workspace, WorkspaceId, WorkspaceStatus,
 };
 use crate::dev_orchestrator::{BeMode, OrchestratorConfig};
 use crate::dev_servers::{self, DevServerLocks, DevStateSnapshot};
@@ -1366,6 +1366,198 @@ pub struct SetClaudeHiddenArgs {
 
 /// Toggle a Claude session's `hidden` flag in state. Cosmetic only — the
 /// tmux session and the supervisor's `SessionHandle` keep running.
+#[derive(Debug, serde::Deserialize)]
+pub struct MoveSessionArgs {
+    pub session_meta_id: SessionId,
+    pub from_workspace: WorkspaceId,
+    pub to_workspace: WorkspaceId,
+}
+
+/// Move a Claude session into another workspace, keeping its conversation.
+///
+/// A running process can't change directory, so this is a respawn: the old
+/// tmux session is killed and `claude --resume` starts in the destination
+/// worktree. What makes that work is copying the transcript first — Claude
+/// keys sessions by working directory, so a resume from a different cwd looks
+/// in a different place and finds nothing.
+///
+/// The Tethys session id changes (it is the tmux session name, and that is a
+/// new process); the Claude session id, the display name, and the conversation
+/// do not.
+#[tauri::command]
+pub async fn move_session_to_workspace(
+    app: AppHandle,
+    supervisor: State<'_, Arc<SessionSupervisor>>,
+    store: State<'_, Arc<Store>>,
+    claude_bin: State<'_, ClaudeBin>,
+    tmux_bin: State<'_, TmuxBin>,
+    mcp: State<'_, Option<McpLaunch>>,
+    args: MoveSessionArgs,
+) -> AppResult<SessionInfo> {
+    if args.from_workspace == args.to_workspace {
+        return Err(AppError::Other("that session is already there".into()));
+    }
+    if tmux_bin.0.as_os_str().is_empty() {
+        return Err(AppError::Other("tmux not found".into()));
+    }
+
+    let meta = store
+        .read(|s| {
+            s.find_workspace(&args.from_workspace).and_then(|w| {
+                w.sessions
+                    .iter()
+                    .find(|sess| sess.id == args.session_meta_id)
+                    .cloned()
+            })
+        })
+        .await
+        .ok_or_else(|| {
+            AppError::Other(format!(
+                "no session {} in workspace {}",
+                args.session_meta_id, args.from_workspace
+            ))
+        })?;
+
+    if meta.kind != SessionKind::Claude {
+        return Err(AppError::Other(
+            "only Claude sessions can be moved — a dev server belongs to its worktree".into(),
+        ));
+    }
+    // Mid-turn work is lost on respawn and there is no way to get it back, so
+    // refuse rather than silently discard it.
+    if meta.runtime_state == Some(SessionRuntimeState::Working) {
+        return Err(AppError::Other(
+            "that session is mid-turn. Wait for it to finish, or it loses the work in flight."
+                .into(),
+        ));
+    }
+    let claude_sid = meta.claude_session_id.clone().ok_or_else(|| {
+        AppError::Other(
+            "that session has never reported a Claude session id, so there is no \
+             conversation to carry over."
+                .into(),
+        )
+    })?;
+
+    // Land in the same repo's worktree when the destination has that repo,
+    // otherwise at its root — the same rule a new session follows.
+    let (dest_cwd, dest_repo_key, dest_binary) = store
+        .read(|s| {
+            s.find_workspace(&args.to_workspace).and_then(|w| {
+                let same_repo = meta.repo_key.as_deref().and_then(|key| {
+                    w.repo_links
+                        .iter()
+                        .find(|l| l.repo_key == key)
+                        .map(|l| (l.worktree_path.clone(), Some(key.to_string())))
+                });
+                let resolved = same_repo.or_else(|| {
+                    w.repo_links
+                        .first()
+                        .and_then(|l| l.worktree_path.parent().map(|p| (p.to_path_buf(), None)))
+                })?;
+                Some((resolved.0, resolved.1, w.claude_binary.clone()))
+            })
+        })
+        .await
+        .ok_or_else(|| {
+            AppError::Other(format!(
+                "workspace {} has no worktrees to move into",
+                args.to_workspace
+            ))
+        })?;
+
+    copy_transcript_for_move(&meta, &dest_cwd, &claude_sid)?;
+
+    // Kill the old pane before spawning, so two clients never share one
+    // conversation.
+    tmux::kill_session(&tmux_bin.0, &args.session_meta_id);
+
+    let resolved_bin = match dest_binary.as_deref() {
+        Some(bin) => claude::resolve_named(bin)?,
+        None => claude_bin.0.clone(),
+    };
+    let (info, _token) = supervisor.spawn_claude(
+        args.to_workspace.clone(),
+        dest_repo_key.clone(),
+        &dest_cwd,
+        &tmux_bin.0,
+        &resolved_bin,
+        Some(&claude_sid),
+        mcp.inner().as_ref(),
+    )?;
+
+    let moved = ClaudeSessionMeta {
+        id: info.id.clone(),
+        kind: SessionKind::Claude,
+        repo_key: dest_repo_key,
+        cwd: dest_cwd,
+        claude_session_id: Some(claude_sid),
+        transcript_path: None,
+        hidden: meta.hidden,
+        runtime_state: None,
+        notification_type: None,
+        turn_acknowledged: false,
+        display_name: meta.display_name.clone(),
+    };
+    store
+        .mutate(|s| {
+            if let Some(src) = s.find_workspace_mut(&args.from_workspace) {
+                src.sessions.retain(|sess| sess.id != args.session_meta_id);
+                if let Some(order) = src.session_order.as_mut() {
+                    order.retain(|id| *id != args.session_meta_id);
+                }
+            }
+            let dest = s
+                .find_workspace_mut(&args.to_workspace)
+                .ok_or_else(|| AppError::WorkspaceNotFound(args.to_workspace.clone()))?;
+            dest.sessions.push(moved.clone());
+            Ok(())
+        })
+        .await?;
+
+    info!(
+        from = %args.from_workspace,
+        to = %args.to_workspace,
+        old_session = %args.session_meta_id,
+        new_session = %info.id,
+        "moved session between workspaces"
+    );
+    emit_workspace_changed(&app, &args.from_workspace);
+    emit_workspace_changed(&app, &args.to_workspace);
+    Ok(info)
+}
+
+/// Put the conversation where the destination's `claude --resume` will look
+/// for it. Without this the resume reports "No conversation found".
+fn copy_transcript_for_move(
+    meta: &ClaudeSessionMeta,
+    dest_cwd: &Path,
+    claude_sid: &str,
+) -> AppResult<()> {
+    let src = meta
+        .transcript_path
+        .clone()
+        .or_else(|| {
+            crate::paths::claude_project_dir(&meta.cwd)
+                .map(|dir| dir.join(format!("{claude_sid}.jsonl")))
+        })
+        .ok_or_else(|| AppError::Other("could not locate the session transcript".into()))?;
+    if !src.exists() {
+        return Err(AppError::Other(format!(
+            "session transcript is missing at {}",
+            src.display()
+        )));
+    }
+    let dest_dir = crate::paths::claude_project_dir(dest_cwd)
+        .ok_or_else(|| AppError::Other("could not resolve the destination's Claude dir".into()))?;
+    std::fs::create_dir_all(&dest_dir)?;
+    let dest = dest_dir.join(format!("{claude_sid}.jsonl"));
+    // Copy rather than move: the source workspace may still be around, and a
+    // transcript is the only record of the conversation.
+    std::fs::copy(&src, &dest)?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn set_claude_session_hidden(
     app: AppHandle,

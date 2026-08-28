@@ -303,6 +303,7 @@ pub fn run() {
             commands::start_claude_session,
             commands::resume_claude_session,
             commands::set_claude_session_hidden,
+            commands::move_session_to_workspace,
             commands::attach_session,
             commands::detach_session,
             commands::send_input,

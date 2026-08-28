@@ -1837,3 +1837,17 @@ li.is-dragging {
   margin: 8px 0 0;
   font-size: 0.9em;
 }
+
+.move-session-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  max-height: 40vh;
+  overflow-y: auto;
+  margin: 0.5rem 0;
+}
+
+.move-session-list button {
+  text-align: left;
+  font-family: var(--mono, monospace);
+}
