@@ -17,13 +17,13 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, error, info, warn};
 
 use crate::error::{AppError, AppResult};
-use crate::github::{parse_pr_reference, GithubPoller, GithubSlug, PrReference};
+use crate::github::{parse_pr_reference, GithubPoller, GithubPrStatus, GithubSlug, PrReference};
 use crate::paths::Paths;
 use crate::registry::RegistryLoad;
 use crate::state::ManualPr;
 use crate::store::Store;
 
-pub use tethys_mcp::{LinkPr, Request, Response};
+pub use tethys_mcp::{DescribeWorkspace, LinkPr, PrView, Request, Response, RepoView, WorkspaceView};
 
 /// Everything needed to render a session's `--mcp-config`, resolved once at
 /// boot: the companion binary, the socket it should dial, and the registry repo
@@ -158,6 +158,7 @@ async fn serve_connection(mut stream: UnixStream, services: McpServices) -> AppR
     let request: Request = tethys_mcp::read_frame(&mut stream).await?;
     let response = match request {
         Request::LinkPr(req) => link_pr(&services, req).await,
+        Request::DescribeWorkspace(req) => describe_workspace(&services, req).await,
     };
     tethys_mcp::write_frame(&mut stream, &response).await?;
     Ok(())
@@ -206,6 +207,14 @@ async fn attach(services: &McpServices, req: &LinkPr) -> AppResult<Response> {
         PrReference::Number(n) => n,
     };
 
+    // Record which repo the PR belongs to. Named by the agent, or worked out by
+    // matching the slug against the registry — either way it is only stored
+    // once we know the workspace actually spans that repo.
+    let repo_key = match req.repo_key.clone() {
+        Some(key) => Some(key),
+        None => infer_repo_key(services, &req.from_workspace, &slug).await,
+    };
+
     let already_attached = services
         .store
         .mutate(|s| {
@@ -221,6 +230,7 @@ async fn attach(services: &McpServices, req: &LinkPr) -> AppResult<Response> {
                     owner: slug.owner.clone(),
                     name: slug.name.clone(),
                     number,
+                    repo_key: repo_key.clone(),
                     github: None,
                 });
             }
@@ -314,6 +324,161 @@ async fn resolve_repo_slug(
     }
 }
 
+/// Which of the workspace's repos carries this slug, if any. Used to record a
+/// repo for a PR the agent didn't name one for.
+async fn infer_repo_key(
+    services: &McpServices,
+    workspace_id: &str,
+    slug: &GithubSlug,
+) -> Option<String> {
+    let repo_keys: Vec<String> = services
+        .store
+        .read(|s| {
+            s.find_workspace(workspace_id)
+                .map(|ws| ws.repo_links.iter().map(|l| l.repo_key.clone()).collect())
+                .unwrap_or_default()
+        })
+        .await;
+    let reg = services.registry.require().ok()?;
+    repo_keys.into_iter().find(|key| {
+        reg.find_repo(key)
+            .and_then(|r| r.github_slug.as_ref())
+            .is_some_and(|s| s == slug)
+    })
+}
+
+/// Everything an agent may know about the workspace it is running in. Scoped to
+/// the caller's own workspace — the id comes off the connection's baked-in
+/// identity, so this can't be turned into a way to read the others.
+async fn describe_workspace(services: &McpServices, req: DescribeWorkspace) -> Response {
+    debug!(
+        from_workspace = %req.from_workspace,
+        from_session = ?req.from_session,
+        "workspace description requested"
+    );
+
+    let Some(snapshot) = services
+        .store
+        .read(|s| s.find_workspace(&req.from_workspace).cloned())
+        .await
+    else {
+        return Response::Rejected {
+            message: format!("workspace {} is not in state", req.from_workspace),
+        };
+    };
+
+    // The workspace root is the parent every repo worktree sits under.
+    let root = snapshot
+        .repo_links
+        .first()
+        .and_then(|l| l.worktree_path.parent())
+        .map(|p| p.display().to_string());
+
+    let mut repos = Vec::with_capacity(snapshot.repo_links.len());
+    for link in &snapshot.repo_links {
+        let slug = services
+            .registry
+            .require()
+            .ok()
+            .and_then(|reg| reg.find_repo(&link.repo_key).and_then(|r| r.github_slug.clone()));
+        repos.push(RepoView {
+            repo_key: link.repo_key.clone(),
+            worktree_path: link.worktree_path.display().to_string(),
+            current_branch: current_branch(&link.worktree_path).await,
+            branch_pr: link.github.as_ref().and_then(|status| {
+                slug.as_ref()
+                    .map(|slug| pr_view(slug, status, Some(link.repo_key.clone())))
+            }),
+        });
+    }
+
+    let attached_prs = snapshot
+        .manual_prs
+        .iter()
+        .map(|pr| match &pr.github {
+            Some(status) => pr_view(
+                &GithubSlug {
+                    owner: pr.owner.clone(),
+                    name: pr.name.clone(),
+                },
+                status,
+                pr.repo_key.clone(),
+            ),
+            // Attached but not yet polled — report it rather than hide it, or
+            // an agent would re-link a PR that is already there.
+            None => PrView {
+                owner: pr.owner.clone(),
+                name: pr.name.clone(),
+                number: pr.number,
+                url: format!(
+                    "https://github.com/{}/{}/pull/{}",
+                    pr.owner, pr.name, pr.number
+                ),
+                repo_key: pr.repo_key.clone(),
+                state: None,
+                is_draft: None,
+                checks: None,
+                review_decision: None,
+                unresolved_threads: None,
+                has_merge_conflicts: None,
+            },
+        })
+        .collect();
+
+    Response::Described(WorkspaceView {
+        workspace_id: snapshot.id.clone(),
+        branch: snapshot.branch.clone(),
+        root,
+        repos,
+        attached_prs,
+    })
+}
+
+/// The branch a worktree is *actually* on. `None` when the directory is gone or
+/// git can't answer — which is itself worth reporting, so the caller doesn't
+/// assume the worktree is fine.
+async fn current_branch(worktree: &Path) -> Option<String> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!branch.is_empty()).then_some(branch)
+}
+
+/// Flatten a polled status into the wire view. The enums become strings here
+/// so the wire crate doesn't have to restate them.
+fn pr_view(slug: &GithubSlug, status: &GithubPrStatus, repo_key: Option<String>) -> PrView {
+    PrView {
+        owner: slug.owner.clone(),
+        name: slug.name.clone(),
+        number: status.pr_number,
+        url: status.url.clone(),
+        repo_key,
+        state: Some(as_tag(&status.state)),
+        is_draft: Some(status.is_draft),
+        checks: Some(as_tag(&status.checks)),
+        review_decision: Some(as_tag(&status.review_decision)),
+        unresolved_threads: Some(status.unresolved_threads),
+        has_merge_conflicts: Some(status.has_merge_conflicts),
+    }
+}
+
+/// Render one of the status enums as its snake_case serde tag, so the wire
+/// format tracks the app's own spelling without a second definition.
+fn as_tag<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| "unknown".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,6 +511,9 @@ mod tests {
         let args = launch().claude_args("ws-1", "sess-1");
         assert_eq!(args.len(), 2);
         assert!(args[0].starts_with("--mcp-config={"));
-        assert_eq!(args[1], "--allowed-tools=mcp__tethys__link_pr");
+        assert_eq!(
+            args[1],
+            "--allowed-tools=mcp__tethys__link_pr,mcp__tethys__describe_workspace"
+        );
     }
 }

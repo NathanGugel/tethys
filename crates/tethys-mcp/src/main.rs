@@ -32,8 +32,9 @@ use serde_json::json;
 use tokio::net::UnixStream;
 
 use tethys_mcp::{
-    read_frame, write_frame, LinkPr, Request, Response, ENV_REPO_KEYS, ENV_SESSION_ID, ENV_SOCKET,
-    ENV_WORKSPACE_ID, TOOL_LINK_PR,
+    read_frame, write_frame, DescribeWorkspace, LinkPr, PrView, Request, Response, WorkspaceView,
+    ENV_REPO_KEYS, ENV_SESSION_ID, ENV_SOCKET, ENV_WORKSPACE_ID, TOOL_DESCRIBE_WORKSPACE,
+    TOOL_LINK_PR,
 };
 
 /// What the calling agent supplies to `link_pr`. The workspace it lands on
@@ -133,6 +134,30 @@ impl TethysServer {
         )
     }
 
+    /// `describe_workspace` takes no arguments. Which workspace is being asked
+    /// about is not the agent's to choose, and there is nothing else to vary.
+    fn describe_workspace_tool(&self) -> Tool {
+        Tool::new(
+            Cow::Borrowed(TOOL_DESCRIBE_WORKSPACE),
+            Cow::Borrowed(
+                "Report what the Tethys workspace this session belongs to is made \
+                 of: each repo, where its worktree is on disk, which branch that \
+                 worktree is currently on, and every pull request Tethys is \
+                 tracking for it — both the ones it detected from the branches and \
+                 the ones attached with link_pr.\n\n\
+                 The branch reported per repo is read from git, not from Tethys's \
+                 own record, so it tells you what is really checked out. Those can \
+                 differ: a worktree may have been moved to another branch by hand, \
+                 which is worth noticing before you build on top of it.\n\n\
+                 Reach for it when you need to work across the workspace's other \
+                 repos, when you need a sibling worktree's path, or to check \
+                 whether a PR is already linked before calling link_pr. It reads \
+                 only; nothing is changed.",
+            ),
+            empty_schema(),
+        )
+    }
+
     /// The `tools/list` reply.
     ///
     /// `ttl_ms` and `cache_scope` are not optional in practice. Claude Code
@@ -143,7 +168,7 @@ impl TethysServer {
     /// when Tethys spawns this process, so a cached list must not outlive the
     /// session it was built for.
     fn tools_result(&self) -> ListToolsResult {
-        ListToolsResult::with_all_items(vec![self.link_pr_tool()])
+        ListToolsResult::with_all_items(vec![self.link_pr_tool(), self.describe_workspace_tool()])
             .with_ttl_ms(0)
             .with_cache_scope(CacheScope::Private)
     }
@@ -186,6 +211,7 @@ impl ServerHandler for TethysServer {
     ) -> Result<CallToolResponse, ErrorData> {
         match request.name.as_ref() {
             TOOL_LINK_PR => self.link_pr(request.arguments).await,
+            TOOL_DESCRIBE_WORKSPACE => self.describe_workspace().await,
             other => Err(ErrorData::invalid_params(
                 format!("unknown tool: {other}"),
                 None,
@@ -237,8 +263,107 @@ impl TethysServer {
             Response::Rejected { message } => {
                 failed(format!("link refused, nothing was linked: {message}"))
             }
+            other => failed(format!("Tethys answered a link with {other:?}")),
         })
     }
+
+
+    async fn describe_workspace(&self) -> Result<CallToolResponse, ErrorData> {
+        let request = Request::DescribeWorkspace(DescribeWorkspace {
+            from_workspace: self.from_workspace.clone(),
+            from_session: self.from_session.clone(),
+        });
+
+        let response = match self.send(&request).await {
+            Ok(response) => response,
+            Err(e) => return Ok(failed(format!("could not read the workspace: {e}"))),
+        };
+
+        Ok(match response {
+            Response::Described(view) => {
+                CallToolResult::success(vec![ContentBlock::text(render_workspace(&view))]).into()
+            }
+            Response::Rejected { message } => failed(message),
+            other => failed(format!("Tethys answered a describe with {other:?}")),
+        })
+    }
+}
+
+/// Render the workspace as prose rather than JSON. An agent reads this to
+/// decide what to do next, and a table of paths and branches is easier to act
+/// on than a nested object.
+fn render_workspace(view: &WorkspaceView) -> String {
+    let mut out = format!("Workspace {} on branch `{}`", view.workspace_id, view.branch);
+    if let Some(root) = &view.root {
+        out.push_str(&format!("\nRoot: {root}"));
+    }
+
+    out.push_str("\n\nRepos:");
+    if view.repos.is_empty() {
+        out.push_str("\n  (none)");
+    }
+    for repo in &view.repos {
+        out.push_str(&format!("\n  {} — {}", repo.repo_key, repo.worktree_path));
+        match repo.current_branch.as_deref() {
+            Some(b) if b == view.branch => out.push_str(&format!("\n    on `{b}`")),
+            // Worth calling out: the worktree is not where Tethys thinks it is,
+            // which is exactly the case an agent must not paper over.
+            Some(b) => out.push_str(&format!(
+                "\n    on `{b}` — NOT the workspace branch `{}`",
+                view.branch
+            )),
+            None => out.push_str("\n    branch unknown (worktree missing?)"),
+        }
+        match &repo.branch_pr {
+            Some(pr) => out.push_str(&format!("\n    branch PR: {}", render_pr(pr))),
+            None => out.push_str("\n    branch PR: none"),
+        }
+    }
+
+    out.push_str("\n\nAttached PRs:");
+    if view.attached_prs.is_empty() {
+        out.push_str("\n  (none)");
+    }
+    for pr in &view.attached_prs {
+        let where_ = pr.repo_key.as_deref().unwrap_or("repo not recorded");
+        out.push_str(&format!("\n  [{where_}] {}", render_pr(pr)));
+    }
+    out
+}
+
+fn render_pr(pr: &PrView) -> String {
+    let mut bits = vec![format!("{}/{}#{}", pr.owner, pr.name, pr.number)];
+    if let Some(state) = &pr.state {
+        let draft = if pr.is_draft.unwrap_or(false) {
+            " (draft)"
+        } else {
+            ""
+        };
+        bits.push(format!("{state}{draft}"));
+    }
+    if let Some(checks) = &pr.checks {
+        bits.push(format!("checks {checks}"));
+    }
+    if let Some(review) = &pr.review_decision {
+        bits.push(format!("review {review}"));
+    }
+    if pr.unresolved_threads.unwrap_or(0) > 0 {
+        bits.push(format!("{} unresolved", pr.unresolved_threads.unwrap_or(0)));
+    }
+    if pr.has_merge_conflicts.unwrap_or(false) {
+        bits.push("CONFLICTS".into());
+    }
+    bits.push(pr.url.clone());
+    bits.join(" · ")
+}
+
+/// A no-argument tool still needs an object schema; some clients reject a bare
+/// `{}` with no `type`.
+fn empty_schema() -> JsonObject {
+    json!({ "type": "object", "properties": {}, "additionalProperties": false })
+        .as_object()
+        .cloned()
+        .expect("input schema literal is an object")
 }
 
 /// Deserialize a tool call's arguments. The one place a bad call is a protocol
@@ -308,8 +433,11 @@ mod tests {
         assert_eq!(schema["properties"]["repo_key"]["type"], "string");
     }
 
+    /// Every tool has to be listed here *and* in `ALLOWED_TOOLS`. One that
+    /// reaches the agent without the permission entry stalls on a dialog
+    /// nobody is watching, so the two lists are checked against each other.
     #[test]
-    fn the_tools_reply_carries_the_link_tool() {
+    fn the_tools_reply_carries_every_tool_and_each_one_is_allowed() {
         let raw = serde_json::to_value(server().tools_result()).expect("serialize");
         let names: Vec<&str> = raw["tools"]
             .as_array()
@@ -317,6 +445,22 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().expect("name"))
             .collect();
-        assert_eq!(names, vec![TOOL_LINK_PR]);
+        assert_eq!(names, vec![TOOL_LINK_PR, TOOL_DESCRIBE_WORKSPACE]);
+
+        for name in names {
+            let qualified = format!("mcp__tethys__{name}");
+            assert!(
+                tethys_mcp::ALLOWED_TOOLS.contains(&qualified.as_str()),
+                "{qualified} is offered but missing from ALLOWED_TOOLS"
+            );
+        }
+    }
+
+    /// A no-argument tool still needs a well-formed object schema.
+    #[test]
+    fn describe_workspace_takes_no_arguments() {
+        let raw = serde_json::to_value(server().describe_workspace_tool()).expect("serialize");
+        assert_eq!(raw["inputSchema"]["type"], "object");
+        assert!(raw["inputSchema"]["required"].is_null());
     }
 }

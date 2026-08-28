@@ -85,12 +85,33 @@ pub async fn github_reprobe_auth(
 pub async fn attach_manual_pr(
     app: AppHandle,
     store: State<'_, Arc<Store>>,
+    registry: State<'_, Arc<RegistryLoad>>,
     poller: State<'_, Arc<GithubPoller>>,
     workspace_id: WorkspaceId,
     url: String,
 ) -> AppResult<Workspace> {
     let (slug, number) = parse_github_pr_url(&url)
         .ok_or_else(|| AppError::Other(format!("not a GitHub PR URL: {url}")))?;
+
+    // Record which repo this PR belongs to when the slug matches one the
+    // workspace spans. The dialog only asks for a URL, so this is the only
+    // chance to work it out.
+    let repo_key = {
+        let keys: Vec<String> = store
+            .read(|s| {
+                s.find_workspace(&workspace_id)
+                    .map(|ws| ws.repo_links.iter().map(|l| l.repo_key.clone()).collect())
+                    .unwrap_or_default()
+            })
+            .await;
+        registry.require().ok().and_then(|reg| {
+            keys.into_iter().find(|key| {
+                reg.find_repo(key)
+                    .and_then(|r| r.github_slug.as_ref())
+                    .is_some_and(|s| *s == slug)
+            })
+        })
+    };
 
     let updated = store
         .mutate(|s| {
@@ -105,6 +126,7 @@ pub async fn attach_manual_pr(
                     owner: slug.owner.clone(),
                     name: slug.name.clone(),
                     number,
+                    repo_key: repo_key.clone(),
                     github: None,
                 });
             }

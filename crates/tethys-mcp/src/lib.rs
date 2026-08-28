@@ -21,10 +21,17 @@ pub const SERVER_NAME: &str = "tethys";
 /// effect, and doesn't need the word "attach" the UI uses.
 pub const TOOL_LINK_PR: &str = "link_pr";
 
+/// Report what the calling workspace is made of — its repos, their worktrees,
+/// the branch each one is actually on, and every PR Tethys is tracking for it.
+pub const TOOL_DESCRIBE_WORKSPACE: &str = "describe_workspace";
+
 /// Every tool, fully qualified the way Claude's permission system spells them.
 /// Each one has to be listed for `--allowed-tools`, or a call to it stalls on a
 /// permission dialog nobody is watching.
-pub const ALLOWED_TOOLS: &[&str] = &["mcp__tethys__link_pr"];
+pub const ALLOWED_TOOLS: &[&str] = &[
+    "mcp__tethys__link_pr",
+    "mcp__tethys__describe_workspace",
+];
 
 /// Env keys Tethys bakes into the generated `--mcp-config` at spawn time.
 /// The calling session's identity arrives this way rather than as tool
@@ -49,6 +56,17 @@ pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     LinkPr(LinkPr),
+    DescribeWorkspace(DescribeWorkspace),
+}
+
+/// A read of the calling workspace. Carries only the identity — there is
+/// nothing for the agent to ask *about*, because it may only ever ask about
+/// itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DescribeWorkspace {
+    pub from_workspace: String,
+    #[serde(default)]
+    pub from_session: Option<String>,
 }
 
 /// A link request: the reference the agent typed, plus the identity Tethys
@@ -74,6 +92,64 @@ pub struct LinkPr {
     pub reference: String,
 }
 
+/// One repo's worktree inside a workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoView {
+    pub repo_key: String,
+    pub worktree_path: String,
+    /// Branch the worktree is *actually* on, read from git rather than from
+    /// Tethys's state. The two can differ — someone can check out another
+    /// branch by hand — and the real one is the useful answer.
+    #[serde(default)]
+    pub current_branch: Option<String>,
+    /// The PR Tethys auto-detected for this repo's branch, if any.
+    #[serde(default)]
+    pub branch_pr: Option<PrView>,
+}
+
+/// A pull request as Tethys currently understands it. Status fields are plain
+/// strings rather than enums: this crate is the wire format, and mirroring the
+/// app's enums here would mean two definitions to keep in step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrView {
+    pub owner: String,
+    pub name: String,
+    pub number: u32,
+    pub url: String,
+    /// Which repo of the workspace this PR belongs to, when known.
+    #[serde(default)]
+    pub repo_key: Option<String>,
+    /// `open` / `merged` / `closed`. `None` before the first poll lands.
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub is_draft: Option<bool>,
+    /// `none` / `pending` / `success` / `failure` / `neutral`.
+    #[serde(default)]
+    pub checks: Option<String>,
+    #[serde(default)]
+    pub review_decision: Option<String>,
+    #[serde(default)]
+    pub unresolved_threads: Option<u32>,
+    #[serde(default)]
+    pub has_merge_conflicts: Option<bool>,
+}
+
+/// The whole of what an agent may know about the workspace it is running in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceView {
+    pub workspace_id: String,
+    /// The workspace's own branch — the one Tethys provisioned its worktrees
+    /// on, and the one it looks PRs up by.
+    pub branch: String,
+    /// Parent directory holding every repo's worktree.
+    #[serde(default)]
+    pub root: Option<String>,
+    pub repos: Vec<RepoView>,
+    /// PRs attached by hand or via `link_pr`, as opposed to auto-detected.
+    pub attached_prs: Vec<PrView>,
+}
+
 /// The app's answer, one success variant per request plus a shared refusal.
 ///
 /// A link isn't reported until the PR has been resolved to real GitHub
@@ -90,6 +166,7 @@ pub enum Response {
         /// saying so keeps an agent from reporting a change it didn't make.
         already_attached: bool,
     },
+    Described(WorkspaceView),
     Rejected {
         message: String,
     },
@@ -154,7 +231,9 @@ mod tests {
         let mut buf = Vec::new();
         write_frame(&mut buf, &req).await.expect("write");
         let mut cursor = std::io::Cursor::new(buf);
-        let Request::LinkPr(back) = read_frame(&mut cursor).await.expect("read");
+        let Request::LinkPr(back) = read_frame(&mut cursor).await.expect("read") else {
+            panic!("must round-trip as a link_pr request")
+        };
         assert_eq!(back.reference, "https://github.com/me/api/pull/12");
         assert_eq!(back.repo_key.as_deref(), Some("backend"));
     }
@@ -167,7 +246,9 @@ mod tests {
             "from_workspace": "ws-1",
             "reference": "#12"
         }"##;
-        let Request::LinkPr(req) = serde_json::from_str(raw).expect("must deserialize");
+        let Request::LinkPr(req) = serde_json::from_str(raw).expect("must deserialize") else {
+            panic!("must parse as a link_pr request")
+        };
         assert_eq!(req.repo_key, None);
         assert_eq!(req.from_session, None);
     }
@@ -185,5 +266,34 @@ mod tests {
         let mut cursor = std::io::Cursor::new(0u32.to_be_bytes().to_vec());
         let got: io::Result<Request> = read_frame(&mut cursor).await;
         assert_eq!(got.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn a_describe_frame_round_trips_under_its_own_tag() {
+        let req = Request::DescribeWorkspace(DescribeWorkspace {
+            from_workspace: "ws-1".into(),
+            from_session: Some("sess-1".into()),
+        });
+        let raw = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(raw["op"], "describe_workspace");
+
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &req).await.expect("write");
+        let mut cursor = std::io::Cursor::new(buf);
+        let Request::DescribeWorkspace(back) = read_frame(&mut cursor).await.expect("read") else {
+            panic!("must round-trip as a describe_workspace request")
+        };
+        assert_eq!(back.from_workspace, "ws-1");
+    }
+
+    /// The two ops share a socket, so the tag is the only thing keeping them
+    /// apart. A describe frame must never be readable as a link.
+    #[test]
+    fn the_op_tag_separates_the_two_requests() {
+        let raw = r#"{"op":"describe_workspace","from_workspace":"ws-1"}"#;
+        assert!(matches!(
+            serde_json::from_str::<Request>(raw).expect("must deserialize"),
+            Request::DescribeWorkspace(_)
+        ));
     }
 }

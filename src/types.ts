@@ -53,6 +53,10 @@ export interface ManualPr {
   owner: string;
   name: string;
   number: number;
+  /** Which of the workspace's repos this PR belongs to, when known. Null for
+   *  PRs attached before the field existed, or in a repo the workspace
+   *  doesn't span. */
+  repo_key: string | null;
   github: GithubPrStatus | null;
 }
 
