@@ -333,6 +333,24 @@ async fn provision_repo_worktree(ctx: RepoProvision<'_>) -> AppResult<RepoLink> 
     let created_branch = !branch_preexisted;
 
     if branch_preexisted {
+        // Git allows a branch in one worktree at a time, and all of a repo's
+        // worktrees share this clone. Say which workspace is holding it —
+        // "already used by worktree at <path>" is git's answer, and the path
+        // is a workspace the user can actually go and free.
+        if let Some(holder) = git::worktree_holding_branch(&clone_path, ctx.branch).await? {
+            let workspace = holder
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| holder.display().to_string());
+            return Err(AppError::Other(format!(
+                "branch '{}' is already checked out in workspace '{}' ({}). \
+                 Free it there first, or work in that workspace instead.",
+                ctx.branch,
+                workspace,
+                holder.display()
+            )));
+        }
         ctx.tx.status(
             format!("checking out existing branch {}", ctx.branch),
             Some(&ctx.repo.key),
