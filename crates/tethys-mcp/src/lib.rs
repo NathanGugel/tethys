@@ -76,6 +76,12 @@ pub struct GivePrOwnWorkspace {
     pub from_session: Option<String>,
     /// `123`, `#123`, `owner/repo#123`, or a full GitHub PR URL.
     pub reference: String,
+    /// Opt in to detaching another workspace's worktree when it holds the
+    /// branch. Defaults false, so the first call refuses and names the holder
+    /// — an agent has to decide to disturb someone else's work, rather than
+    /// discovering afterwards that it did.
+    #[serde(default)]
+    pub take_branch: bool,
 }
 
 /// A read of the calling workspace. Carries only the identity — there is

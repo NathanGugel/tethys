@@ -167,6 +167,14 @@ impl TethysServer {
                     "description": "The pull request: a full GitHub URL, \
                         `owner/repo#123`, or just the number.",
                 },
+                "take_branch": {
+                    "type": "boolean",
+                    "description": "Set true to detach another workspace's \
+                        worktree if it is holding the branch. Leave it out on \
+                        the first call: it will refuse and name the workspace \
+                        that would be disturbed, which is usually worth \
+                        mentioning before you go ahead.",
+                },
             },
             "required": ["reference"],
             "additionalProperties": false,
@@ -182,8 +190,9 @@ impl TethysServer {
                  because that is where its branch comes from; call link_pr first \
                  if it isn't, and describe_workspace to see what is. Only one \
                  worktree may hold a branch at a time, so if another workspace \
-                 has it, that worktree is detached first — it keeps its files at \
-                 the same commit and simply stops owning the branch name.\n\n\
+                 has it this refuses and names it; pass take_branch to detach \
+                 that worktree, which keeps its files at the same commit and \
+                 simply stops owning the branch name.\n\n\
                  Provisioning (worktrees, dependency install, setup scripts) \
                  takes minutes and runs in the background: this returns once the \
                  workspace is accepted, not when it is ready.",
@@ -334,12 +343,15 @@ impl TethysServer {
         #[derive(Deserialize)]
         struct Args {
             reference: String,
+            #[serde(default)]
+            take_branch: bool,
         }
         let args: Args = parse_args(arguments)?;
         let request = Request::GivePrOwnWorkspace(GivePrOwnWorkspace {
             from_workspace: self.from_workspace.clone(),
             from_session: self.from_session.clone(),
             reference: args.reference,
+            take_branch: args.take_branch,
         });
 
         let response = match self.send(&request).await {
@@ -563,5 +575,32 @@ mod tests {
         let raw = serde_json::to_value(server().describe_workspace_tool()).expect("serialize");
         assert_eq!(raw["inputSchema"]["type"], "object");
         assert!(raw["inputSchema"]["required"].is_null());
+    }
+
+    /// Taking a branch off another workspace has to be opted into, so the
+    /// schema must offer it — and must not require it, or every call becomes a
+    /// decision to disturb someone.
+    #[test]
+    fn give_pr_own_workspace_offers_take_branch_without_requiring_it() {
+        let raw = serde_json::to_value(server().give_pr_own_workspace_tool()).expect("serialize");
+        let schema = &raw["inputSchema"];
+        assert_eq!(schema["required"], serde_json::json!(["reference"]));
+        assert_eq!(schema["properties"]["take_branch"]["type"], "boolean");
+    }
+
+    /// A frame from a client predating the flag must read as "don't take it".
+    #[test]
+    fn a_give_frame_without_take_branch_defaults_to_refusing() {
+        let raw = r##"{
+            "op": "give_pr_own_workspace",
+            "from_workspace": "ws-1",
+            "reference": "#4300"
+        }"##;
+        let tethys_mcp::Request::GivePrOwnWorkspace(req) =
+            serde_json::from_str(raw).expect("must deserialize")
+        else {
+            panic!("must parse as give_pr_own_workspace")
+        };
+        assert!(!req.take_branch);
     }
 }

@@ -2191,6 +2191,53 @@ function AddPrDialog({
 
 /** A manually-attached PR chip: the normal GitHub chip (or a lightweight
  *  placeholder until the first poll lands) plus a detach affordance. */
+/** Asks before taking a branch off another workspace's worktree. That worktree
+ *  keeps its files — it's detached at the same commit — but it stops being on
+ *  a branch, which is surprising enough to be worth a click. */
+function DetachConfirmDialog({
+  holder,
+  branch,
+  busy,
+  onConfirm,
+  onCancel,
+}: {
+  holder: string;
+  branch: string;
+  busy: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" onClick={busy ? undefined : onCancel}>
+      <div
+        className="modal"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+      >
+        <h3>Take the branch from {holder}?</h3>
+        <p>
+          <code>{branch}</code> is checked out in <strong>{holder}</strong>, and
+          only one worktree can have it.
+        </p>
+        <p>
+          That worktree keeps its files exactly as they are — it stays on the
+          same commit — but it will no longer be on a branch, so commits made
+          there afterwards land on a detached HEAD.
+        </p>
+        <div className="modal-actions">
+          <button type="button" onClick={onCancel} disabled={busy}>
+            Cancel
+          </button>
+          <button type="button" onClick={onConfirm} disabled={busy}>
+            {busy ? "Freeing…" : "Take the branch"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /** Right-click menu on an attached PR chip. Only one item so far, so it stays
  *  local to the chip rather than joining the session-chip menu. */
 function PrChipMenu({
@@ -2265,6 +2312,9 @@ function ManualPrChip({
 }) {
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   const [busy, setBusy] = useState(false);
+  /** Workspace currently holding the branch, once we've asked and it turned
+   *  out someone does. Non-null means the confirmation is up. */
+  const [confirmHolder, setConfirmHolder] = useState<string | null>(null);
 
   const head = pr.github?.head_branch ?? null;
   // Offer the move only for a PR on some other branch: one opened from this
@@ -2272,22 +2322,37 @@ function ManualPrChip({
   // poll after attaching, and for statuses stored before head_branch existed.
   const canMove = head !== null && head !== workspaceBranch;
 
-  const giveOwnWorkspace = async () => {
+  // Freeing the branch detaches whichever worktree holds it, which is usually
+  // someone else's workspace — so find out whose before doing it, and ask.
+  const startGiveOwnWorkspace = async () => {
     if (!head) return;
     setBusy(true);
     try {
-      // Git allows a branch in one worktree at a time, so whoever holds it has
-      // to let go before a new workspace can check it out. Detaching leaves
-      // that worktree on the same commit — its files don't move.
-      const freed = await invoke<{ freed: boolean; workspace: string | null }>(
-        "free_branch",
+      const holder = await invoke<{ workspace: string | null }>(
+        "find_branch_holder",
         { args: { branch: head, repo_key: pr.repo_key } },
       );
-      if (freed.freed && freed.workspace) {
-        console.info(
-          `detached ${freed.workspace} to release ${head}`,
-        );
+      if (holder.workspace) {
+        setConfirmHolder(holder.workspace);
+      } else {
+        // Nothing holds it — no one to disturb, so don't ask.
+        await freeAndCreate();
       }
+    } catch (err) {
+      onError(String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const freeAndCreate = async () => {
+    if (!head) return;
+    setBusy(true);
+    try {
+      await invoke("free_branch", {
+        args: { branch: head, repo_key: pr.repo_key },
+      });
+      setConfirmHolder(null);
       onGiveOwnWorkspace(head);
     } catch (err) {
       onError(String(err));
@@ -2321,8 +2386,17 @@ function ManualPrChip({
           y={menu.y}
           branch={head ?? ""}
           busy={busy}
-          onGiveOwnWorkspace={giveOwnWorkspace}
+          onGiveOwnWorkspace={startGiveOwnWorkspace}
           onClose={() => setMenu(null)}
+        />
+      )}
+      {confirmHolder && (
+        <DetachConfirmDialog
+          holder={confirmHolder}
+          branch={head ?? ""}
+          busy={busy}
+          onConfirm={freeAndCreate}
+          onCancel={() => setConfirmHolder(null)}
         />
       )}
       {/* Which worktree the PR belongs to. A workspace can hold PRs from
