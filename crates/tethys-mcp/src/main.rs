@@ -32,9 +32,9 @@ use serde_json::json;
 use tokio::net::UnixStream;
 
 use tethys_mcp::{
-    read_frame, write_frame, DescribeWorkspace, LinkPr, PrView, Request, Response, WorkspaceView,
-    ENV_REPO_KEYS, ENV_SESSION_ID, ENV_SOCKET, ENV_WORKSPACE_ID, TOOL_DESCRIBE_WORKSPACE,
-    TOOL_LINK_PR,
+    read_frame, write_frame, DescribeWorkspace, GivePrOwnWorkspace, LinkPr, PrView, Request,
+    Response, WorkspaceView, ENV_REPO_KEYS, ENV_SESSION_ID, ENV_SOCKET, ENV_WORKSPACE_ID,
+    TOOL_DESCRIBE_WORKSPACE, TOOL_GIVE_PR_OWN_WORKSPACE, TOOL_LINK_PR,
 };
 
 /// What the calling agent supplies to `link_pr`. The workspace it lands on
@@ -158,6 +158,40 @@ impl TethysServer {
         )
     }
 
+    fn give_pr_own_workspace_tool(&self) -> Tool {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "reference": {
+                    "type": "string",
+                    "description": "The pull request: a full GitHub URL, \
+                        `owner/repo#123`, or just the number.",
+                },
+            },
+            "required": ["reference"],
+            "additionalProperties": false,
+        });
+        Tool::new(
+            Cow::Borrowed(TOOL_GIVE_PR_OWN_WORKSPACE),
+            Cow::Borrowed(
+                "Provision a Tethys workspace of its own for a pull request, so \
+                 it gets its own worktree per repo and its own dev servers — the \
+                 way to actually run a PR that was opened from a branch other \
+                 than the one this worktree is on.\n\n\
+                 The PR has to be one Tethys already tracks for this workspace, \
+                 because that is where its branch comes from; call link_pr first \
+                 if it isn't, and describe_workspace to see what is. Only one \
+                 worktree may hold a branch at a time, so if another workspace \
+                 has it, that worktree is detached first — it keeps its files at \
+                 the same commit and simply stops owning the branch name.\n\n\
+                 Provisioning (worktrees, dependency install, setup scripts) \
+                 takes minutes and runs in the background: this returns once the \
+                 workspace is accepted, not when it is ready.",
+            ),
+            schema.as_object().cloned().expect("schema literal is an object"),
+        )
+    }
+
     /// The `tools/list` reply.
     ///
     /// `ttl_ms` and `cache_scope` are not optional in practice. Claude Code
@@ -168,7 +202,11 @@ impl TethysServer {
     /// when Tethys spawns this process, so a cached list must not outlive the
     /// session it was built for.
     fn tools_result(&self) -> ListToolsResult {
-        ListToolsResult::with_all_items(vec![self.link_pr_tool(), self.describe_workspace_tool()])
+        ListToolsResult::with_all_items(vec![
+            self.link_pr_tool(),
+            self.describe_workspace_tool(),
+            self.give_pr_own_workspace_tool(),
+        ])
             .with_ttl_ms(0)
             .with_cache_scope(CacheScope::Private)
     }
@@ -212,6 +250,7 @@ impl ServerHandler for TethysServer {
         match request.name.as_ref() {
             TOOL_LINK_PR => self.link_pr(request.arguments).await,
             TOOL_DESCRIBE_WORKSPACE => self.describe_workspace().await,
+            TOOL_GIVE_PR_OWN_WORKSPACE => self.give_pr_own_workspace(request.arguments).await,
             other => Err(ErrorData::invalid_params(
                 format!("unknown tool: {other}"),
                 None,
@@ -285,6 +324,58 @@ impl TethysServer {
             }
             Response::Rejected { message } => failed(message),
             other => failed(format!("Tethys answered a describe with {other:?}")),
+        })
+    }
+
+    async fn give_pr_own_workspace(
+        &self,
+        arguments: Option<JsonObject>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        #[derive(Deserialize)]
+        struct Args {
+            reference: String,
+        }
+        let args: Args = parse_args(arguments)?;
+        let request = Request::GivePrOwnWorkspace(GivePrOwnWorkspace {
+            from_workspace: self.from_workspace.clone(),
+            from_session: self.from_session.clone(),
+            reference: args.reference,
+        });
+
+        let response = match self.send(&request).await {
+            Ok(response) => response,
+            Err(e) => {
+                return Ok(failed(format!(
+                    "no workspace was created, and nothing was detached: {e}"
+                )))
+            }
+        };
+
+        Ok(match response {
+            Response::WorkspaceCreated {
+                workspace_id,
+                branch,
+                repos,
+                freed_from,
+            } => {
+                let freed = match freed_from {
+                    Some(ws) => format!(
+                        " Workspace {ws} was holding `{branch}` and has been detached — \
+                         it keeps its files, but is no longer on that branch."
+                    ),
+                    None => String::new(),
+                };
+                CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Workspace {workspace_id} is provisioning on `{branch}` across {}. \
+                     It takes a few minutes and nothing further is reported back here.{freed}",
+                    repos.join(", ")
+                ))])
+                .into()
+            }
+            Response::Rejected { message } => {
+                failed(format!("no workspace was created: {message}"))
+            }
+            other => failed(format!("Tethys answered with {other:?}")),
         })
     }
 }
@@ -448,7 +539,14 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().expect("name"))
             .collect();
-        assert_eq!(names, vec![TOOL_LINK_PR, TOOL_DESCRIBE_WORKSPACE]);
+        assert_eq!(
+            names,
+            vec![
+                TOOL_LINK_PR,
+                TOOL_DESCRIBE_WORKSPACE,
+                TOOL_GIVE_PR_OWN_WORKSPACE
+            ]
+        );
 
         for name in names {
             let qualified = format!("mcp__tethys__{name}");

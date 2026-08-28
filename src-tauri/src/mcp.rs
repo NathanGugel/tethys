@@ -19,11 +19,15 @@ use tracing::{debug, error, info, warn};
 use crate::error::{AppError, AppResult};
 use crate::github::{parse_pr_reference, GithubPoller, GithubPrStatus, GithubSlug, PrReference};
 use crate::paths::Paths;
+use crate::inprogress::InProgressWorkspaces;
 use crate::registry::RegistryLoad;
 use crate::state::ManualPr;
 use crate::store::Store;
 
-pub use tethys_mcp::{DescribeWorkspace, LinkPr, PrView, Request, Response, RepoView, WorkspaceView};
+pub use tethys_mcp::{
+    DescribeWorkspace, GivePrOwnWorkspace, LinkPr, PrView, RepoView, Request, Response,
+    WorkspaceView,
+};
 
 /// Everything needed to render a session's `--mcp-config`, resolved once at
 /// boot: the companion binary, the socket it should dial, and the registry repo
@@ -116,6 +120,8 @@ pub struct McpServices {
     pub store: Arc<Store>,
     pub registry: Arc<RegistryLoad>,
     pub poller: Arc<GithubPoller>,
+    pub paths: Paths,
+    pub in_progress: InProgressWorkspaces,
 }
 
 /// Bind `mcp.sock` and spawn an accept loop. If the socket already exists (a
@@ -159,6 +165,7 @@ async fn serve_connection(mut stream: UnixStream, services: McpServices) -> AppR
     let response = match request {
         Request::LinkPr(req) => link_pr(&services, req).await,
         Request::DescribeWorkspace(req) => describe_workspace(&services, req).await,
+        Request::GivePrOwnWorkspace(req) => give_pr_own_workspace(&services, req).await,
     };
     tethys_mcp::write_frame(&mut stream, &response).await?;
     Ok(())
@@ -322,6 +329,149 @@ async fn resolve_repo_slug(
                 .join(", ")
         ))),
     }
+}
+
+/// Provision a workspace of its own for a PR the caller's workspace tracks.
+///
+/// Resolving the PR against tracked state rather than GitHub is deliberate:
+/// the head branch has to come from somewhere, and requiring the PR to be
+/// tracked means an agent can only ever act on a PR already associated with
+/// its own workspace.
+async fn give_pr_own_workspace(services: &McpServices, req: GivePrOwnWorkspace) -> Response {
+    debug!(
+        from_workspace = %req.from_workspace,
+        reference = %req.reference,
+        "pr workspace requested"
+    );
+    match provision_for_pr(services, &req).await {
+        Ok(response) => response,
+        Err(e) => {
+            warn!(error = %e, "pr workspace refused");
+            Response::Rejected {
+                message: e.to_string(),
+            }
+        }
+    }
+}
+
+async fn provision_for_pr(
+    services: &McpServices,
+    req: &GivePrOwnWorkspace,
+) -> AppResult<Response> {
+    let parsed = parse_pr_reference(&req.reference).ok_or_else(|| {
+        AppError::Other(format!(
+            "could not read '{}' as a pull request. Use a GitHub URL, \
+             owner/repo#123, or just the number.",
+            req.reference
+        ))
+    })?;
+    let number = match parsed {
+        PrReference::Qualified(_, n) => n,
+        PrReference::Number(n) => n,
+    };
+
+    let Some(caller) = services
+        .store
+        .read(|s| s.find_workspace(&req.from_workspace).cloned())
+        .await
+    else {
+        return Err(AppError::WorkspaceNotFound(req.from_workspace.clone()));
+    };
+
+    // The head branch is the whole of what a new workspace needs, and it only
+    // exists on a polled status — so the PR has to be one Tethys is tracking.
+    let branch = caller
+        .manual_prs
+        .iter()
+        .filter(|p| p.number == number)
+        .find_map(|p| p.github.as_ref().and_then(|g| g.head_branch.clone()))
+        .or_else(|| {
+            caller.repo_links.iter().find_map(|l| {
+                l.github
+                    .as_ref()
+                    .filter(|g| g.pr_number == number)
+                    .and_then(|g| g.head_branch.clone())
+            })
+        })
+        .ok_or_else(|| {
+            AppError::Other(format!(
+                "this workspace isn't tracking a PR #{number} with a known branch. \
+                 Link it first, or wait for the next poll if you just linked it."
+            ))
+        })?;
+
+    if branch == caller.branch {
+        return Err(AppError::Other(format!(
+            "PR #{number} is opened from `{branch}`, which is this workspace's own \
+             branch — it already has a worktree here."
+        )));
+    }
+
+    // Only one worktree may hold a branch. Detach whoever has it; their files
+    // stay on the same commit, they just stop owning the name.
+    let mut freed_from = None;
+    let reg = services.registry.require()?;
+    for repo in &reg.repos {
+        let clone_path = services.paths.repo_clone_path(&repo.key);
+        if !clone_path.exists() {
+            continue;
+        }
+        if let Some(holder) = crate::git::worktree_holding_branch(&clone_path, &branch).await? {
+            crate::git::detach_worktree(&holder).await?;
+            freed_from = holder
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned());
+            info!(branch = %branch, holder = %holder.display(), "detached to free branch for pr workspace");
+            break;
+        }
+    }
+
+    // Mirror the caller's repo set, so the new workspace can run the same stack.
+    let repos: Vec<String> = caller.repo_links.iter().map(|l| l.repo_key.clone()).collect();
+    if repos.is_empty() {
+        return Err(AppError::Other(
+            "this workspace has no repos to mirror".into(),
+        ));
+    }
+
+    let workspace_id = uuid::Uuid::new_v4().to_string();
+    let args = crate::commands::CreateWorkspaceArgs {
+        workspace_id: workspace_id.clone(),
+        branch: branch.clone(),
+        repo_selections: repos.clone(),
+        claude_binary: caller.claude_binary.clone(),
+    };
+
+    // Provisioning takes minutes; the caller is told it started, not that it
+    // finished. Failures land on the row as CreationFailed, where they're the
+    // user's to see — the agent has already moved on.
+    let services = services.clone();
+    let id_for_log = workspace_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        if let Err(e) = crate::commands::provision_workspace(
+            &services.app,
+            &services.store,
+            &services.registry,
+            &services.paths,
+            &services.in_progress,
+            args,
+            crate::job::JobTx(tx),
+        )
+        .await
+        {
+            warn!(id = %id_for_log, error = %e, "mcp-requested workspace failed to provision");
+        }
+    });
+
+    Ok(Response::WorkspaceCreated {
+        workspace_id,
+        branch,
+        repos,
+        freed_from,
+    })
 }
 
 /// Which of the workspace's repos carries this slug, if any. Used to record a
@@ -515,7 +665,9 @@ mod tests {
         assert!(args[0].starts_with("--mcp-config={"));
         assert_eq!(
             args[1],
-            "--allowed-tools=mcp__tethys__link_pr,mcp__tethys__describe_workspace"
+            "--allowed-tools=mcp__tethys__link_pr,mcp__tethys__describe_workspace,\
+mcp__tethys__give_pr_own_workspace"
+                .replace('\n', "")
         );
     }
 }
