@@ -119,6 +119,9 @@ pub struct PrView {
     /// Which repo of the workspace this PR belongs to, when known.
     #[serde(default)]
     pub repo_key: Option<String>,
+    /// Branch the PR is opened from — what you'd check out to work on it.
+    #[serde(default)]
+    pub head_branch: Option<String>,
     /// `open` / `merged` / `closed`. `None` before the first poll lands.
     #[serde(default)]
     pub state: Option<String>,

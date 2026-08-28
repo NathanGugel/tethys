@@ -415,6 +415,7 @@ async fn describe_workspace(services: &McpServices, req: DescribeWorkspace) -> R
                     pr.owner, pr.name, pr.number
                 ),
                 repo_key: pr.repo_key.clone(),
+                head_branch: None,
                 state: None,
                 is_draft: None,
                 checks: None,
@@ -461,6 +462,7 @@ fn pr_view(slug: &GithubSlug, status: &GithubPrStatus, repo_key: Option<String>)
         number: status.pr_number,
         url: status.url.clone(),
         repo_key,
+        head_branch: status.head_branch.clone(),
         state: Some(as_tag(&status.state)),
         is_draft: Some(status.is_draft),
         checks: Some(as_tag(&status.checks)),

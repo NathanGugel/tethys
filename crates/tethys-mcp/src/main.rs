@@ -333,6 +333,9 @@ fn render_workspace(view: &WorkspaceView) -> String {
 
 fn render_pr(pr: &PrView) -> String {
     let mut bits = vec![format!("{}/{}#{}", pr.owner, pr.name, pr.number)];
+    if let Some(branch) = &pr.head_branch {
+        bits.push(format!("from `{branch}`"));
+    }
     if let Some(state) = &pr.state {
         let draft = if pr.is_draft.unwrap_or(false) {
             " (draft)"

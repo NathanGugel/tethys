@@ -53,6 +53,12 @@ pub struct GithubPrStatus {
     pub review_decision: ReviewDecision,
     pub unresolved_threads: u32,
     pub head_sha: String,
+    /// Branch the PR is opened from. Needed to tell whether a PR belongs to a
+    /// worktree that's already checked out on it, and to know what to check
+    /// out when giving a PR its own worktree. `None` for statuses polled
+    /// before this field existed — they refresh on the next tick.
+    #[serde(default)]
+    pub head_branch: Option<String>,
     pub fetched_at: DateTime<Utc>,
     #[serde(default)]
     pub last_error: Option<String>,
