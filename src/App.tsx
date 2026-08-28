@@ -70,7 +70,9 @@ function App() {
   const [registry, setRegistry] = useState<RegistryStatus | null>(null);
   const [discrepancies, setDiscrepancies] = useState<Discrepancies | null>(null);
   const [selectedId, setSelectedId] = useState<WorkspaceId | null>(null);
-  const [creating, setCreating] = useState(false);
+  // `false` when closed; an object when open, optionally carrying a branch to
+  // prefill (used when giving a PR its own workspace).
+  const [creating, setCreating] = useState<false | { branch?: string }>(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   /**
@@ -520,7 +522,7 @@ function App() {
         <div className="sidebar-header">
           <button
             className="primary"
-            onClick={() => setCreating(true)}
+            onClick={() => setCreating({})}
             type="button"
             disabled={!registryOk}
             title={!registryOk ? "Configure repos.toml first" : undefined}
@@ -584,6 +586,7 @@ function App() {
         ))}
         {!selectedRun && selected && selected.status.kind === "ready" && (
           <WorkspaceDetail
+            onGiveOwnWorkspace={(b) => setCreating({ branch: b })}
             workspace={selected}
             sessions={sessionsByWorkspace.get(selected.id) ?? []}
             availableRepos={
@@ -612,6 +615,7 @@ function App() {
 
       {creating && registry?.kind === "ok" && (
         <CreateWorkspaceDialog
+          initialBranch={creating.branch}
           repos={registry.registry.repos}
           onClose={() => setCreating(false)}
           onSubmit={(partial) => {
@@ -871,6 +875,7 @@ function WorkspaceDetail({
   onRequestDelete,
   onRequestArchive,
   onRepoAdded,
+  onGiveOwnWorkspace,
 }: {
   workspace: Workspace;
   sessions: SessionInfo[];
@@ -878,6 +883,8 @@ function WorkspaceDetail({
   onRequestDelete: () => void;
   onRequestArchive: () => void;
   onRepoAdded: () => void;
+  /** Open the new-workspace dialog prefilled with this branch. */
+  onGiveOwnWorkspace: (branch: string) => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
@@ -1105,8 +1112,10 @@ function WorkspaceDetail({
             <ManualPrChip
               key={`${p.owner}/${p.name}#${p.number}`}
               workspaceId={workspace.id}
+              workspaceBranch={workspace.branch}
               pr={p}
               onError={setError}
+              onGiveOwnWorkspace={onGiveOwnWorkspace}
             />
           ))}
         </h2>
@@ -2182,15 +2191,111 @@ function AddPrDialog({
 
 /** A manually-attached PR chip: the normal GitHub chip (or a lightweight
  *  placeholder until the first poll lands) plus a detach affordance. */
+/** Right-click menu on an attached PR chip. Only one item so far, so it stays
+ *  local to the chip rather than joining the session-chip menu. */
+function PrChipMenu({
+  x,
+  y,
+  branch,
+  busy,
+  onGiveOwnWorkspace,
+  onClose,
+}: {
+  x: number;
+  y: number;
+  branch: string;
+  busy: boolean;
+  onGiveOwnWorkspace: () => void;
+  onClose: () => void;
+}) {
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const handle = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("mousedown", handle);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", handle);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [onClose]);
+
+  const ESTIMATED_W = 240;
+  const ESTIMATED_H = 60;
+  const left = Math.min(x, window.innerWidth - ESTIMATED_W - 4);
+  const top = Math.min(y, window.innerHeight - ESTIMATED_H - 4);
+
+  return (
+    <div ref={ref} className="context-menu" style={{ left, top }} role="menu">
+      <button
+        type="button"
+        role="menuitem"
+        disabled={busy}
+        title={`Free ${branch} and open a new workspace on it`}
+        onClick={() => {
+          onGiveOwnWorkspace();
+          onClose();
+        }}
+      >
+        {busy ? "Freeing branch…" : "Give this PR its own workspace"}
+      </button>
+    </div>
+  );
+}
+
 function ManualPrChip({
   workspaceId,
+  workspaceBranch,
   pr,
   onError,
+  onGiveOwnWorkspace,
 }: {
   workspaceId: WorkspaceId;
+  /** The workspace's own branch. A PR opened from it is already the thing
+   *  this worktree is working on, so there's nothing to move. */
+  workspaceBranch: string;
   pr: ManualPr;
   onError: (msg: string) => void;
+  onGiveOwnWorkspace: (branch: string) => void;
 }) {
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const head = pr.github?.head_branch ?? null;
+  // Offer the move only for a PR on some other branch: one opened from this
+  // workspace's own branch is already here. `head` is null until the first
+  // poll after attaching, and for statuses stored before head_branch existed.
+  const canMove = head !== null && head !== workspaceBranch;
+
+  const giveOwnWorkspace = async () => {
+    if (!head) return;
+    setBusy(true);
+    try {
+      // Git allows a branch in one worktree at a time, so whoever holds it has
+      // to let go before a new workspace can check it out. Detaching leaves
+      // that worktree on the same commit — its files don't move.
+      const freed = await invoke<{ freed: boolean; workspace: string | null }>(
+        "free_branch",
+        { args: { branch: head, repo_key: pr.repo_key } },
+      );
+      if (freed.freed && freed.workspace) {
+        console.info(
+          `detached ${freed.workspace} to release ${head}`,
+        );
+      }
+      onGiveOwnWorkspace(head);
+    } catch (err) {
+      onError(String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const detach = (e: React.MouseEvent) => {
     e.stopPropagation();
     invoke("detach_manual_pr", {
@@ -2202,7 +2307,24 @@ function ManualPrChip({
   };
 
   return (
-    <span className="manual-pr-chip">
+    <span
+      className="manual-pr-chip"
+      onContextMenu={(e) => {
+        if (!canMove) return;
+        e.preventDefault();
+        setMenu({ x: e.clientX, y: e.clientY });
+      }}
+    >
+      {menu && (
+        <PrChipMenu
+          x={menu.x}
+          y={menu.y}
+          branch={head ?? ""}
+          busy={busy}
+          onGiveOwnWorkspace={giveOwnWorkspace}
+          onClose={() => setMenu(null)}
+        />
+      )}
       {/* Which worktree the PR belongs to. A workspace can hold PRs from
           several repos, and the chip alone doesn't say which is which. */}
       {pr.repo_key && (
@@ -2262,12 +2384,16 @@ function CreateWorkspaceDialog({
   repos,
   onClose,
   onSubmit,
+  initialBranch,
 }: {
   repos: Repo[];
   onClose: () => void;
   onSubmit: (args: CreateWorkspaceFormArgs) => void;
+  /** Prefills the branch field — set when the dialog is opened for a PR that
+   *  already has a branch, so it isn't retyped. */
+  initialBranch?: string;
 }) {
-  const [branch, setBranch] = useState("");
+  const [branch, setBranch] = useState(initialBranch ?? "");
   const [selected, setSelected] = useState<Set<string>>(() =>
     loadLastRepoSelection(repos),
   );
