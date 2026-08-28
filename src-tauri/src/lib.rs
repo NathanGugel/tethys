@@ -11,6 +11,7 @@ mod hook_listener;
 mod inprogress;
 mod job;
 mod logging;
+mod mcp;
 mod memory_poller;
 mod paths;
 mod purge;
@@ -179,6 +180,29 @@ pub fn run() {
             });
             tauri::async_runtime::spawn(poller.clone().run());
 
+            // --- mcp: the tools a session gets over Tethys itself ----------
+            // Resolved once at boot. `None` (companion binary missing) means
+            // sessions spawn without the tools rather than failing to spawn.
+            let registry_for_mcp: Arc<RegistryLoad> = app.state::<Arc<RegistryLoad>>().inner().clone();
+            let mcp_launch = mcp::McpLaunch::resolve(&paths, &registry_for_mcp);
+            if mcp_launch.is_none() {
+                warn!("mcp tools unavailable — sessions will spawn without them");
+            }
+            app.manage(mcp_launch);
+
+            let mcp_socket = paths.mcp_socket();
+            let mcp_services = mcp::McpServices {
+                app: handle.clone(),
+                store: store.clone(),
+                registry: registry_for_mcp,
+                poller: poller.clone(),
+            };
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = mcp::listen(&mcp_socket, mcp_services).await {
+                    error!(error = %e, "mcp listener failed to start");
+                }
+            });
+
             // --- soft-delete purger (hourly) -------------------------------
             let registry_for_purger: Arc<RegistryLoad> =
                 app.state::<Arc<RegistryLoad>>().inner().clone();
@@ -274,6 +298,7 @@ pub fn run() {
             commands::resume_claude_session,
             commands::set_claude_session_hidden,
             commands::attach_session,
+            commands::detach_session,
             commands::send_input,
             commands::resize_session,
             commands::get_theme,

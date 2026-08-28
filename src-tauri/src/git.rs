@@ -205,21 +205,27 @@ pub async fn pull_clone(clone_path: &Path, tx: &JobTx, repo: &str) -> AppResult<
     Ok(())
 }
 
-/// Creates a new branch `<branch>` and a worktree checking it out.
-///
-/// With `track_from = None`: `git worktree add <worktree_path> -b <branch>` —
-/// new branch starts at the clone's current HEAD with no upstream.
-///
-/// With `track_from = Some("origin/<branch>")`:
-/// `git worktree add --track -b <branch> <worktree_path> origin/<branch>` —
-/// new branch starts at the remote ref and is set to track it. Used when the
-/// caller has already verified the remote branch exists, so the worktree
-/// lands on the remote's commit with upstream wired up in one step.
+/// How `worktree_add` should resolve the branch it checks out.
+pub enum WorktreeBranch<'a> {
+    /// Create a fresh branch off the clone's current HEAD (`-b <branch>`).
+    NewFromHead,
+    /// Create a fresh local branch tracking the given start point, e.g.
+    /// `origin/<branch>` (`--track -b <branch> <path> <start>`). Lands the
+    /// worktree on the remote's commit with upstream wired up in one step.
+    TrackRemote(&'a str),
+    /// Check out a branch that already exists locally (`<path> <branch>`).
+    /// Git refuses if that branch is already checked out in another worktree,
+    /// which is the guard against two workspaces sharing a branch.
+    ExistingLocal,
+}
+
+/// Adds a worktree at `worktree_path` checked out on `branch`, resolved
+/// according to `source`.
 pub async fn worktree_add(
     clone_path: &Path,
     worktree_path: &Path,
     branch: &str,
-    track_from: Option<&str>,
+    source: WorktreeBranch<'_>,
     tx: &JobTx,
     repo: &str,
 ) -> AppResult<()> {
@@ -238,14 +244,23 @@ pub async fn worktree_add(
         "worktree".as_ref(),
         "add".as_ref(),
     ];
-    if track_from.is_some() {
-        args.push("--track".as_ref());
-    }
-    args.push("-b".as_ref());
-    args.push(branch.as_ref());
-    args.push(worktree_path.as_os_str());
-    if let Some(start_point) = track_from {
-        args.push(start_point.as_ref());
+    match source {
+        WorktreeBranch::NewFromHead => {
+            args.push("-b".as_ref());
+            args.push(branch.as_ref());
+            args.push(worktree_path.as_os_str());
+        }
+        WorktreeBranch::TrackRemote(start_point) => {
+            args.push("--track".as_ref());
+            args.push("-b".as_ref());
+            args.push(branch.as_ref());
+            args.push(worktree_path.as_os_str());
+            args.push(start_point.as_ref());
+        }
+        WorktreeBranch::ExistingLocal => {
+            args.push(worktree_path.as_os_str());
+            args.push(branch.as_ref());
+        }
     }
 
     let status = run_streamed("git", args, None, tx, Some(repo)).await?;
@@ -434,4 +449,151 @@ pub async fn worktree_remove(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command as StdCommand;
+
+    /// A `JobTx` whose receiver is dropped. Every send in this module is
+    /// fire-and-forget (`let _ = send`), so the closed channel is inert.
+    fn noop_tx() -> JobTx {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        JobTx(tx)
+    }
+
+    fn git_ok(cwd: &Path, args: &[&str]) {
+        let status = StdCommand::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .status()
+            .expect("git must run");
+        assert!(status.success(), "git {args:?} failed in {}", cwd.display());
+    }
+
+    /// A repo with one commit on `main`, usable as a clone source.
+    fn init_repo_with_commit(path: &Path) {
+        git_ok(path, &["init", "--initial-branch=main"]);
+        git_ok(path, &["config", "user.email", "test@example.com"]);
+        git_ok(path, &["config", "user.name", "Test"]);
+        std::fs::write(path.join("README.md"), "hello\n").expect("write README");
+        git_ok(path, &["add", "."]);
+        git_ok(path, &["commit", "-m", "initial"]);
+    }
+
+    fn clone_repo(origin: &Path, dest: &Path) {
+        let status = StdCommand::new("git")
+            .arg("clone")
+            .arg(origin)
+            .arg(dest)
+            .status()
+            .expect("git clone must run");
+        assert!(status.success(), "git clone failed");
+    }
+
+    fn current_branch(path: &Path) -> String {
+        let out = StdCommand::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .expect("git rev-parse must run");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn worktree_add_checks_out_existing_local_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        init_repo_with_commit(&origin);
+
+        let clone_path = tmp.path().join("clone");
+        clone_repo(&origin, &clone_path);
+        // A branch that already exists locally — e.g. a side branch an agent
+        // created and pushed, which the user now wants its own worktree for.
+        git_ok(&clone_path, &["branch", "feature"]);
+        assert!(branch_exists(&clone_path, "feature").await.unwrap());
+
+        let worktree_path = tmp.path().join("wt");
+        worktree_add(
+            &clone_path,
+            &worktree_path,
+            "feature",
+            WorktreeBranch::ExistingLocal,
+            &noop_tx(),
+            "repo",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(current_branch(&worktree_path), "feature");
+    }
+
+    #[tokio::test]
+    async fn worktree_add_existing_local_rejects_branch_in_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        init_repo_with_commit(&origin);
+
+        let clone_path = tmp.path().join("clone");
+        clone_repo(&origin, &clone_path);
+        git_ok(&clone_path, &["branch", "feature"]);
+
+        let first = tmp.path().join("wt1");
+        worktree_add(
+            &clone_path,
+            &first,
+            "feature",
+            WorktreeBranch::ExistingLocal,
+            &noop_tx(),
+            "repo",
+        )
+        .await
+        .unwrap();
+
+        // The "another workspace already has this branch checked out" case.
+        // Git must refuse rather than produce two worktrees on one branch.
+        let second = tmp.path().join("wt2");
+        let result = worktree_add(
+            &clone_path,
+            &second,
+            "feature",
+            WorktreeBranch::ExistingLocal,
+            &noop_tx(),
+            "repo",
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn worktree_add_new_from_head_creates_the_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        init_repo_with_commit(&origin);
+
+        let clone_path = tmp.path().join("clone");
+        clone_repo(&origin, &clone_path);
+        assert!(!branch_exists(&clone_path, "fresh").await.unwrap());
+
+        let worktree_path = tmp.path().join("wt");
+        worktree_add(
+            &clone_path,
+            &worktree_path,
+            "fresh",
+            WorktreeBranch::NewFromHead,
+            &noop_tx(),
+            "repo",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(current_branch(&worktree_path), "fresh");
+        assert!(branch_exists(&clone_path, "fresh").await.unwrap());
+    }
 }

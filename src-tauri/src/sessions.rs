@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
+use crate::mcp::McpLaunch;
 use crate::hook_listener::HookMessage;
 use crate::state::SessionRuntimeState;
 use crate::store::Store;
@@ -361,6 +362,7 @@ impl SessionSupervisor {
     /// The `TETHYS_SPAWN_TOKEN` correlation var reaches claude via tmux's
     /// `-e` flag (per-session env), so the SessionStart hook still maps
     /// back to the right Tethys session.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_claude(
         &self,
         workspace_id: String,
@@ -369,6 +371,7 @@ impl SessionSupervisor {
         tmux_bin: &Path,
         claude_bin: &Path,
         resume_claude_session_id: Option<&str>,
+        mcp: Option<&McpLaunch>,
     ) -> AppResult<(SessionInfo, String)> {
         let token = Uuid::new_v4().to_string();
         let id = new_session_id();
@@ -393,6 +396,12 @@ impl SessionSupervisor {
             "--".into(),
             claude_bin.to_string_lossy().into_owned(),
         ]);
+        // Hands this session the Tethys tools. The identity in the rendered
+        // config is this session's own, which is what stops an agent linking a
+        // PR onto somebody else's workspace.
+        if let Some(mcp) = mcp {
+            args.extend(mcp.claude_args(&workspace_id, &id));
+        }
         if let Some(csid) = resume_claude_session_id {
             args.push("--resume".into());
             args.push(csid.to_string());
@@ -730,6 +739,20 @@ impl SessionSupervisor {
         Ok(scrollback)
     }
 
+    /// Best-effort: drop a subscriber (by its channel id) when its pane
+    /// unmounts. Silently ignores an unknown session — it may already be
+    /// gone, and the only goal is to stop streaming to a dead terminal.
+    ///
+    /// Without this the reader thread keeps fanning bytes to a channel whose
+    /// `onmessage` closure still pins the whole xterm instance (and its
+    /// scrollback) alive in the webview — the send never errors, so the
+    /// retain-on-error path never reclaims it.
+    pub fn detach(&self, session_id: &str, channel_id: u32) {
+        if let Some(handle) = self.sessions.lock().unwrap().get(session_id) {
+            remove_subscriber(&mut handle.subscribers.lock().unwrap(), channel_id);
+        }
+    }
+
     pub fn send_input(&self, session_id: &str, data: &[u8]) -> AppResult<()> {
         let writer = {
             let sessions = self.sessions.lock().unwrap();
@@ -894,6 +917,11 @@ fn trim_detach_epilogue(ring: &Arc<Mutex<VecDeque<u8>>>) {
     ring.truncate(cut_from);
 }
 
+/// Remove any subscriber whose channel id matches `channel_id`.
+fn remove_subscriber(subs: &mut Vec<Channel<InvokeResponseBody>>, channel_id: u32) {
+    subs.retain(|sub| sub.id() != channel_id);
+}
+
 fn append_to_ring(ring: &Arc<Mutex<VecDeque<u8>>>, data: &[u8]) {
     let mut ring = ring.lock().unwrap();
     if data.len() >= RING_CAPACITY {
@@ -967,8 +995,10 @@ fn spawn_child_watcher(
 #[cfg(test)]
 mod tests {
     use super::parent_session_from_subagent_path;
-    use super::TurnState;
     use crate::state::SessionRuntimeState;
+    use super::TurnState;
+    use super::remove_subscriber;
+    use tauri::ipc::{Channel, InvokeResponseBody};
 
     #[test]
     fn apply_reports_change_on_state_transition() {
@@ -1007,6 +1037,29 @@ mod tests {
             Some("idle_prompt".into())
         ));
         assert!(!turn.acknowledged);
+    }
+
+    #[test]
+    fn remove_subscriber_drops_only_the_matching_channel() {
+        let a = Channel::<InvokeResponseBody>::new(|_| Ok(()));
+        let b = Channel::<InvokeResponseBody>::new(|_| Ok(()));
+        let (a_id, b_id) = (a.id(), b.id());
+        let mut subs = vec![a, b];
+
+        remove_subscriber(&mut subs, a_id);
+
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].id(), b_id);
+    }
+
+    #[test]
+    fn remove_subscriber_ignores_unknown_id() {
+        let a = Channel::<InvokeResponseBody>::new(|_| Ok(()));
+        let mut subs = vec![a];
+
+        remove_subscriber(&mut subs, u32::MAX);
+
+        assert_eq!(subs.len(), 1);
     }
 
     #[test]

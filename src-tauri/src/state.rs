@@ -104,6 +104,12 @@ pub struct ManualPr {
     pub owner: String,
     pub name: String,
     pub number: u32,
+    /// Which of the workspace's repos this PR belongs to, when it could be
+    /// worked out — named by the caller, or inferred by matching the PR's
+    /// owner/name against the registry. `None` for PRs attached before this
+    /// field existed, and for PRs in a repo the workspace doesn't span.
+    #[serde(default)]
+    pub repo_key: Option<String>,
     /// Latest polled status — same shape as an auto-detected repo-link PR.
     /// `None` until the first poll after attaching (or if the PR can't be
     /// fetched).
@@ -163,6 +169,18 @@ pub struct RepoLink {
     pub setup_script_ran_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub github: Option<GithubPrStatus>,
+    /// Whether Tethys created this branch (off HEAD or off a remote tracking
+    /// ref) versus checked out a branch that already existed locally.
+    /// Teardown and purge only delete branches Tethys created, so checking
+    /// out a pre-existing branch never destroys it. Defaults to `true` for
+    /// state written before this field existed — under the old branch
+    /// pre-check every branch Tethys held was one it had created.
+    #[serde(default = "default_created_branch")]
+    pub created_branch: bool,
+}
+
+fn default_created_branch() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -525,6 +543,79 @@ mod tests {
         }"#;
         let parsed: AppState = serde_json::from_str(raw).expect("must deserialize");
         assert!(parsed.workspaces[0].manual_prs.is_empty());
+    }
+
+    #[test]
+    fn pre_repo_key_manual_pr_defaults_to_none() {
+        // A PR attached before the field existed has no recorded repo; the UI
+        // and the MCP view both have to tolerate that rather than assume one.
+        let raw = r#"{
+            "workspaces": [
+                {
+                    "id": "abc-123",
+                    "branch": "feat/foo",
+                    "created_at": "2026-04-01T12:00:00Z",
+                    "repo_links": [],
+                    "manual_prs": [
+                        { "owner": "new-lantern", "name": "nl-backend", "number": 4321 }
+                    ]
+                }
+            ]
+        }"#;
+        let parsed: AppState = serde_json::from_str(raw).expect("must deserialize");
+        assert_eq!(parsed.workspaces[0].manual_prs[0].repo_key, None);
+    }
+
+    #[test]
+    fn pre_created_branch_defaults_to_true() {
+        // Under the old branch pre-check, a workspace could only ever hold a
+        // branch Tethys had just created — so state written before this field
+        // must default to true, or a purge would stop deleting those branches.
+        let raw = r#"{
+            "workspaces": [
+                {
+                    "id": "abc-123",
+                    "branch": "feat/foo",
+                    "created_at": "2026-04-01T12:00:00Z",
+                    "repo_links": [
+                        {
+                            "repo_key": "frontend",
+                            "worktree_path": "/tmp/wt",
+                            "setup_script_ran_at": null
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let parsed: AppState = serde_json::from_str(raw).expect("must deserialize");
+        assert!(parsed.workspaces[0].repo_links[0].created_branch);
+    }
+
+    #[test]
+    fn created_branch_round_trips_false() {
+        let raw = r#"{
+            "workspaces": [
+                {
+                    "id": "abc-123",
+                    "branch": "feat/foo",
+                    "created_at": "2026-04-01T12:00:00Z",
+                    "repo_links": [
+                        {
+                            "repo_key": "frontend",
+                            "worktree_path": "/tmp/wt",
+                            "setup_script_ran_at": null,
+                            "created_branch": false
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let parsed: AppState = serde_json::from_str(raw).expect("must deserialize");
+        assert!(!parsed.workspaces[0].repo_links[0].created_branch);
+
+        let back = serde_json::to_string(&parsed).expect("must serialize");
+        let again: AppState = serde_json::from_str(&back).expect("must round-trip");
+        assert!(!again.workspaces[0].repo_links[0].created_branch);
     }
 
     #[test]

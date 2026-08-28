@@ -17,6 +17,7 @@ use crate::github::parse_github_pr_url;
 use crate::github::poller::{AuthSnapshot, GithubPoller};
 use crate::inprogress::InProgressWorkspaces;
 use crate::job::{JobEvent, JobTx};
+use crate::mcp::McpLaunch;
 use crate::paths::Paths;
 use crate::purge::Purger;
 use crate::reconcile::{self, Discrepancies};
@@ -84,12 +85,33 @@ pub async fn github_reprobe_auth(
 pub async fn attach_manual_pr(
     app: AppHandle,
     store: State<'_, Arc<Store>>,
+    registry: State<'_, Arc<RegistryLoad>>,
     poller: State<'_, Arc<GithubPoller>>,
     workspace_id: WorkspaceId,
     url: String,
 ) -> AppResult<Workspace> {
     let (slug, number) = parse_github_pr_url(&url)
         .ok_or_else(|| AppError::Other(format!("not a GitHub PR URL: {url}")))?;
+
+    // Record which repo this PR belongs to when the slug matches one the
+    // workspace spans. The dialog only asks for a URL, so this is the only
+    // chance to work it out.
+    let repo_key = {
+        let keys: Vec<String> = store
+            .read(|s| {
+                s.find_workspace(&workspace_id)
+                    .map(|ws| ws.repo_links.iter().map(|l| l.repo_key.clone()).collect())
+                    .unwrap_or_default()
+            })
+            .await;
+        registry.require().ok().and_then(|reg| {
+            keys.into_iter().find(|key| {
+                reg.find_repo(key)
+                    .and_then(|r| r.github_slug.as_ref())
+                    .is_some_and(|s| *s == slug)
+            })
+        })
+    };
 
     let updated = store
         .mutate(|s| {
@@ -104,6 +126,7 @@ pub async fn attach_manual_pr(
                     owner: slug.owner.clone(),
                     name: slug.name.clone(),
                     number,
+                    repo_key: repo_key.clone(),
                     github: None,
                 });
             }
@@ -274,95 +297,129 @@ struct RepoProvision<'a> {
     tx: &'a JobTx,
 }
 
-/// Clone (if needed) → pull → branch pre-check → worktree add → install
+/// Clone (if needed) → pull → resolve branch → worktree add → install
 /// `.claude/settings.local.json` symlink → run setup script. Returns the
-/// `RepoLink` to push into state. Caller is responsible for teardown on
-/// later failure (we don't know whether sibling repos still need to be
-/// provisioned after us).
+/// `RepoLink` to push into state. Atomic for its own repo: any failure past
+/// `worktree add` tears down this repo's worktree (and its branch, if Tethys
+/// created it) before bubbling. Sibling repos remain the caller's
+/// responsibility (we don't know whether more still need provisioning).
 async fn provision_repo_worktree(ctx: RepoProvision<'_>) -> AppResult<RepoLink> {
     let clone_path = ctx.paths.repo_clone_path(&ctx.repo.key);
 
     git::ensure_clone(&clone_path, &ctx.repo.remote_url, ctx.tx, &ctx.repo.key).await?;
     git::pull_clone(&clone_path, ctx.tx, &ctx.repo.key).await?;
 
-    // Pre-check: if the branch already exists, git worktree add will fail
-    // with a fatal. We bail here with a clearer message — and (for the
-    // multi-repo create flow) avoid partially-creating worktrees in other
-    // repos first.
-    if git::branch_exists(&clone_path, ctx.branch).await? {
-        return Err(AppError::Other(format!(
-            "branch '{}' already exists in {}. Pick a different branch name, \
-             or delete the stale branch first.",
-            ctx.branch, ctx.repo.key
-        )));
-    }
-
-    // If the branch already exists on the remote, create the local branch
-    // tracking it instead of branching off HEAD — saves the manual
-    // upstream-set + reset dance.
-    let track_from = if git::remote_branch_exists(&clone_path, "origin", ctx.branch).await? {
+    // Decide how the worktree's branch is resolved. A branch that already
+    // exists locally is checked out as-is — that's the case where an agent
+    // opened a PR from a side branch in another worktree and the user now
+    // wants its own worktree to run it in. Git refuses if that branch is
+    // already checked out elsewhere. A branch that exists only on the remote
+    // gets a fresh local tracking branch, which saves the manual
+    // upstream-set + reset dance. Otherwise we branch off HEAD.
+    let branch_preexisted = git::branch_exists(&clone_path, ctx.branch).await?;
+    let remote_start = if !branch_preexisted
+        && git::remote_branch_exists(&clone_path, "origin", ctx.branch).await?
+    {
         Some(format!("origin/{}", ctx.branch))
     } else {
         None
     };
-
-    git::worktree_add(
-        &clone_path,
-        ctx.worktree_path,
-        ctx.branch,
-        track_from.as_deref(),
-        ctx.tx,
-        &ctx.repo.key,
-    )
-    .await?;
-
-    claude_local::install_symlink(
-        ctx.worktree_path,
-        &ctx.paths.repo_shared_claude_local(&ctx.repo.key),
-        ctx.tx,
-        &ctx.repo.key,
-    )
-    .await?;
-
-    copy_env_from_clone(&clone_path, ctx.worktree_path, ctx.tx, &ctx.repo.key).await?;
-
-    let mut link = RepoLink {
-        repo_key: ctx.repo.key.clone(),
-        worktree_path: ctx.worktree_path.to_path_buf(),
-        setup_script_ran_at: None,
-        github: None,
+    let source = match (branch_preexisted, &remote_start) {
+        (true, _) => git::WorktreeBranch::ExistingLocal,
+        (false, Some(start)) => git::WorktreeBranch::TrackRemote(start),
+        (false, None) => git::WorktreeBranch::NewFromHead,
     };
+    // Tethys may delete on teardown only the branches it created.
+    let created_branch = !branch_preexisted;
 
-    if let Some(script) = ctx
-        .repo
-        .default_setup_script
-        .as_ref()
-        .filter(|s| !s.trim().is_empty())
-    {
-        // Pre-warm node_modules from the base clone via APFS clonefile so the
-        // setup script (yarn/pnpm/npm install) only has to reconcile drift
-        // instead of installing the whole tree from scratch. The setup_warmer
-        // background task keeps the base clone's node_modules current.
-        setup::warm_node_modules_from_clone(
+    if branch_preexisted {
+        ctx.tx.status(
+            format!("checking out existing branch {}", ctx.branch),
+            Some(&ctx.repo.key),
+        );
+    }
+
+    // Everything from `worktree_add` on leaves on-disk state behind, so on
+    // failure we tear down this repo's own worktree (and its branch, only if
+    // we created it) before bubbling. Sibling repos are the caller's problem.
+    let provisioned = async {
+        git::worktree_add(
             &clone_path,
             ctx.worktree_path,
-            ctx.tx,
-            &ctx.repo.key,
-        )
-        .await;
-
-        setup::run_setup_script(
-            script,
-            ctx.worktree_path,
-            ctx.repo.setup_timeout_secs,
+            ctx.branch,
+            source,
             ctx.tx,
             &ctx.repo.key,
         )
         .await?;
-        link.setup_script_ran_at = Some(Utc::now());
-    }
 
-    Ok(link)
+        claude_local::install_symlink(
+            ctx.worktree_path,
+            &ctx.paths.repo_shared_claude_local(&ctx.repo.key),
+            ctx.tx,
+            &ctx.repo.key,
+        )
+        .await?;
+
+        copy_env_from_clone(&clone_path, ctx.worktree_path, ctx.tx, &ctx.repo.key).await?;
+
+        let mut link = RepoLink {
+            repo_key: ctx.repo.key.clone(),
+            worktree_path: ctx.worktree_path.to_path_buf(),
+            setup_script_ran_at: None,
+            github: None,
+            created_branch,
+        };
+
+        if let Some(script) = ctx
+            .repo
+            .default_setup_script
+            .as_ref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            // Pre-warm node_modules from the base clone via APFS clonefile so
+            // the setup script (yarn/pnpm/npm install) only has to reconcile
+            // drift instead of installing the whole tree from scratch. The
+            // setup_warmer background task keeps the base clone's node_modules
+            // current.
+            setup::warm_node_modules_from_clone(
+                &clone_path,
+                ctx.worktree_path,
+                ctx.tx,
+                &ctx.repo.key,
+            )
+            .await;
+
+            setup::run_setup_script(
+                script,
+                ctx.worktree_path,
+                ctx.repo.setup_timeout_secs,
+                ctx.tx,
+                &ctx.repo.key,
+            )
+            .await?;
+            link.setup_script_ran_at = Some(Utc::now());
+        }
+
+        Ok::<RepoLink, AppError>(link)
+    }
+    .await;
+
+    match provisioned {
+        Ok(link) => Ok(link),
+        Err(e) => {
+            teardown_repo_worktree(RepoTeardown {
+                repo_key: &ctx.repo.key,
+                worktree_path: ctx.worktree_path,
+                branch: ctx.branch,
+                created_branch,
+                paths: ctx.paths,
+                tx: ctx.tx,
+            })
+            .await;
+            Err(e)
+        }
+    }
 }
 
 /// Copy `<clone_path>/.env` into the new worktree if it exists. `.env` is
@@ -397,14 +454,18 @@ struct RepoTeardown<'a> {
     repo_key: &'a str,
     worktree_path: &'a Path,
     branch: &'a str,
+    /// Whether Tethys created this branch. A pre-existing branch — one checked
+    /// out to give an already-open PR its own worktree — is left intact; only
+    /// the worktree goes.
+    created_branch: bool,
     paths: &'a Paths,
     tx: &'a JobTx,
 }
 
 /// Best-effort reverse of `provision_repo_worktree`: force-remove the
-/// worktree, prune stale registrations, delete the branch we created.
-/// Errors are streamed as status events but never bubbled — teardown is
-/// always best-effort.
+/// worktree, prune stale registrations, and delete the branch when Tethys
+/// created it. Errors are streamed as status events but never bubbled —
+/// teardown is always best-effort.
 async fn teardown_repo_worktree(ctx: RepoTeardown<'_>) {
     if !ctx.worktree_path.exists() {
         return;
@@ -419,7 +480,9 @@ async fn teardown_repo_worktree(ctx: RepoTeardown<'_>) {
         );
     }
     git::worktree_prune_best_effort(&clone_path, ctx.tx, ctx.repo_key).await;
-    git::branch_delete_best_effort(&clone_path, ctx.branch, ctx.tx, ctx.repo_key).await;
+    if ctx.created_branch {
+        git::branch_delete_best_effort(&clone_path, ctx.branch, ctx.tx, ctx.repo_key).await;
+    }
 }
 
 /// Orchestrates clone + worktree add + setup script for every selected repo,
@@ -525,8 +588,12 @@ pub async fn create_workspace(
     let _in_progress_guard = in_progress.insert(workspace_dir.clone());
     let tx = spawn_event_forwarder(on_event);
 
+    // Provisioned links accumulate here so the rollback path tears down
+    // exactly what succeeded — each carries whether Tethys created its branch.
+    // A failing repo self-cleans inside `provision_repo_worktree`, so it never
+    // reaches this list.
+    let mut created: Vec<RepoLink> = Vec::new();
     let orchestrate = async {
-        let mut created: Vec<RepoLink> = Vec::new();
         for repo in &selected {
             let worktree_path = reg.plan_worktree_path(&workspace_dir, &repo.key);
             let link = provision_repo_worktree(RepoProvision {
@@ -539,17 +606,18 @@ pub async fn create_workspace(
             .await?;
             created.push(link);
         }
-        Ok::<_, AppError>(created)
-    };
+        Ok::<_, AppError>(())
+    }
+    .await;
 
-    match orchestrate.await {
-        Ok(created_links) => {
+    match orchestrate {
+        Ok(()) => {
             let stored = store
                 .mutate(|s| {
                     let ws = s
                         .find_workspace_mut(&id)
                         .ok_or_else(|| AppError::WorkspaceNotFound(id.clone()))?;
-                    ws.repo_links = created_links;
+                    ws.repo_links = created.clone();
                     ws.status = WorkspaceStatus::Ready;
                     Ok(ws.clone())
                 })
@@ -567,16 +635,15 @@ pub async fn create_workspace(
             warn!(error = %msg, "workspace create failed; rolling back worktrees");
             tx.status(format!("tearing down partial workspace: {msg}"), None);
 
-            // Best-effort teardown of anything we managed to create. The
-            // branch pre-check inside provision_repo_worktree guarantees we
-            // didn't inherit any pre-existing branches, so deleting them
-            // here is safe.
-            for repo in selected.iter().rev() {
-                let worktree_path = reg.plan_worktree_path(&workspace_dir, &repo.key);
+            // Best-effort teardown of the repos we fully provisioned. Each
+            // link records whether Tethys created its branch, so a branch we
+            // merely checked out to run an existing PR survives the rollback.
+            for link in created.iter().rev() {
                 teardown_repo_worktree(RepoTeardown {
-                    repo_key: &repo.key,
-                    worktree_path: &worktree_path,
+                    repo_key: &link.repo_key,
+                    worktree_path: &link.worktree_path,
                     branch: &branch,
+                    created_branch: link.created_branch,
                     paths: &paths,
                     tx: &tx,
                 })
@@ -726,10 +793,15 @@ pub async fn add_repo_to_workspace(
             let msg = e.to_string();
             warn!(error = %msg, "add_repo_to_workspace failed; rolling back worktree");
             tx.status(format!("rolling back: {msg}"), None);
+            // `provision_repo_worktree` already self-cleans on failure,
+            // deleting any branch it created. This is a backstop for a stray
+            // worktree; `created_branch: false` keeps it from ever deleting a
+            // branch the provision path decided to keep.
             teardown_repo_worktree(RepoTeardown {
                 repo_key: &repo.key,
                 worktree_path: &worktree_path,
                 branch: &branch,
+                created_branch: false,
                 paths: &paths,
                 tx: &tx,
             })
@@ -1034,6 +1106,7 @@ pub async fn start_claude_session(
     store: State<'_, Arc<Store>>,
     claude_bin: State<'_, ClaudeBin>,
     tmux_bin: State<'_, TmuxBin>,
+    mcp: State<'_, Option<McpLaunch>>,
     args: StartClaudeArgs,
 ) -> AppResult<SessionInfo> {
     spawn_claude(
@@ -1044,6 +1117,7 @@ pub async fn start_claude_session(
         &tmux_bin,
         &args,
         None,
+        mcp.inner().as_ref(),
     )
     .await
 }
@@ -1066,6 +1140,7 @@ pub async fn resume_claude_session(
     store: State<'_, Arc<Store>>,
     claude_bin: State<'_, ClaudeBin>,
     tmux_bin: State<'_, TmuxBin>,
+    mcp: State<'_, Option<McpLaunch>>,
     args: ResumeClaudeArgs,
 ) -> AppResult<SessionInfo> {
     // Pull claude_session_id + cwd from the ClaudeSessionMeta we already
@@ -1126,10 +1201,12 @@ pub async fn resume_claude_session(
         &tmux_bin,
         &start,
         Some(&claude_sid),
+        mcp.inner().as_ref(),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_claude(
     app: &AppHandle,
     supervisor: &Arc<SessionSupervisor>,
@@ -1138,6 +1215,7 @@ async fn spawn_claude(
     tmux_bin: &TmuxBin,
     args: &StartClaudeArgs,
     resume_claude_sid: Option<&str>,
+    mcp: Option<&McpLaunch>,
 ) -> AppResult<SessionInfo> {
     if tmux_bin.0.as_os_str().is_empty() {
         return Err(AppError::Other(
@@ -1190,6 +1268,7 @@ async fn spawn_claude(
         &tmux_bin.0,
         &resolved_bin,
         resume_claude_sid,
+        mcp,
     )?;
 
     // Persist a ClaudeSessionMeta entry so resume works across restarts.
@@ -1285,6 +1364,15 @@ pub fn attach_session(
     on_bytes: tauri::ipc::Channel<InvokeResponseBody>,
 ) -> AppResult<Vec<u8>> {
     supervisor.attach(&session_id, on_bytes)
+}
+
+#[tauri::command]
+pub fn detach_session(
+    supervisor: State<'_, Arc<SessionSupervisor>>,
+    session_id: String,
+    channel_id: u32,
+) {
+    supervisor.detach(&session_id, channel_id);
 }
 
 #[tauri::command]

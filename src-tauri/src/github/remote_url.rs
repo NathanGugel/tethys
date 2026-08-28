@@ -107,6 +107,58 @@ fn split_host_and_path(url: &str) -> Option<(&str, &str)> {
     None
 }
 
+/// A pull request as named by a caller, which may or may not identify its repo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrReference {
+    /// The reference carried its own `owner/name` — a URL or `owner/repo#123`.
+    Qualified(GithubSlug, u32),
+    /// A bare `123` or `#123`. The caller resolves which repo it belongs to.
+    Number(u32),
+}
+
+/// Parse the ways someone might name a PR: a full GitHub URL,
+/// `owner/repo#123`, `#123`, or a bare `123`.
+///
+/// Exists because an agent that just ran `gh pr create` has a number and a URL
+/// but no reason to know which spelling Tethys wants, and a human pasting into
+/// the attach dialog has whatever was on the clipboard.
+pub fn parse_pr_reference(reference: &str) -> Option<PrReference> {
+    let trimmed = reference.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some((slug, number)) = parse_github_pr_url(trimmed) {
+        return Some(PrReference::Qualified(slug, number));
+    }
+
+    // `owner/repo#123`
+    if let Some((repo_part, number_part)) = trimmed.split_once('#') {
+        let number: u32 = number_part.trim().parse().ok()?;
+        let repo_part = repo_part.trim();
+        if repo_part.is_empty() {
+            // `#123`
+            return Some(PrReference::Number(number));
+        }
+        let (owner, name) = repo_part.split_once('/')?;
+        let (owner, name) = (owner.trim(), name.trim());
+        let name = name.strip_suffix(".git").unwrap_or(name);
+        if owner.is_empty() || name.is_empty() || name.contains('/') {
+            return None;
+        }
+        return Some(PrReference::Qualified(
+            GithubSlug {
+                owner: owner.to_string(),
+                name: name.to_string(),
+            },
+            number,
+        ));
+    }
+
+    // Bare `123`
+    trimmed.parse::<u32>().ok().map(PrReference::Number)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,5 +369,51 @@ mod tests {
         assert_eq!(parse_github_pr_url(""), None);
         assert_eq!(parse_github_pr_url("   "), None);
         assert_eq!(parse_github_pr_url("not-a-url"), None);
+    }
+
+    #[test]
+    fn reference_accepts_a_full_url() {
+        assert_eq!(
+            parse_pr_reference("https://github.com/ryan/tethys/pull/42"),
+            Some(PrReference::Qualified(
+                GithubSlug {
+                    owner: "ryan".into(),
+                    name: "tethys".into()
+                },
+                42
+            ))
+        );
+    }
+
+    #[test]
+    fn reference_accepts_owner_repo_hash_number() {
+        assert_eq!(
+            parse_pr_reference("ryan/tethys#42"),
+            Some(PrReference::Qualified(
+                GithubSlug {
+                    owner: "ryan".into(),
+                    name: "tethys".into()
+                },
+                42
+            ))
+        );
+    }
+
+    #[test]
+    fn reference_accepts_bare_and_hashed_numbers() {
+        assert_eq!(parse_pr_reference("42"), Some(PrReference::Number(42)));
+        assert_eq!(parse_pr_reference("#42"), Some(PrReference::Number(42)));
+        assert_eq!(parse_pr_reference("  #42 "), Some(PrReference::Number(42)));
+    }
+
+    #[test]
+    fn reference_rejects_garbage() {
+        assert_eq!(parse_pr_reference(""), None);
+        assert_eq!(parse_pr_reference("   "), None);
+        assert_eq!(parse_pr_reference("not-a-pr"), None);
+        assert_eq!(parse_pr_reference("ryan/tethys"), None);
+        assert_eq!(parse_pr_reference("ryan#42"), None);
+        assert_eq!(parse_pr_reference("#abc"), None);
+        assert_eq!(parse_pr_reference("a/b/c#42"), None);
     }
 }
