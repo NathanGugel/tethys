@@ -316,6 +316,7 @@ pub fn run() {
             commands::get_dev_state,
             commands::detect_be_changes,
             commands::free_branch,
+            commands::find_branch_holder,
             commands::get_memory_snapshot,
         ])
         .run(tauri::generate_context!())

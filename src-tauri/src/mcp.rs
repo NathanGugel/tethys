@@ -417,11 +417,24 @@ async fn provision_for_pr(
             continue;
         }
         if let Some(holder) = crate::git::worktree_holding_branch(&clone_path, &branch).await? {
-            crate::git::detach_worktree(&holder).await?;
-            freed_from = holder
+            let name = holder
                 .parent()
                 .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().into_owned());
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| holder.display().to_string());
+            // Refuse by default. Detaching is harmless to that worktree's
+            // files but takes it off its branch, and an agent should decide to
+            // do that deliberately — and be able to mention it first.
+            if !req.take_branch {
+                return Err(AppError::Other(format!(
+                    "`{branch}` is checked out in workspace '{name}', and only one \
+                     worktree can hold it. Pass take_branch to detach that \
+                     worktree — it keeps its files at the same commit, but stops \
+                     being on a branch."
+                )));
+            }
+            crate::git::detach_worktree(&holder).await?;
+            freed_from = Some(name);
             info!(branch = %branch, holder = %holder.display(), "detached to free branch for pr workspace");
             break;
         }

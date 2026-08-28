@@ -1717,6 +1717,56 @@ pub struct FreeBranchArgs {
     pub repo_key: Option<String>,
 }
 
+/// Which worktree, if any, currently holds `branch` — without changing
+/// anything.
+///
+/// The read half of `free_branch`. Freeing a branch detaches someone else's
+/// worktree, so the UI has to be able to say whose before asking.
+#[tauri::command]
+pub async fn find_branch_holder(
+    registry: State<'_, Arc<RegistryLoad>>,
+    paths: State<'_, Paths>,
+    args: FreeBranchArgs,
+) -> AppResult<FreedBranch> {
+    let branch = args.branch.trim();
+    if branch.is_empty() {
+        return Err(AppError::Other("branch is required".into()));
+    }
+    let reg = registry.require()?;
+    let repos: Vec<&Repo> = match args.repo_key.as_deref() {
+        Some(key) => vec![reg
+            .find_repo(key)
+            .ok_or_else(|| AppError::Other(format!("unknown repo key: {key}")))?],
+        None => reg.repos.iter().collect(),
+    };
+
+    for repo in repos {
+        let clone_path = paths.repo_clone_path(&repo.key);
+        if !clone_path.exists() {
+            continue;
+        }
+        if let Some(holder) = git::worktree_holding_branch(&clone_path, branch).await? {
+            return Ok(FreedBranch {
+                // Nothing was freed — this only reports what would have to be.
+                freed: false,
+                workspace: holder
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned()),
+                worktree_path: Some(holder.display().to_string()),
+                repo_key: Some(repo.key.clone()),
+            });
+        }
+    }
+
+    Ok(FreedBranch {
+        freed: false,
+        workspace: None,
+        worktree_path: None,
+        repo_key: None,
+    })
+}
+
 /// Release `branch` from whichever worktree currently holds it, by detaching
 /// that worktree at the commit it is already on.
 ///
