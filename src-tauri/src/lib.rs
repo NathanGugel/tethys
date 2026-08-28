@@ -309,6 +309,7 @@ pub fn run() {
             commands::stop_dev_servers,
             commands::get_dev_state,
             commands::detect_be_changes,
+            commands::free_branch,
             commands::get_memory_snapshot,
         ])
         .run(tauri::generate_context!())

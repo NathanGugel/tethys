@@ -350,6 +350,35 @@ pub async fn worktree_add(
     Ok(())
 }
 
+/// Detach a worktree's HEAD at the commit it is already on.
+///
+/// This is how a branch is freed for another worktree to take. Detaching
+/// rather than switching branches is deliberate: the files stay at the exact
+/// same commit, so nothing running against that worktree sees its contents
+/// change — it simply stops owning the branch name. Local modifications are
+/// carried across untouched.
+pub async fn detach_worktree(worktree_path: &Path) -> AppResult<()> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["checkout", "--detach"])
+        .output()
+        .await
+        .map_err(|e| AppError::Other(format!("git checkout --detach: {e}")))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let lines: Vec<String> = stderr.lines().map(str::to_string).collect();
+        return Err(AppError::Other(match explain(&lines) {
+            Some(reason) => format!(
+                "could not detach {}: {reason}",
+                worktree_path.display()
+            ),
+            None => format!("could not detach {}", worktree_path.display()),
+        }));
+    }
+    Ok(())
+}
+
 /// Path of the worktree that currently has `branch` checked out, if any.
 ///
 /// Git allows a branch in only one worktree at a time, and every worktree for
@@ -712,6 +741,91 @@ mod tests {
 
         assert_eq!(current_branch(&worktree_path), "fresh");
         assert!(branch_exists(&clone_path, "fresh").await.unwrap());
+    }
+
+    /// The whole point of detaching: the holder keeps its files at the same
+    /// commit, gives up the branch name, and a second worktree can then take
+    /// it — which is what "give this PR its own workspace" relies on.
+    #[tokio::test]
+    async fn detaching_frees_the_branch_for_another_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        init_repo_with_commit(&origin);
+
+        let clone_path = tmp.path().join("clone");
+        clone_repo(&origin, &clone_path);
+        git_ok(&clone_path, &["branch", "feature"]);
+
+        let holder = tmp.path().join("holder");
+        worktree_add(
+            &clone_path,
+            &holder,
+            "feature",
+            WorktreeBranch::ExistingLocal,
+            &noop_tx(),
+            "repo",
+        )
+        .await
+        .unwrap();
+        let commit_before = current_commit(&holder);
+
+        // A second worktree can't have it yet.
+        let taker = tmp.path().join("taker");
+        assert!(worktree_add(
+            &clone_path,
+            &taker,
+            "feature",
+            WorktreeBranch::ExistingLocal,
+            &noop_tx(),
+            "repo",
+        )
+        .await
+        .is_err());
+
+        detach_worktree(&holder).await.unwrap();
+
+        // Holder kept its contents, just not the branch.
+        assert_eq!(current_commit(&holder), commit_before);
+        assert_eq!(current_branch(&holder), "HEAD");
+        assert_eq!(
+            parse_worktree_holding_branch(
+                &String::from_utf8_lossy(
+                    &std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(&clone_path)
+                        .args(["worktree", "list", "--porcelain"])
+                        .output()
+                        .unwrap()
+                        .stdout
+                ),
+                "feature"
+            ),
+            None
+        );
+
+        // And now the move can complete.
+        worktree_add(
+            &clone_path,
+            &taker,
+            "feature",
+            WorktreeBranch::ExistingLocal,
+            &noop_tx(),
+            "repo",
+        )
+        .await
+        .unwrap();
+        assert_eq!(current_branch(&taker), "feature");
+    }
+
+    fn current_commit(path: &Path) -> String {
+        let out = StdCommand::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git rev-parse must run");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 }
 

@@ -1670,6 +1670,87 @@ pub async fn get_dev_state(
     dev_servers::snapshot(supervisor.inner(), store.inner(), &args.workspace_id).await
 }
 
+/// What `free_branch` did, so the caller can say so rather than guess.
+#[derive(Debug, serde::Serialize)]
+pub struct FreedBranch {
+    /// False when no worktree held the branch — nothing needed doing.
+    pub freed: bool,
+    /// Directory name of the workspace the branch was taken from.
+    pub workspace: Option<String>,
+    pub worktree_path: Option<String>,
+    pub repo_key: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct FreeBranchArgs {
+    pub branch: String,
+    /// Limit the search to one repo. `None` checks every repo in the registry,
+    /// which is what you want when acting on a PR whose repo isn't recorded.
+    #[serde(default)]
+    pub repo_key: Option<String>,
+}
+
+/// Release `branch` from whichever worktree currently holds it, by detaching
+/// that worktree at the commit it is already on.
+///
+/// Git allows a branch in one worktree at a time and all of a repo's worktrees
+/// share one clone, so a branch opened in another workspace can't be checked
+/// out into a new one until the holder lets go. Detaching frees the name
+/// without moving the holder's files — it stays on the same commit.
+#[tauri::command]
+pub async fn free_branch(
+    registry: State<'_, Arc<RegistryLoad>>,
+    paths: State<'_, Paths>,
+    args: FreeBranchArgs,
+) -> AppResult<FreedBranch> {
+    let branch = args.branch.trim();
+    if branch.is_empty() {
+        return Err(AppError::Other("branch is required".into()));
+    }
+    let reg = registry.require()?;
+
+    let repos: Vec<&Repo> = match args.repo_key.as_deref() {
+        Some(key) => vec![reg
+            .find_repo(key)
+            .ok_or_else(|| AppError::Other(format!("unknown repo key: {key}")))?],
+        None => reg.repos.iter().collect(),
+    };
+
+    for repo in repos {
+        let clone_path = paths.repo_clone_path(&repo.key);
+        if !clone_path.exists() {
+            continue;
+        }
+        let Some(holder) = git::worktree_holding_branch(&clone_path, branch).await? else {
+            continue;
+        };
+        git::detach_worktree(&holder).await?;
+        let workspace = holder
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned());
+        info!(
+            branch = %branch,
+            repo = %repo.key,
+            holder = %holder.display(),
+            "detached worktree to free branch"
+        );
+        return Ok(FreedBranch {
+            freed: true,
+            workspace,
+            worktree_path: Some(holder.display().to_string()),
+            repo_key: Some(repo.key.clone()),
+        });
+    }
+
+    Ok(FreedBranch {
+        freed: false,
+        workspace: None,
+        worktree_path: None,
+        repo_key: None,
+    })
+}
+
 #[tauri::command]
 pub async fn detect_be_changes(
     store: State<'_, Arc<Store>>,
