@@ -25,12 +25,17 @@ pub const TOOL_LINK_PR: &str = "link_pr";
 /// the branch each one is actually on, and every PR Tethys is tracking for it.
 pub const TOOL_DESCRIBE_WORKSPACE: &str = "describe_workspace";
 
+/// Give a pull request a workspace of its own — free its branch from whatever
+/// worktree holds it, then provision a new workspace on it.
+pub const TOOL_GIVE_PR_OWN_WORKSPACE: &str = "give_pr_own_workspace";
+
 /// Every tool, fully qualified the way Claude's permission system spells them.
 /// Each one has to be listed for `--allowed-tools`, or a call to it stalls on a
 /// permission dialog nobody is watching.
 pub const ALLOWED_TOOLS: &[&str] = &[
     "mcp__tethys__link_pr",
     "mcp__tethys__describe_workspace",
+    "mcp__tethys__give_pr_own_workspace",
 ];
 
 /// Env keys Tethys bakes into the generated `--mcp-config` at spawn time.
@@ -57,6 +62,20 @@ pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub enum Request {
     LinkPr(LinkPr),
     DescribeWorkspace(DescribeWorkspace),
+    GivePrOwnWorkspace(GivePrOwnWorkspace),
+}
+
+/// Provision a workspace for a PR Tethys already tracks for the caller.
+///
+/// The PR must be tracked, because that is where its head branch comes from —
+/// and the head branch is the whole of what a new workspace needs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GivePrOwnWorkspace {
+    pub from_workspace: String,
+    #[serde(default)]
+    pub from_session: Option<String>,
+    /// `123`, `#123`, `owner/repo#123`, or a full GitHub PR URL.
+    pub reference: String,
 }
 
 /// A read of the calling workspace. Carries only the identity — there is
@@ -170,6 +189,15 @@ pub enum Response {
         already_attached: bool,
     },
     Described(WorkspaceView),
+    WorkspaceCreated {
+        workspace_id: String,
+        /// Branch the new workspace was provisioned on.
+        branch: String,
+        /// Repos it spans, mirroring the workspace the request came from.
+        repos: Vec<String>,
+        /// Workspace the branch had to be taken from, when one was holding it.
+        freed_from: Option<String>,
+    },
     Rejected {
         message: String,
     },

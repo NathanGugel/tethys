@@ -521,6 +521,34 @@ pub async fn create_workspace(
     args: CreateWorkspaceArgs,
     on_event: Channel<JobEvent>,
 ) -> AppResult<Workspace> {
+    let tx = spawn_event_forwarder(on_event);
+    provision_workspace(
+        &app,
+        store.inner(),
+        registry.inner(),
+        paths.inner(),
+        in_progress.inner(),
+        args,
+        tx,
+    )
+    .await
+}
+
+/// The provisioning itself, independent of who asked for it.
+///
+/// The Tauri command feeds progress to a frontend `Channel`; other callers —
+/// an agent asking over MCP — supply a `JobTx` that goes somewhere else. The
+/// work in between is the same either way, and only ever wanted writing once.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn provision_workspace(
+    app: &AppHandle,
+    store: &Arc<Store>,
+    registry: &Arc<RegistryLoad>,
+    paths: &Paths,
+    in_progress: &InProgressWorkspaces,
+    args: CreateWorkspaceArgs,
+    tx: JobTx,
+) -> AppResult<Workspace> {
     let id = args.workspace_id.trim().to_string();
     if id.is_empty() {
         return Err(AppError::Other("workspace_id is required".into()));
@@ -598,13 +626,12 @@ pub async fn create_workspace(
             Ok(())
         })
         .await?;
-    emit_workspace_changed(&app, &id);
+    emit_workspace_changed(app, &id);
 
     // Register as in-progress so the reconciler doesn't flag our worktree
     // dirs as orphans mid-create. Guard removes the entry on drop — normal
     // return, `?`, panic, or task cancellation.
     let _in_progress_guard = in_progress.insert(workspace_dir.clone());
-    let tx = spawn_event_forwarder(on_event);
 
     // Provisioned links accumulate here so the rollback path tears down
     // exactly what succeeded — each carries whether Tethys created its branch.
@@ -618,7 +645,7 @@ pub async fn create_workspace(
                 repo,
                 worktree_path: &worktree_path,
                 branch: &branch,
-                paths: &paths,
+                paths,
                 tx: &tx,
             })
             .await?;
@@ -641,11 +668,11 @@ pub async fn create_workspace(
                 })
                 .await?;
 
-            regen_workspace_root_settings(&stored, &paths, &tx).await;
+            regen_workspace_root_settings(&stored, paths, &tx).await;
 
             info!(id = %stored.id, branch = %stored.branch, repos = stored.repo_links.len(), "created workspace");
             let _ = tx.0.send(JobEvent::Success);
-            emit_workspace_changed(&app, &stored.id);
+            emit_workspace_changed(app, &stored.id);
             Ok(stored)
         }
         Err(e) => {
@@ -662,7 +689,7 @@ pub async fn create_workspace(
                     worktree_path: &link.worktree_path,
                     branch: &branch,
                     created_branch: link.created_branch,
-                    paths: &paths,
+                    paths,
                     tx: &tx,
                 })
                 .await;
@@ -693,7 +720,7 @@ pub async fn create_workspace(
             if let Err(mutate_err) = mutate_result {
                 warn!(error = %mutate_err, "failed to mark workspace as CreationFailed");
             }
-            emit_workspace_changed(&app, &id);
+            emit_workspace_changed(app, &id);
 
             let _ = tx.0.send(JobEvent::Failed { error: msg });
             Err(e)

@@ -191,11 +191,17 @@ pub fn run() {
             app.manage(mcp_launch);
 
             let mcp_socket = paths.mcp_socket();
+            // One instance, shared with Tauri state below: the reconciler skips
+            // whatever is registered here, and a workspace provisioned over MCP
+            // has to be skipped on the same terms as one made from the UI.
+            let in_progress = inprogress::InProgressWorkspaces::new();
             let mcp_services = mcp::McpServices {
                 app: handle.clone(),
                 store: store.clone(),
                 registry: registry_for_mcp,
                 poller: poller.clone(),
+                paths: paths.clone(),
+                in_progress: in_progress.clone(),
             };
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = mcp::listen(&mcp_socket, mcp_services).await {
@@ -239,7 +245,7 @@ pub fn run() {
             tauri::async_runtime::spawn(memory_poller.run());
 
             app.manage(paths);
-            app.manage(inprogress::InProgressWorkspaces::new());
+            app.manage(in_progress);
 
             // --- menu (append Theme items under the default View submenu) --
             if let Err(e) = install_menu(&handle) {
