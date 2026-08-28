@@ -1785,6 +1785,13 @@ li.is-dragging {
   align-items: center;
 }
 
+.manual-pr-repo {
+  font-size: 0.75em;
+  opacity: 0.55;
+  margin-right: 0.25em;
+  white-space: nowrap;
+}
+
 .manual-pr-detach {
   background: transparent;
   border: none;

@@ -906,6 +906,7 @@ mod tests {
                 session_order: None,
                 dev_servers: None,
                 manual_prs: vec![crate::state::ManualPr {
+                    repo_key: None,
                     owner: "acme".into(),
                     name: "web".into(),
                     number: 4321,

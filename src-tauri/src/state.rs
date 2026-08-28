@@ -104,6 +104,12 @@ pub struct ManualPr {
     pub owner: String,
     pub name: String,
     pub number: u32,
+    /// Which of the workspace's repos this PR belongs to, when it could be
+    /// worked out — named by the caller, or inferred by matching the PR's
+    /// owner/name against the registry. `None` for PRs attached before this
+    /// field existed, and for PRs in a repo the workspace doesn't span.
+    #[serde(default)]
+    pub repo_key: Option<String>,
     /// Latest polled status — same shape as an auto-detected repo-link PR.
     /// `None` until the first poll after attaching (or if the PR can't be
     /// fetched).
@@ -537,6 +543,27 @@ mod tests {
         }"#;
         let parsed: AppState = serde_json::from_str(raw).expect("must deserialize");
         assert!(parsed.workspaces[0].manual_prs.is_empty());
+    }
+
+    #[test]
+    fn pre_repo_key_manual_pr_defaults_to_none() {
+        // A PR attached before the field existed has no recorded repo; the UI
+        // and the MCP view both have to tolerate that rather than assume one.
+        let raw = r#"{
+            "workspaces": [
+                {
+                    "id": "abc-123",
+                    "branch": "feat/foo",
+                    "created_at": "2026-04-01T12:00:00Z",
+                    "repo_links": [],
+                    "manual_prs": [
+                        { "owner": "new-lantern", "name": "nl-backend", "number": 4321 }
+                    ]
+                }
+            ]
+        }"#;
+        let parsed: AppState = serde_json::from_str(raw).expect("must deserialize");
+        assert_eq!(parsed.workspaces[0].manual_prs[0].repo_key, None);
     }
 
     #[test]

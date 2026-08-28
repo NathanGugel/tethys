@@ -2079,6 +2079,13 @@ function ManualPrChip({
 
   return (
     <span className="manual-pr-chip">
+      {/* Which worktree the PR belongs to. A workspace can hold PRs from
+          several repos, and the chip alone doesn't say which is which. */}
+      {pr.repo_key && (
+        <span className="manual-pr-repo" title={`in ${pr.repo_key}`}>
+          {pr.repo_key}
+        </span>
+      )}
       {pr.github ? (
         <GithubChip status={pr.github} />
       ) : (
