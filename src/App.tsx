@@ -587,6 +587,12 @@ function App() {
         {!selectedRun && selected && selected.status.kind === "ready" && (
           <WorkspaceDetail
             onGiveOwnWorkspace={(b) => setCreating({ branch: b })}
+            otherWorkspaces={workspaces.filter(
+              (w) =>
+                w.id !== selected.id &&
+                !w.deleted_at &&
+                w.status.kind === "ready",
+            )}
             workspace={selected}
             sessions={sessionsByWorkspace.get(selected.id) ?? []}
             availableRepos={
@@ -876,6 +882,7 @@ function WorkspaceDetail({
   onRequestArchive,
   onRepoAdded,
   onGiveOwnWorkspace,
+  otherWorkspaces,
 }: {
   workspace: Workspace;
   sessions: SessionInfo[];
@@ -885,11 +892,15 @@ function WorkspaceDetail({
   onRepoAdded: () => void;
   /** Open the new-workspace dialog prefilled with this branch. */
   onGiveOwnWorkspace: (branch: string) => void;
+  /** Ready workspaces a session could be moved into. */
+  otherWorkspaces: Workspace[];
 }) {
   const [busy, setBusy] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
   const [addingRepo, setAddingRepo] = useState(false);
   const [addingPr, setAddingPr] = useState(false);
+  /** Session id whose move picker is open. */
+  const [movingSession, setMovingSession] = useState<string | null>(null);
   // Per-workspace selection. Derived on render (no effect), so switching
   // back to a workspace paints the remembered pick immediately.
   const [selectedByWorkspace, setSelectedByWorkspace] = useState<
@@ -1216,6 +1227,15 @@ function WorkspaceDetail({
       )}
 
       <div className="session-pane">
+        {movingSession && (
+          <MoveSessionDialog
+            sessionId={movingSession}
+            fromWorkspace={workspace.id}
+            targets={otherWorkspaces}
+            onClose={() => setMovingSession(null)}
+            onError={setError}
+          />
+        )}
         <SessionBar
           visibleSessions={visibleOrdered}
           hiddenSessions={hiddenOrdered}
@@ -1228,6 +1248,8 @@ function WorkspaceDetail({
           onStartInRepo={startInRepo}
           onSetHidden={setSessionHidden}
           onClearTurn={clearSessionTurn}
+          onMoveSession={(id) => setMovingSession(id)}
+          canMoveSessions={otherWorkspaces.length > 0}
           onReorder={persistOrder}
           renamingSessionId={renamingSessionId}
           onStartRename={(id) => setRenamingSessionId(id)}
@@ -1527,6 +1549,80 @@ function ChipRenameInput({
   );
 }
 
+/** Picks a destination workspace for a session, and performs the move.
+ *
+ *  The move is a respawn — a running process can't change directory — so the
+ *  terminal starts fresh while the conversation is resumed. Saying so here is
+ *  the difference between that looking like a feature and looking like a bug.
+ */
+function MoveSessionDialog({
+  sessionId,
+  fromWorkspace,
+  targets,
+  onClose,
+  onError,
+}: {
+  sessionId: string;
+  fromWorkspace: WorkspaceId;
+  targets: Workspace[];
+  onClose: () => void;
+  onError: (msg: string) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+
+  const move = async (toWorkspace: WorkspaceId) => {
+    setBusy(true);
+    try {
+      await invoke("move_session_to_workspace", {
+        args: {
+          session_meta_id: sessionId,
+          from_workspace: fromWorkspace,
+          to_workspace: toWorkspace,
+        },
+      });
+      onClose();
+    } catch (err) {
+      onError(String(err));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" onClick={busy ? undefined : onClose}>
+      <div
+        className="modal"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+      >
+        <h3>Move this chat to…</h3>
+        <p>
+          The conversation carries over. The terminal doesn&apos;t — this
+          restarts Claude in the other worktree and resumes, so scrollback
+          starts empty.
+        </p>
+        <div className="move-session-list">
+          {targets.map((w) => (
+            <button
+              key={w.id}
+              type="button"
+              disabled={busy}
+              onClick={() => move(w.id)}
+            >
+              {w.branch}
+            </button>
+          ))}
+        </div>
+        <div className="modal-actions">
+          <button type="button" onClick={onClose} disabled={busy}>
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SessionBar({
   visibleSessions,
   hiddenSessions,
@@ -1539,6 +1635,8 @@ function SessionBar({
   onStartInRepo,
   onSetHidden,
   onClearTurn,
+  onMoveSession,
+  canMoveSessions,
   onReorder,
   renamingSessionId,
   onStartRename,
@@ -1558,6 +1656,10 @@ function SessionBar({
   onStartInRepo: (repoKey: string | null) => void;
   onSetHidden: (id: string, hidden: boolean) => void;
   onClearTurn: (id: string) => void;
+  /** Open the move picker for this session. */
+  onMoveSession: (id: string) => void;
+  /** False when there's no other workspace to move into. */
+  canMoveSessions: boolean;
   /** Persist a new chip order. Receives the visible chips' new order;
    *  the caller is responsible for appending hidden ids if any. */
   onReorder: (newVisibleOrder: string[]) => void;
@@ -1819,6 +1921,8 @@ function SessionBar({
               hidden={isHidden}
               onClearTurn={() => onClearTurn(chipMenu.sessionId)}
               onSetHidden={() => onSetHidden(chipMenu.sessionId, !isHidden)}
+              canMove={canMoveSessions}
+              onMove={() => onMoveSession(chipMenu.sessionId)}
               onClose={() => setChipMenu(null)}
             />
           );
@@ -1832,16 +1936,21 @@ function SessionChipMenu({
   y,
   needsTurn,
   hidden,
+  canMove,
   onClearTurn,
   onSetHidden,
+  onMove,
   onClose,
 }: {
   x: number;
   y: number;
   needsTurn: boolean;
   hidden: boolean;
+  /** False when there is nowhere to move to, or nothing to carry over. */
+  canMove: boolean;
   onClearTurn: () => void;
   onSetHidden: () => void;
+  onMove: () => void;
   onClose: () => void;
 }) {
   const ref = useRef<HTMLDivElement | null>(null);
@@ -1882,6 +1991,11 @@ function SessionChipMenu({
       <button type="button" role="menuitem" onClick={wrap(onSetHidden)}>
         {hidden ? "Show this chat" : "Hide this chat"}
       </button>
+      {canMove && (
+        <button type="button" role="menuitem" onClick={wrap(onMove)}>
+          Move to another workspace…
+        </button>
+      )}
     </div>
   );
 }
