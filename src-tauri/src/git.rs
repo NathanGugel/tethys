@@ -1,6 +1,7 @@
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -20,6 +21,22 @@ pub async fn run_streamed<I, S>(
     tx: &JobTx,
     repo: Option<&str>,
 ) -> AppResult<std::process::ExitStatus>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let (status, _) = run_inner(program, args, cwd, tx, repo, false).await?;
+    Ok(status)
+}
+
+async fn run_inner<I, S>(
+    program: &str,
+    args: I,
+    cwd: Option<&Path>,
+    tx: &JobTx,
+    repo: Option<&str>,
+    capture: bool,
+) -> AppResult<(std::process::ExitStatus, Vec<String>)>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -47,15 +64,49 @@ where
 
     let tx_err = tx.clone();
     let repo_err = repo.map(String::from);
+    let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = capture.then(|| captured.clone());
     let stderr_task = tokio::spawn(async move {
-        drain_lines(stderr, &tx_err, LogStream::Stderr, repo_err.as_deref()).await;
+        drain_lines_capturing(stderr, &tx_err, LogStream::Stderr, repo_err.as_deref(), sink).await;
     });
 
     let status = child.wait().await?;
     let _ = stdout_task.await;
     let _ = stderr_task.await;
 
-    Ok(status)
+    let stderr_lines = std::mem::take(&mut *captured.lock().unwrap());
+    Ok((status, stderr_lines))
+}
+
+/// Run a child process, streaming output as `run_streamed` does, but also
+/// returning its stderr lines. Used where a non-zero exit needs to explain
+/// *why* — an exit code alone sends the reader to the job log to find the
+/// `fatal:` that the error should have carried in the first place.
+pub async fn run_streamed_capturing_stderr<I, S>(
+    program: &str,
+    args: I,
+    cwd: Option<&Path>,
+    tx: &JobTx,
+    repo: Option<&str>,
+) -> AppResult<(std::process::ExitStatus, Vec<String>)>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_inner(program, args, cwd, tx, repo, true).await
+}
+
+/// The first `fatal:`/`error:` line git produced, or its last line — whichever
+/// is likeliest to say something a person can act on.
+pub fn explain(stderr_lines: &[String]) -> Option<String> {
+    stderr_lines
+        .iter()
+        .find(|l| {
+            let t = l.trim_start();
+            t.starts_with("fatal:") || t.starts_with("error:")
+        })
+        .or_else(|| stderr_lines.iter().rfind(|l| !l.trim().is_empty()))
+        .map(|l| l.trim().to_string())
 }
 
 /// Probe whether `clone_path` looks like a complete git clone by asking
@@ -81,10 +132,21 @@ async fn is_valid_clone(clone_path: &Path) -> bool {
 /// surface — the user just sees "Cloning into..." and then nothing for
 /// minutes while the clone runs.
 async fn drain_lines<R: AsyncRead + Unpin>(
+    reader: R,
+    tx: &JobTx,
+    stream: LogStream,
+    repo: Option<&str>,
+) {
+    drain_lines_capturing(reader, tx, stream, repo, None).await
+}
+
+/// As `drain_lines`, but also appends each emitted line to `sink` when given.
+async fn drain_lines_capturing<R: AsyncRead + Unpin>(
     mut reader: R,
     tx: &JobTx,
     stream: LogStream,
     repo: Option<&str>,
+    sink: Option<Arc<Mutex<Vec<String>>>>,
 ) {
     let mut buf = [0u8; 4096];
     let mut line: Vec<u8> = Vec::with_capacity(256);
@@ -95,11 +157,11 @@ async fn drain_lines<R: AsyncRead + Unpin>(
                 for &byte in &buf[..n] {
                     if byte == b'\n' || byte == b'\r' {
                         if !line.is_empty() {
-                            tx.log(
-                                stream,
-                                String::from_utf8_lossy(&line).into_owned(),
-                                repo,
-                            );
+                            let text = String::from_utf8_lossy(&line).into_owned();
+                            if let Some(sink) = &sink {
+                                sink.lock().unwrap().push(text.clone());
+                            }
+                            tx.log(stream, text, repo);
                             line.clear();
                         }
                     } else {
@@ -111,7 +173,11 @@ async fn drain_lines<R: AsyncRead + Unpin>(
         }
     }
     if !line.is_empty() {
-        tx.log(stream, String::from_utf8_lossy(&line).into_owned(), repo);
+        let text = String::from_utf8_lossy(&line).into_owned();
+        if let Some(sink) = &sink {
+            sink.lock().unwrap().push(text.clone());
+        }
+        tx.log(stream, text, repo);
     }
 }
 
@@ -263,16 +329,67 @@ pub async fn worktree_add(
         }
     }
 
-    let status = run_streamed("git", args, None, tx, Some(repo)).await?;
+    let (status, stderr) = run_streamed_capturing_stderr("git", args, None, tx, Some(repo)).await?;
 
     if !status.success() {
-        return Err(AppError::Other(format!(
-            "git worktree add {} exited with {:?}",
-            worktree_path.display(),
-            status.code()
-        )));
+        // Git's own `fatal:` says something actionable ("already used by
+        // worktree at ..."); the exit code alone sends the reader to the job
+        // log to find out what happened.
+        return Err(AppError::Other(match explain(&stderr) {
+            Some(reason) => format!(
+                "git worktree add {} failed: {reason}",
+                worktree_path.display()
+            ),
+            None => format!(
+                "git worktree add {} exited with {:?}",
+                worktree_path.display(),
+                status.code()
+            ),
+        }));
     }
     Ok(())
+}
+
+/// Path of the worktree that currently has `branch` checked out, if any.
+///
+/// Git allows a branch in only one worktree at a time, and every worktree for
+/// a repo comes off the same managed clone — so this is how a caller finds out
+/// *who* is holding a branch it wants, rather than only that someone is.
+pub async fn worktree_holding_branch(
+    clone_path: &Path,
+    branch: &str,
+) -> AppResult<Option<PathBuf>> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(clone_path)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .await
+        .map_err(|e| AppError::Other(format!("git worktree list: {e}")))?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    Ok(parse_worktree_holding_branch(
+        &String::from_utf8_lossy(&out.stdout),
+        branch,
+    ))
+}
+
+/// Scan `git worktree list --porcelain` for the entry whose `branch` line
+/// matches. Records are blank-line separated and lead with `worktree <path>`.
+fn parse_worktree_holding_branch(porcelain: &str, branch: &str) -> Option<PathBuf> {
+    let wanted = format!("refs/heads/{branch}");
+    let mut current: Option<PathBuf> = None;
+    for line in porcelain.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current = Some(PathBuf::from(path.trim()));
+        } else if let Some(found) = line.strip_prefix("branch ") {
+            if found.trim() == wanted {
+                return current;
+            }
+        }
+    }
+    None
 }
 
 /// `git -C <clone_path> show-ref --verify --quiet refs/heads/<branch>`.
@@ -595,5 +712,68 @@ mod tests {
 
         assert_eq!(current_branch(&worktree_path), "fresh");
         assert!(branch_exists(&clone_path, "fresh").await.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod holding_tests {
+    use super::{explain, parse_worktree_holding_branch};
+    use std::path::PathBuf;
+
+    const PORCELAIN: &str = "\
+worktree /data/repos/frontend
+HEAD 5586c250fc
+branch refs/heads/master
+
+worktree /wt/nathan-nl-8883/frontend
+HEAD 7ff47a5916
+branch refs/heads/nathan/bulk-clone-append-only-copy
+
+worktree /wt/detached/frontend
+HEAD abc123
+detached
+";
+
+    #[test]
+    fn finds_the_worktree_holding_a_branch() {
+        assert_eq!(
+            parse_worktree_holding_branch(PORCELAIN, "nathan/bulk-clone-append-only-copy"),
+            Some(PathBuf::from("/wt/nathan-nl-8883/frontend"))
+        );
+    }
+
+    #[test]
+    fn returns_none_for_a_branch_no_worktree_holds() {
+        assert_eq!(parse_worktree_holding_branch(PORCELAIN, "nathan/other"), None);
+    }
+
+    /// A detached worktree holds no branch, so it must never be reported as
+    /// the holder of the branch it happens to sit on.
+    #[test]
+    fn a_detached_worktree_is_not_a_holder() {
+        assert_eq!(parse_worktree_holding_branch(PORCELAIN, "abc123"), None);
+    }
+
+    #[test]
+    fn explain_prefers_the_fatal_line() {
+        let lines = vec![
+            "Preparing worktree (checking out 'x')".to_string(),
+            "fatal: 'x' is already used by worktree at '/wt/a'".to_string(),
+        ];
+        assert_eq!(
+            explain(&lines).as_deref(),
+            Some("fatal: 'x' is already used by worktree at '/wt/a'")
+        );
+    }
+
+    #[test]
+    fn explain_falls_back_to_the_last_nonempty_line() {
+        let lines = vec!["something odd".to_string(), "   ".to_string()];
+        assert_eq!(explain(&lines).as_deref(), Some("something odd"));
+    }
+
+    #[test]
+    fn explain_of_nothing_is_none() {
+        assert_eq!(explain(&[]), None);
     }
 }
