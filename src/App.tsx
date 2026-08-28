@@ -201,18 +201,27 @@ function App() {
     );
   });
 
-  const workspaceNeedsTurn = useCallback(
-    (w: Workspace): boolean => {
-      if (w.archived_at) return false;
-      for (const info of turnStates.values()) {
+  // Ids of this workspace's sessions with an unacknowledged "your turn"
+  // indicator. The sidebar renders the count in the workspace dot and
+  // names the sessions in its tooltip.
+  const workspaceTurnSessions = useCallback(
+    (w: Workspace): string[] => {
+      if (w.archived_at) return [];
+      const ids: string[] = [];
+      for (const [sessionId, info] of turnStates) {
         if (info.workspaceId !== w.id) continue;
         if (info.state !== "idle" && info.state !== "waiting_input") continue;
         if (info.acknowledged) continue;
-        return true;
+        ids.push(sessionId);
       }
-      return false;
+      return ids;
     },
     [turnStates],
+  );
+
+  const workspaceNeedsTurn = useCallback(
+    (w: Workspace): boolean => workspaceTurnSessions(w).length > 0,
+    [workspaceTurnSessions],
   );
 
   const handleClearTurn = useCallback(
@@ -527,7 +536,7 @@ function App() {
           onArchiveToggle={handleArchiveToggle}
           onDelete={handleDelete}
           onClearTurn={handleClearTurn}
-          workspaceNeedsTurn={workspaceNeedsTurn}
+          workspaceTurnSessions={workspaceTurnSessions}
           memory={memory}
         />
         <div className="sidebar-footer">
@@ -1043,6 +1052,16 @@ function WorkspaceDetail({
     }
   };
 
+  // Acknowledge a single session's "your turn" indicator. The backend
+  // persists turn_acknowledged + emits session:turn_changed, which clears
+  // the chip dot (and folds into the workspace row aggregate).
+  const clearSessionTurn = (sessionId: string) => {
+    invoke("acknowledge_session_turn", {
+      workspaceId: workspace.id,
+      sessionId,
+    }).catch((e) => console.error("acknowledge_session_turn failed:", e));
+  };
+
   const resumeMeta = async (metaId: string, repoKey: string | null) => {
     setBusy(true);
     setError(null);
@@ -1199,6 +1218,7 @@ function WorkspaceDetail({
           onSelect={selectSession}
           onStartInRepo={startInRepo}
           onSetHidden={setSessionHidden}
+          onClearTurn={clearSessionTurn}
           onReorder={persistOrder}
           renamingSessionId={renamingSessionId}
           onStartRename={(id) => setRenamingSessionId(id)}
@@ -1312,6 +1332,7 @@ function SessionChip({
   draggable,
   onSelect,
   onSetHidden,
+  onContextMenu,
   onStartRename,
   onCommitRename,
   onCancelRename,
@@ -1329,6 +1350,7 @@ function SessionChip({
   draggable: boolean;
   onSelect: (id: string) => void;
   onSetHidden: (id: string, hidden: boolean) => void;
+  onContextMenu: (id: string, x: number, y: number) => void;
   onStartRename: (id: string) => void;
   onCommitRename: (id: string, name: string | null) => void;
   onCancelRename: () => void;
@@ -1356,6 +1378,7 @@ function SessionChip({
   const needsTurn =
     !isDevServer &&
     live?.running &&
+    !live.turn_acknowledged &&
     (live.runtime_state === "idle" || live.runtime_state === "waiting_input");
   const chipClass = [
     "session-chip",
@@ -1395,6 +1418,11 @@ function SessionChip({
         e.preventDefault();
         e.stopPropagation();
         onStartRename(meta.id);
+      }}
+      onContextMenu={(e) => {
+        if (isDevServer) return;
+        e.preventDefault();
+        onContextMenu(meta.id, e.clientX, e.clientY);
       }}
       onKeyDown={(e) => {
         if (isRenaming) return;
@@ -1501,6 +1529,7 @@ function SessionBar({
   onSelect,
   onStartInRepo,
   onSetHidden,
+  onClearTurn,
   onReorder,
   renamingSessionId,
   onStartRename,
@@ -1519,6 +1548,7 @@ function SessionBar({
   /** `null` => start at the workspace root. */
   onStartInRepo: (repoKey: string | null) => void;
   onSetHidden: (id: string, hidden: boolean) => void;
+  onClearTurn: (id: string) => void;
   /** Persist a new chip order. Receives the visible chips' new order;
    *  the caller is responsible for appending hidden ids if any. */
   onReorder: (newVisibleOrder: string[]) => void;
@@ -1606,6 +1636,15 @@ function SessionBar({
   const [menuOpen, setMenuOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement | null>(null);
 
+  // Right-click context menu for a single session chip.
+  const [chipMenu, setChipMenu] = useState<{
+    sessionId: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  const openChipMenu = (sessionId: string, x: number, y: number) =>
+    setChipMenu({ sessionId, x, y });
+
   // Close the "+ New" repo menu on outside click.
   useEffect(() => {
     if (!menuOpen) return;
@@ -1651,6 +1690,7 @@ function SessionBar({
               draggable
               onSelect={onSelect}
               onSetHidden={onSetHidden}
+              onContextMenu={openChipMenu}
               onStartRename={onStartRename}
               onCommitRename={onCommitRename}
               onCancelRename={onCancelRename}
@@ -1668,6 +1708,7 @@ function SessionBar({
               draggable={false}
               onSelect={() => {}}
               onSetHidden={() => {}}
+              onContextMenu={() => {}}
               onStartRename={() => {}}
               onCommitRename={() => {}}
               onCancelRename={() => {}}
@@ -1687,6 +1728,7 @@ function SessionBar({
             draggable={false}
             onSelect={onSelect}
             onSetHidden={onSetHidden}
+            onContextMenu={openChipMenu}
             onStartRename={onStartRename}
             onCommitRename={onCommitRename}
             onCancelRename={onCancelRename}
@@ -1749,6 +1791,88 @@ function SessionBar({
             : `Show ${hiddenSessions.length} hidden`}
         </button>
       )}
+      {chipMenu &&
+        (() => {
+          const live = liveById.get(chipMenu.sessionId);
+          const needsTurn =
+            !!live?.running &&
+            !live.turn_acknowledged &&
+            (live.runtime_state === "idle" ||
+              live.runtime_state === "waiting_input");
+          const isHidden = hiddenSessions.some(
+            (m) => m.id === chipMenu.sessionId,
+          );
+          return (
+            <SessionChipMenu
+              x={chipMenu.x}
+              y={chipMenu.y}
+              needsTurn={needsTurn}
+              hidden={isHidden}
+              onClearTurn={() => onClearTurn(chipMenu.sessionId)}
+              onSetHidden={() => onSetHidden(chipMenu.sessionId, !isHidden)}
+              onClose={() => setChipMenu(null)}
+            />
+          );
+        })()}
+    </div>
+  );
+}
+
+function SessionChipMenu({
+  x,
+  y,
+  needsTurn,
+  hidden,
+  onClearTurn,
+  onSetHidden,
+  onClose,
+}: {
+  x: number;
+  y: number;
+  needsTurn: boolean;
+  hidden: boolean;
+  onClearTurn: () => void;
+  onSetHidden: () => void;
+  onClose: () => void;
+}) {
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const handle = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("mousedown", handle);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", handle);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [onClose]);
+
+  // Keep the menu inside the viewport.
+  const ESTIMATED_W = 180;
+  const ESTIMATED_H = 80;
+  const left = Math.min(x, window.innerWidth - ESTIMATED_W - 4);
+  const top = Math.min(y, window.innerHeight - ESTIMATED_H - 4);
+
+  const wrap = (fn: () => void) => () => {
+    fn();
+    onClose();
+  };
+
+  return (
+    <div ref={ref} className="context-menu" style={{ left, top }} role="menu">
+      {needsTurn && (
+        <button type="button" role="menuitem" onClick={wrap(onClearTurn)}>
+          Clear notification
+        </button>
+      )}
+      <button type="button" role="menuitem" onClick={wrap(onSetHidden)}>
+        {hidden ? "Show this chat" : "Hide this chat"}
+      </button>
     </div>
   );
 }

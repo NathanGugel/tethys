@@ -34,7 +34,9 @@ type Props = {
   onArchiveToggle: (ws: Workspace) => void;
   onDelete: (ws: Workspace) => void;
   onClearTurn: (ws: Workspace) => void;
-  workspaceNeedsTurn: (ws: Workspace) => boolean;
+  /** Ids of the workspace's sessions with an unacknowledged "your turn"
+   *  indicator. The row dot shows the count and names them on hover. */
+  workspaceTurnSessions: (ws: Workspace) => string[];
   /** Latest poller snapshot. Used to render per-row RAM chips for
    *  workspaces with dev servers running. `null` until the first
    *  snapshot lands. */
@@ -49,7 +51,7 @@ export function Sidebar({
   onArchiveToggle,
   onDelete,
   onClearTurn,
-  workspaceNeedsTurn,
+  workspaceTurnSessions,
   memory,
 }: Props) {
   const { active, archived } = useMemo(() => {
@@ -137,7 +139,7 @@ export function Sidebar({
                 key={w.id}
                 workspace={w}
                 selected={w.id === selectedId}
-                needsTurn={workspaceNeedsTurn(w)}
+                turnSessions={workspaceTurnSessions(w)}
                 memory={memory}
                 onSelect={() => onSelect(w.id)}
                 onContextMenu={(x, y) => setMenu({ ws: w, x, y })}
@@ -149,7 +151,7 @@ export function Sidebar({
               <WorkspaceRow
                 workspace={activeWorkspace}
                 selected={activeWorkspace.id === selectedId}
-                needsTurn={workspaceNeedsTurn(activeWorkspace)}
+                turnSessions={workspaceTurnSessions(activeWorkspace)}
                 memory={memory}
                 isDragging
                 onSelect={() => {}}
@@ -177,7 +179,7 @@ export function Sidebar({
               key={w.id}
               workspace={w}
               selected={w.id === selectedId}
-              needsTurn={workspaceNeedsTurn(w)}
+              turnSessions={workspaceTurnSessions(w)}
               memory={memory}
               isArchived
               onSelect={() => onSelect(w.id)}
@@ -190,7 +192,7 @@ export function Sidebar({
           x={menu.x}
           y={menu.y}
           workspace={menu.ws}
-          hasTurn={workspaceNeedsTurn(menu.ws)}
+          hasTurn={workspaceTurnSessions(menu.ws).length > 0}
           onClose={() => setMenu(null)}
           onArchiveToggle={onArchiveToggle}
           onDelete={onDelete}
@@ -204,14 +206,14 @@ export function Sidebar({
 function SortableWorkspaceRow({
   workspace,
   selected,
-  needsTurn,
+  turnSessions,
   memory,
   onSelect,
   onContextMenu,
 }: {
   workspace: Workspace;
   selected: boolean;
-  needsTurn: boolean;
+  turnSessions: string[];
   memory: MemorySnapshot | null;
   onSelect: () => void;
   onContextMenu: (x: number, y: number) => void;
@@ -229,7 +231,7 @@ function SortableWorkspaceRow({
     <WorkspaceRow
       workspace={workspace}
       selected={selected}
-      needsTurn={needsTurn}
+      turnSessions={turnSessions}
       memory={memory}
       isDragging={isDragging}
       onSelect={onSelect}
@@ -254,7 +256,7 @@ type DndProps = {
 function WorkspaceRow({
   workspace,
   selected,
-  needsTurn,
+  turnSessions,
   memory,
   isArchived = false,
   isDragging = false,
@@ -264,7 +266,7 @@ function WorkspaceRow({
 }: {
   workspace: Workspace;
   selected: boolean;
-  needsTurn: boolean;
+  turnSessions: string[];
   memory: MemorySnapshot | null;
   isArchived?: boolean;
   isDragging?: boolean;
@@ -273,6 +275,17 @@ function WorkspaceRow({
   dndProps?: DndProps;
 }) {
   const status = workspace.status.kind;
+  const turnCount = turnSessions.length;
+  // Name the lit sessions in the dot's tooltip so "which tabs need a
+  // look" is answerable without opening the workspace. Falls back to the
+  // default chip label (first 8 chars of the id) for unnamed sessions.
+  const turnLabels = turnSessions
+    .map((id) => {
+      const meta = workspace.sessions.find((s) => s.id === id);
+      return meta?.display_name?.trim() || id.slice(0, 8);
+    })
+    .join(", ");
+  const turnTitle = turnLabels ? `Your turn: ${turnLabels}` : "Your turn";
   const classes = [
     selected ? "selected" : "",
     isArchived ? "is-archived" : "",
@@ -301,12 +314,18 @@ function WorkspaceRow({
         <span className="workspace-name-text" title={workspace.branch}>
           {workspace.branch}
         </span>
-        {status === "ready" && needsTurn && (
+        {status === "ready" && turnCount > 0 && (
           <span
-            className="turn-dot"
-            title="Your turn"
-            aria-label="your turn"
-          />
+            className={`turn-dot${turnCount > 1 ? " has-count" : ""}`}
+            title={turnTitle}
+            aria-label={
+              turnCount > 1
+                ? `your turn in ${turnCount} sessions`
+                : "your turn"
+            }
+          >
+            {turnCount > 1 ? turnCount : null}
+          </span>
         )}
       </div>
       {status === "creating" && <div className="pending-label">creating…</div>}
