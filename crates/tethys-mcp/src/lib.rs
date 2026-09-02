@@ -29,6 +29,10 @@ pub const TOOL_DESCRIBE_WORKSPACE: &str = "describe_workspace";
 /// worktree holds it, then provision a new workspace on it.
 pub const TOOL_GIVE_PR_OWN_WORKSPACE: &str = "give_pr_own_workspace";
 
+/// Point one of the workspace's worktrees at a different ref, so a build can
+/// combine work that lives on separate branches.
+pub const TOOL_SET_WORKTREE_REF: &str = "set_worktree_ref";
+
 /// Every tool, fully qualified the way Claude's permission system spells them.
 /// Each one has to be listed for `--allowed-tools`, or a call to it stalls on a
 /// permission dialog nobody is watching.
@@ -36,6 +40,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "mcp__tethys__link_pr",
     "mcp__tethys__describe_workspace",
     "mcp__tethys__give_pr_own_workspace",
+    "mcp__tethys__set_worktree_ref",
 ];
 
 /// Env keys Tethys bakes into the generated `--mcp-config` at spawn time.
@@ -63,6 +68,20 @@ pub enum Request {
     LinkPr(LinkPr),
     DescribeWorkspace(DescribeWorkspace),
     GivePrOwnWorkspace(GivePrOwnWorkspace),
+    SetWorktreeRef(SetWorktreeRef),
+}
+
+/// Move one repo's worktree to a given ref, leaving the others alone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetWorktreeRef {
+    pub from_workspace: String,
+    #[serde(default)]
+    pub from_session: Option<String>,
+    /// Which of the workspace's repos to move.
+    pub repo_key: String,
+    /// Branch, remote ref, or commit. `origin/<branch>` is usually what you
+    /// want for someone else's PR — it's what is actually pushed.
+    pub git_ref: String,
 }
 
 /// Provision a workspace for a PR Tethys already tracks for the caller.
@@ -195,6 +214,16 @@ pub enum Response {
         already_attached: bool,
     },
     Described(WorkspaceView),
+    WorktreeMoved {
+        repo_key: String,
+        worktree_path: String,
+        /// Branch it is on now; absent when detached.
+        branch: Option<String>,
+        commit: String,
+        /// Set when an attached checkout was refused because another worktree
+        /// holds that branch, and it was detached at the same commit instead.
+        detached_because_held_by: Option<String>,
+    },
     WorkspaceCreated {
         workspace_id: String,
         /// Branch the new workspace was provisioned on.

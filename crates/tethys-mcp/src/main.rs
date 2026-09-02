@@ -34,7 +34,8 @@ use tokio::net::UnixStream;
 use tethys_mcp::{
     read_frame, write_frame, DescribeWorkspace, GivePrOwnWorkspace, LinkPr, PrView, Request,
     Response, WorkspaceView, ENV_REPO_KEYS, ENV_SESSION_ID, ENV_SOCKET, ENV_WORKSPACE_ID,
-    TOOL_DESCRIBE_WORKSPACE, TOOL_GIVE_PR_OWN_WORKSPACE, TOOL_LINK_PR,
+    SetWorktreeRef, TOOL_DESCRIBE_WORKSPACE, TOOL_GIVE_PR_OWN_WORKSPACE, TOOL_LINK_PR,
+    TOOL_SET_WORKTREE_REF,
 };
 
 /// What the calling agent supplies to `link_pr`. The workspace it lands on
@@ -201,6 +202,55 @@ impl TethysServer {
         )
     }
 
+    /// `set_worktree_ref`'s schema. `repo_key` enumerates the registry for the
+    /// same reason the other tools' do — a repo that doesn't exist should not
+    /// be expressible.
+    fn set_worktree_ref_tool(&self) -> Tool {
+        let mut repo_key = json!({
+            "type": "string",
+            "description": "Which of this workspace's repos to move.",
+        });
+        if !self.repo_keys.is_empty() {
+            repo_key["enum"] = json!(self.repo_keys);
+        }
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "repo_key": repo_key,
+                "git_ref": {
+                    "type": "string",
+                    "description": "Branch, remote ref, or commit to check out. \
+                        Prefer `origin/<branch>` for a PR branch — that is what \
+                        is actually pushed, and it sidesteps the branch being \
+                        held by another worktree.",
+                },
+            },
+            "required": ["repo_key", "git_ref"],
+            "additionalProperties": false,
+        });
+        Tool::new(
+            Cow::Borrowed(TOOL_SET_WORKTREE_REF),
+            Cow::Borrowed(
+                "Point one of this workspace's worktrees at a different ref, so \
+                 a local build can combine work that lives on separate \
+                 branches — a frontend branch against the tip of a stack of \
+                 backend PRs, say.\n\n\
+                 This is the piece that makes a stacked build expressible. \
+                 Building in Tethys uses whatever is on disk in each worktree, \
+                 so moving one repo's worktree and leaving the others is enough; \
+                 nothing else has to know. Fetches from origin first, then \
+                 checks out — attached if it can, detached at the same commit \
+                 if another worktree holds that branch. Either way the build is \
+                 the same.\n\n\
+                 The reply says where the worktree landed and whether it is on \
+                 a branch, because a detached worktree is not somewhere to \
+                 commit. Use describe_workspace to see where every worktree \
+                 currently sits. It does not start a build.",
+            ),
+            schema.as_object().cloned().expect("schema literal is an object"),
+        )
+    }
+
     /// The `tools/list` reply.
     ///
     /// `ttl_ms` and `cache_scope` are not optional in practice. Claude Code
@@ -215,6 +265,7 @@ impl TethysServer {
             self.link_pr_tool(),
             self.describe_workspace_tool(),
             self.give_pr_own_workspace_tool(),
+            self.set_worktree_ref_tool(),
         ])
             .with_ttl_ms(0)
             .with_cache_scope(CacheScope::Private)
@@ -260,6 +311,7 @@ impl ServerHandler for TethysServer {
             TOOL_LINK_PR => self.link_pr(request.arguments).await,
             TOOL_DESCRIBE_WORKSPACE => self.describe_workspace().await,
             TOOL_GIVE_PR_OWN_WORKSPACE => self.give_pr_own_workspace(request.arguments).await,
+            TOOL_SET_WORKTREE_REF => self.set_worktree_ref(request.arguments).await,
             other => Err(ErrorData::invalid_params(
                 format!("unknown tool: {other}"),
                 None,
@@ -387,6 +439,60 @@ impl TethysServer {
             Response::Rejected { message } => {
                 failed(format!("no workspace was created: {message}"))
             }
+            other => failed(format!("Tethys answered with {other:?}")),
+        })
+    }
+
+    async fn set_worktree_ref(
+        &self,
+        arguments: Option<JsonObject>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        #[derive(Deserialize)]
+        struct Args {
+            repo_key: String,
+            git_ref: String,
+        }
+        let args: Args = parse_args(arguments)?;
+        let request = Request::SetWorktreeRef(SetWorktreeRef {
+            from_workspace: self.from_workspace.clone(),
+            from_session: self.from_session.clone(),
+            repo_key: args.repo_key,
+            git_ref: args.git_ref,
+        });
+
+        let response = match self.send(&request).await {
+            Ok(response) => response,
+            Err(e) => return Ok(failed(format!("nothing was moved: {e}"))),
+        };
+
+        Ok(match response {
+            Response::WorktreeMoved {
+                repo_key,
+                worktree_path,
+                branch,
+                commit,
+                detached_because_held_by,
+            } => {
+                let short = commit.chars().take(10).collect::<String>();
+                let where_ = match &branch {
+                    Some(b) => format!("on `{b}` at {short}"),
+                    None => format!("detached at {short}"),
+                };
+                let why = match detached_because_held_by {
+                    Some(holder) => format!(
+                        " It is detached rather than on the branch because {holder} \
+                         already holds it — the tree is the same, so the build is too."
+                    ),
+                    None => String::new(),
+                };
+                CallToolResult::success(vec![ContentBlock::text(format!(
+                    "{repo_key} worktree ({worktree_path}) is now {where_}.{why} \
+                     Building this workspace now builds that combination; nothing \
+                     has been started."
+                ))])
+                .into()
+            }
+            Response::Rejected { message } => failed(format!("nothing was moved: {message}")),
             other => failed(format!("Tethys answered with {other:?}")),
         })
     }
@@ -556,7 +662,8 @@ mod tests {
             vec![
                 TOOL_LINK_PR,
                 TOOL_DESCRIBE_WORKSPACE,
-                TOOL_GIVE_PR_OWN_WORKSPACE
+                TOOL_GIVE_PR_OWN_WORKSPACE,
+                TOOL_SET_WORKTREE_REF
             ]
         );
 

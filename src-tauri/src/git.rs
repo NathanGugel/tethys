@@ -379,6 +379,111 @@ pub async fn detach_worktree(worktree_path: &Path) -> AppResult<()> {
     Ok(())
 }
 
+/// Where a worktree ended up after `checkout_ref`.
+#[derive(Debug)]
+pub struct CheckedOut {
+    /// Branch it is on now, or `None` when detached.
+    pub branch: Option<String>,
+    pub commit: String,
+    /// Set when an attached checkout was refused because another worktree
+    /// holds the branch, and we detached at it instead.
+    pub detached_because_held_by: Option<PathBuf>,
+}
+
+/// Point a worktree at `refspec` — a branch, a remote ref, or a commit.
+///
+/// Prefers an attached checkout, so "put this back on its branch" works, and
+/// falls back to detaching at the same commit when the branch is held by
+/// another worktree. Git allows a branch in one worktree at a time, and for
+/// building a stacked PR the branch identity doesn't matter — the tree does.
+pub async fn checkout_ref(worktree_path: &Path, refspec: &str) -> AppResult<CheckedOut> {
+    let attached = run_git(worktree_path, &["checkout", refspec]).await?;
+    let mut detached_because_held_by = None;
+
+    if !attached.0 {
+        // "already used by worktree at <path>" is the one failure worth
+        // recovering from: the tree we want is reachable, just not the name.
+        let held = attached
+            .1
+            .iter()
+            .find_map(|l| held_by_path(l))
+            .ok_or_else(|| {
+                AppError::Other(match explain(&attached.1) {
+                    Some(reason) => format!("could not check out {refspec}: {reason}"),
+                    None => format!("could not check out {refspec}"),
+                })
+            })?;
+        let detached = run_git(worktree_path, &["checkout", "--detach", refspec]).await?;
+        if !detached.0 {
+            return Err(AppError::Other(match explain(&detached.1) {
+                Some(reason) => format!("could not check out {refspec}: {reason}"),
+                None => format!("could not check out {refspec}"),
+            }));
+        }
+        detached_because_held_by = Some(held);
+    }
+
+    Ok(CheckedOut {
+        branch: attached_branch(worktree_path).await,
+        commit: rev_parse(worktree_path, "HEAD").await.unwrap_or_default(),
+        detached_because_held_by,
+    })
+}
+
+/// Pull `refspec`'s branch from origin so a ref that only exists remotely can
+/// be checked out. Best-effort — an offline fetch shouldn't block checking out
+/// something already local.
+pub async fn fetch_ref_best_effort(worktree_path: &Path, refspec: &str) {
+    let _ = run_git(worktree_path, &["fetch", "origin", refspec]).await;
+    let _ = run_git(worktree_path, &["fetch", "origin"]).await;
+}
+
+/// `(success, stderr_lines)` for a quiet git invocation.
+async fn run_git(cwd: &Path, args: &[&str]) -> AppResult<(bool, Vec<String>)> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| AppError::Other(format!("git {}: {e}", args.join(" "))))?;
+    let stderr = String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    Ok((out.status.success(), stderr))
+}
+
+/// Pull the worktree path out of git's "already used by worktree at '<path>'".
+fn held_by_path(line: &str) -> Option<PathBuf> {
+    let rest = line.split("already used by worktree at").nth(1)?;
+    let trimmed = rest.trim().trim_matches('\'').trim_matches('"');
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+/// Branch name, or `None` when HEAD is detached.
+async fn attached_branch(worktree_path: &Path) -> Option<String> {
+    let name = rev_parse(worktree_path, "--abbrev-ref HEAD").await?;
+    (name != "HEAD").then_some(name)
+}
+
+async fn rev_parse(worktree_path: &Path, what: &str) -> Option<String> {
+    let mut args = vec!["rev-parse"];
+    args.extend(what.split_whitespace());
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(&args)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
 /// Path of the worktree that currently has `branch` checked out, if any.
 ///
 /// Git allows a branch in only one worktree at a time, and every worktree for
@@ -816,6 +921,118 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(current_branch(&taker), "feature");
+    }
+
+    /// The stacked-build case: point a worktree at a ref it doesn't own.
+    #[tokio::test]
+    async fn checkout_ref_attaches_when_the_branch_is_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        init_repo_with_commit(&origin);
+        let clone_path = tmp.path().join("clone");
+        clone_repo(&origin, &clone_path);
+        git_ok(&clone_path, &["branch", "be-3"]);
+
+        let wt = tmp.path().join("wt");
+        worktree_add(
+            &clone_path,
+            &wt,
+            "feature",
+            WorktreeBranch::NewFromHead,
+            &noop_tx(),
+            "repo",
+        )
+        .await
+        .unwrap();
+
+        let landed = checkout_ref(&wt, "be-3").await.unwrap();
+        assert_eq!(landed.branch.as_deref(), Some("be-3"));
+        assert!(landed.detached_because_held_by.is_none());
+    }
+
+    /// When another worktree owns the branch, the tree we want is still
+    /// reachable — so detach at it rather than failing, and say why.
+    #[tokio::test]
+    async fn checkout_ref_detaches_when_another_worktree_holds_the_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        init_repo_with_commit(&origin);
+        let clone_path = tmp.path().join("clone");
+        clone_repo(&origin, &clone_path);
+        git_ok(&clone_path, &["branch", "be-3"]);
+
+        let holder = tmp.path().join("holder");
+        worktree_add(
+            &clone_path,
+            &holder,
+            "be-3",
+            WorktreeBranch::ExistingLocal,
+            &noop_tx(),
+            "repo",
+        )
+        .await
+        .unwrap();
+
+        let mine = tmp.path().join("mine");
+        worktree_add(
+            &clone_path,
+            &mine,
+            "feature",
+            WorktreeBranch::NewFromHead,
+            &noop_tx(),
+            "repo",
+        )
+        .await
+        .unwrap();
+
+        let landed = checkout_ref(&mine, "be-3").await.unwrap();
+        assert!(landed.branch.is_none(), "must be detached");
+        // git reports the canonical path; `tempdir()` hands back /var, which is
+        // a symlink to /private/var on macOS.
+        assert_eq!(
+            landed.detached_because_held_by.map(|p| p.canonicalize().unwrap()),
+            Some(holder.canonicalize().unwrap())
+        );
+        // The commit is what a build reads, and it has to match the branch.
+        assert_eq!(landed.commit, current_commit(&holder));
+    }
+
+    #[tokio::test]
+    async fn checkout_ref_reports_an_unknown_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        init_repo_with_commit(&origin);
+        let clone_path = tmp.path().join("clone");
+        clone_repo(&origin, &clone_path);
+        let wt = tmp.path().join("wt");
+        worktree_add(
+            &clone_path,
+            &wt,
+            "feature",
+            WorktreeBranch::NewFromHead,
+            &noop_tx(),
+            "repo",
+        )
+        .await
+        .unwrap();
+
+        let err = checkout_ref(&wt, "no-such-ref").await.unwrap_err();
+        assert!(
+            err.to_string().contains("no-such-ref"),
+            "error should name the ref: {err}"
+        );
+    }
+
+    #[test]
+    fn held_by_path_reads_gits_wording() {
+        assert_eq!(
+            held_by_path("fatal: 'be-3' is already used by worktree at '/wt/a/frontend'"),
+            Some(PathBuf::from("/wt/a/frontend"))
+        );
+        assert_eq!(held_by_path("fatal: something else entirely"), None);
     }
 
     fn current_commit(path: &Path) -> String {
