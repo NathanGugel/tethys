@@ -66,6 +66,13 @@ pub struct OrchestratorConfig {
     /// keeping the prefix as a stable filter for `docker compose ls`.
     pub compose_project_template: String,
 
+    /// Environment the worktree django needs to reach the shared infra.
+    /// Host networking puts it on the host's network namespace, so the main
+    /// stack's postgres and redis are at `localhost` rather than at the
+    /// compose service names the base file uses — which don't resolve, because
+    /// those services are deactivated here.
+    pub be_env: Vec<(String, String)>,
+
     /// django container name template — `{short}` substituted. The
     /// override file applies this to the django service so multiple
     /// worktree djangos don't fight over the bare name "django".
@@ -120,6 +127,15 @@ impl OrchestratorConfig {
             fe_repo_key: "frontend".into(),
             be_repo_key: "backend".into(),
             master_branch: "master".into(),
+            be_env: vec![
+                (
+                    "DATABASE_URL".into(),
+                    "postgres://postgres:postgres@localhost/newlantern".into(),
+                ),
+                ("CELERY_BROKER_URL".into(), "redis://localhost:6379/0".into()),
+                ("REDIS_URL".into(), "redis://localhost:6379/0".into()),
+                ("EMAIL_HOST".into(), "localhost".into()),
+            ],
             master_be_url: "http://localhost:8000".into(),
             fe_proxy_env_var: "NL_PROXY_TARGET".into(),
             fe_port_start: 3000,
