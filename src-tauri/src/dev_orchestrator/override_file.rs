@@ -6,11 +6,18 @@
 //! start in the worktree — the worktree's django reaches them via
 //! the main stack on `network_mode: host`.
 //!
-//! Deactivating them means django's inherited `depends_on` has to go too:
-//! Compose resolves `depends_on` against the *active* services, so a
-//! profile-excluded one reads as undefined and the whole project fails to
-//! parse. `depends_on` can't be emptied by overriding it — Compose merges the
-//! two rather than replacing — so it is cleared with the `!reset` tag.
+//! Three things follow from deactivating them, and the BE is broken without
+//! any one of them:
+//!
+//! - **`network_mode: host`** — the main stack publishes postgres and redis on
+//!   the host, so this is what makes them reachable at all.
+//! - **`environment`** — on the host network they live at `localhost`, not at
+//!   the compose service names the base file points to. Those names don't
+//!   resolve here, because the services behind them aren't running.
+//! - **`ports` and `depends_on` cleared** — a host-networked service can't
+//!   publish ports, and a `depends_on` naming a deactivated service makes the
+//!   whole project invalid. Neither can be emptied by overriding, because
+//!   Compose merges rather than replaces, so both take the `!reset` tag.
 
 use std::fs;
 use std::path::Path;
@@ -44,15 +51,28 @@ pub fn write(
 name: {project}
 services:
   django:
-    # Cleared, not narrowed: the services django depends on are deactivated
-    # below, and Compose rejects a `depends_on` naming a service that isn't
-    # active ("depends on undefined service"). Overriding with an empty value
-    # doesn't work — `depends_on` merges — so `!reset` is what drops it.
-    depends_on: !reset null
     container_name: {container}
     command: ./manage.py runserver_plus --nothreading 0.0.0.0:{be_port}
+    # Host networking is what makes the shared infra reachable: the main stack
+    # publishes postgres and redis on the host, so this container reaches them
+    # at localhost. It also puts {be_port} straight on the host, which is why
+    # the base file's port publishing is dropped rather than remapped — a
+    # host-networked service cannot publish ports.
+    network_mode: host
+    ports: !reset []
+    # The base service waits on postgres/redis health, but both are deactivated
+    # below. A depends_on naming a service that isn't enabled makes the whole
+    # project invalid, so the wait goes with them. `!reset` because Compose
+    # merges these rather than replacing them.
+    depends_on: !reset []
 "#
     ));
+    if !cfg.be_env.is_empty() {
+        out.push_str("    environment:\n");
+        for (k, v) in &cfg.be_env {
+            out.push_str(&format!("      {k}: {v}\n"));
+        }
+    }
     if !cfg.bind_mounts.is_empty() {
         out.push_str("    volumes:\n");
         for bm in &cfg.bind_mounts {
@@ -88,8 +108,35 @@ mod tests {
             .nth(1)
             .expect("an override always has a django block");
         assert!(
-            django.contains("depends_on: !reset null"),
+            django.contains("depends_on: !reset []"),
             "django must clear depends_on, got: {django}"
+        );
+    }
+
+    /// All four pieces are one mechanism. Host networking is what reaches the
+    /// shared infra; the env points at it; ports and depends_on have to go
+    /// because a host-networked service can't publish and a deactivated
+    /// dependency invalidates the project. Any one missing breaks the BE.
+    #[test]
+    fn the_django_block_carries_the_whole_host_network_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = OrchestratorConfig::newlantern();
+        write(&cfg, tmp.path(), "9700", 8003).unwrap();
+        let out = std::fs::read_to_string(override_path(tmp.path())).unwrap();
+        let django = out.split("  django:\n").nth(1).expect("django block");
+
+        for needed in [
+            "network_mode: host",
+            "ports: !reset []",
+            "depends_on: !reset []",
+            "DATABASE_URL",
+        ] {
+            assert!(django.contains(needed), "missing {needed} in: {django}");
+        }
+        // The env has to name localhost, not a compose service that isn't up.
+        assert!(
+            django.contains("@localhost/") && !django.contains("@postgres"),
+            "db host must be localhost, got: {django}"
         );
     }
 
@@ -107,7 +154,7 @@ mod tests {
                 "{svc} should be deactivated"
             );
         }
-        assert!(out.contains("depends_on: !reset null"));
+        assert!(out.contains("depends_on: !reset []"));
     }
 
     #[test]
