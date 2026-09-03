@@ -5,6 +5,12 @@
 //! (postgres/redis/etc.) get `profiles: ["inactive"]` so they don't
 //! start in the worktree — the worktree's django reaches them via
 //! the main stack on `network_mode: host`.
+//!
+//! Deactivating them means django's inherited `depends_on` has to go too:
+//! Compose resolves `depends_on` against the *active* services, so a
+//! profile-excluded one reads as undefined and the whole project fails to
+//! parse. `depends_on` can't be emptied by overriding it — Compose merges the
+//! two rather than replacing — so it is cleared with the `!reset` tag.
 
 use std::fs;
 use std::path::Path;
@@ -38,6 +44,11 @@ pub fn write(
 name: {project}
 services:
   django:
+    # Cleared, not narrowed: the services django depends on are deactivated
+    # below, and Compose rejects a `depends_on` naming a service that isn't
+    # active ("depends on undefined service"). Overriding with an empty value
+    # doesn't work — `depends_on` merges — so `!reset` is what drops it.
+    depends_on: !reset null
     container_name: {container}
     command: ./manage.py runserver_plus --nothreading 0.0.0.0:{be_port}
 "#
@@ -56,4 +67,88 @@ services:
         out.push_str(&format!("  {svc}:\n    profiles: [\"inactive\"]\n"));
     }
     fs::write(override_path(be_dir), out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dev_orchestrator::config::OrchestratorConfig;
+
+    /// Regression: without this, `docker compose up` exits immediately with
+    /// "service django depends on undefined service postgres" — so no container
+    /// and no session ever appear, while Tethys still reports a started BE
+    /// because it only ever spawned the command.
+    #[test]
+    fn the_django_block_clears_its_inherited_depends_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&OrchestratorConfig::newlantern(), tmp.path(), "9700", 8003).unwrap();
+        let out = std::fs::read_to_string(override_path(tmp.path())).unwrap();
+        let django = out
+            .split("  django:\n")
+            .nth(1)
+            .expect("an override always has a django block");
+        assert!(
+            django.contains("depends_on: !reset null"),
+            "django must clear depends_on, got: {django}"
+        );
+    }
+
+    /// The reset exists only to compensate for the deactivations — one without
+    /// the other is the broken state, in either direction.
+    #[test]
+    fn deactivated_services_and_the_reset_travel_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = OrchestratorConfig::newlantern();
+        write(&cfg, tmp.path(), "9700", 8003).unwrap();
+        let out = std::fs::read_to_string(override_path(tmp.path())).unwrap();
+        for svc in &cfg.inactive_services {
+            assert!(
+                out.contains(&format!("  {svc}:\n    profiles: [\"inactive\"]")),
+                "{svc} should be deactivated"
+            );
+        }
+        assert!(out.contains("depends_on: !reset null"));
+    }
+
+    #[test]
+    fn the_port_and_container_name_reach_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = OrchestratorConfig::newlantern();
+        write(&cfg, tmp.path(), "9700", 8003).unwrap();
+        let out = std::fs::read_to_string(override_path(tmp.path())).unwrap();
+        assert!(out.contains("0.0.0.0:8003"), "got: {out}");
+        assert!(out.contains(&cfg.be_container("9700")));
+        assert!(out.contains(&format!("name: {}", cfg.compose_project("9700"))));
+    }
+
+    /// Writes the override beside a copy of the real backend compose file and
+    /// asks docker to parse it. Ignored by default (needs docker and a
+    /// checkout), but it is the only check that proves the file actually works
+    /// — and it fails with the original "undefined service" error if the reset
+    /// is removed.
+    #[test]
+    #[ignore]
+    fn docker_accepts_the_generated_override() {
+        let base = std::path::PathBuf::from(
+            std::env::var("TETHYS_TEST_BE_DIR").expect("set TETHYS_TEST_BE_DIR"),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        for f in ["docker-compose.yml", ".env", ".env.shared"] {
+            let src = base.join(f);
+            if src.exists() {
+                std::fs::copy(&src, tmp.path().join(f)).unwrap();
+            }
+        }
+        write(&OrchestratorConfig::newlantern(), tmp.path(), "test", 8099).unwrap();
+        let out = std::process::Command::new("docker")
+            .args(["compose", "config", "--quiet"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("docker must run");
+        assert!(
+            out.status.success(),
+            "compose rejected the generated override: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
