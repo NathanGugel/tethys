@@ -26,7 +26,7 @@ use crate::store::Store;
 
 pub use tethys_mcp::{
     DescribeWorkspace, GivePrOwnWorkspace, LinkPr, PrView, RepoView, Request, Response,
-    WorkspaceView,
+    SetWorktreeRef, WorkspaceView,
 };
 
 /// Everything needed to render a session's `--mcp-config`, resolved once at
@@ -166,6 +166,7 @@ async fn serve_connection(mut stream: UnixStream, services: McpServices) -> AppR
         Request::LinkPr(req) => link_pr(&services, req).await,
         Request::DescribeWorkspace(req) => describe_workspace(&services, req).await,
         Request::GivePrOwnWorkspace(req) => give_pr_own_workspace(&services, req).await,
+        Request::SetWorktreeRef(req) => set_worktree_ref(&services, req).await,
     };
     tethys_mcp::write_frame(&mut stream, &response).await?;
     Ok(())
@@ -487,6 +488,95 @@ async fn provision_for_pr(
     })
 }
 
+/// Move one of the caller's worktrees to a ref.
+///
+/// The build reads whatever is on disk, so this plus `Build local` is how a
+/// stacked change gets built: put the backend worktree at the tip of the
+/// backend PRs you want included and leave the frontend where it is.
+async fn set_worktree_ref(services: &McpServices, req: SetWorktreeRef) -> Response {
+    debug!(
+        from_workspace = %req.from_workspace,
+        repo_key = %req.repo_key,
+        git_ref = %req.git_ref,
+        "worktree move requested"
+    );
+    match move_worktree(services, &req).await {
+        Ok(response) => response,
+        Err(e) => {
+            warn!(error = %e, "worktree move refused");
+            Response::Rejected {
+                message: e.to_string(),
+            }
+        }
+    }
+}
+
+async fn move_worktree(services: &McpServices, req: &SetWorktreeRef) -> AppResult<Response> {
+    let git_ref = req.git_ref.trim();
+    if git_ref.is_empty() {
+        return Err(AppError::Other("git_ref is required".into()));
+    }
+
+    let worktree = services
+        .store
+        .read(|s| {
+            s.find_workspace(&req.from_workspace).and_then(|w| {
+                w.repo_links
+                    .iter()
+                    .find(|l| l.repo_key == req.repo_key)
+                    .map(|l| l.worktree_path.clone())
+            })
+        })
+        .await
+        .ok_or_else(|| {
+            AppError::Other(format!(
+                "this workspace has no '{}' worktree",
+                req.repo_key
+            ))
+        })?;
+
+    if !worktree.exists() {
+        return Err(AppError::Other(format!(
+            "the '{}' worktree is missing at {}",
+            req.repo_key,
+            worktree.display()
+        )));
+    }
+
+    // A PR branch usually only exists on the remote from this worktree's point
+    // of view, so fetch before trying to check it out.
+    crate::git::fetch_ref_best_effort(&worktree, git_ref).await;
+    let landed = crate::git::checkout_ref(&worktree, git_ref).await?;
+
+    info!(
+        workspace = %req.from_workspace,
+        repo_key = %req.repo_key,
+        git_ref = %git_ref,
+        branch = ?landed.branch,
+        commit = %landed.commit,
+        "moved worktree"
+    );
+    let _ = services.app.emit(
+        "workspace:changed",
+        json!({ "workspace_id": req.from_workspace }),
+    );
+
+    Ok(Response::WorktreeMoved {
+        repo_key: req.repo_key.clone(),
+        worktree_path: worktree.display().to_string(),
+        branch: landed.branch,
+        commit: landed.commit,
+        detached_because_held_by: landed
+            .detached_because_held_by
+            .map(|p| {
+                p.parent()
+                    .and_then(|q| q.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.display().to_string())
+            }),
+    })
+}
+
 /// Which of the workspace's repos carries this slug, if any. Used to record a
 /// repo for a PR the agent didn't name one for.
 async fn infer_repo_key(
@@ -678,9 +768,7 @@ mod tests {
         assert!(args[0].starts_with("--mcp-config={"));
         assert_eq!(
             args[1],
-            "--allowed-tools=mcp__tethys__link_pr,mcp__tethys__describe_workspace,\
-mcp__tethys__give_pr_own_workspace"
-                .replace('\n', "")
+            format!("--allowed-tools={}", tethys_mcp::ALLOWED_TOOLS.join(","))
         );
     }
 }
