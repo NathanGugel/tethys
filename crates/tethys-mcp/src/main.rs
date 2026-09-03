@@ -533,17 +533,77 @@ fn render_workspace(view: &WorkspaceView) -> String {
     if view.attached_prs.is_empty() {
         out.push_str("\n  (none)");
     }
-    for pr in &view.attached_prs {
-        let where_ = pr.repo_key.as_deref().unwrap_or("repo not recorded");
-        out.push_str(&format!("\n  [{where_}] {}", render_pr(pr)));
+    let chains = order_into_stacks(&view.attached_prs);
+    for chain in &chains {
+        let stacked = chain.len() > 1;
+        for (position, &i) in chain.iter().enumerate() {
+            let pr = &view.attached_prs[i];
+            let where_ = pr.repo_key.as_deref().unwrap_or("repo not recorded");
+            if stacked {
+                // Position is the actionable part: "the first three" means
+                // checking out the head of number three, which contains them.
+                out.push_str(&format!(
+                    "\n  [{where_}] {}. {}",
+                    position + 1,
+                    render_pr(pr)
+                ));
+            } else {
+                out.push_str(&format!("\n  [{where_}] {}", render_pr(pr)));
+            }
+        }
+        if stacked {
+            out.push_str(
+                "\n    ^ a stack, bottom first. Checking out one of these includes \
+                 everything below it.",
+            );
+        }
     }
     out
 }
 
+/// Order PRs into stacks: a PR whose base is another PR's head sits on top of
+/// it. Returns each chain bottom-first, plus whatever didn't chain to anything.
+///
+/// This reads GitHub's base branch rather than a `gh stack` object, which
+/// means a hand-made chain and a formal stack look the same. For deciding what
+/// to build that is the right answer — the question is which PR contains which,
+/// and the base chain answers it either way.
+fn order_into_stacks(prs: &[PrView]) -> Vec<Vec<usize>> {
+    let mut chains: Vec<Vec<usize>> = Vec::new();
+    // A PR is a base for another when its head is that other's base.
+    let stacked_on = |i: usize| -> Option<usize> {
+        let base = prs[i].base_branch.as_deref()?;
+        prs.iter()
+            .position(|p| p.head_branch.as_deref() == Some(base) && p.number != prs[i].number)
+    };
+    // Bottoms are the PRs nothing beneath them explains.
+    let bottoms: Vec<usize> = (0..prs.len()).filter(|i| stacked_on(*i).is_none()).collect();
+
+    for bottom in bottoms {
+        let mut chain = vec![bottom];
+        // Walk upward: whoever is stacked directly on the current tip.
+        loop {
+            let tip = *chain.last().expect("chain is never empty");
+            let next = (0..prs.len()).find(|i| {
+                !chain.contains(i)
+                    && stacked_on(*i) == Some(tip)
+            });
+            match next {
+                Some(i) => chain.push(i),
+                None => break,
+            }
+        }
+        chains.push(chain);
+    }
+    chains
+}
+
 fn render_pr(pr: &PrView) -> String {
     let mut bits = vec![format!("{}/{}#{}", pr.owner, pr.name, pr.number)];
-    if let Some(branch) = &pr.head_branch {
-        bits.push(format!("from `{branch}`"));
+    match (&pr.head_branch, &pr.base_branch) {
+        (Some(head), Some(base)) => bits.push(format!("`{head}` onto `{base}`")),
+        (Some(head), None) => bits.push(format!("from `{head}`")),
+        _ => {}
     }
     if let Some(state) = &pr.state {
         let draft = if pr.is_draft.unwrap_or(false) {
@@ -709,5 +769,100 @@ mod tests {
             panic!("must parse as give_pr_own_workspace")
         };
         assert!(!req.take_branch);
+    }
+
+    fn pr(number: u32, head: &str, base: Option<&str>) -> PrView {
+        PrView {
+            owner: "acme".into(),
+            name: "be".into(),
+            number,
+            url: format!("https://github.com/acme/be/pull/{number}"),
+            repo_key: Some("backend".into()),
+            head_branch: Some(head.into()),
+            base_branch: base.map(str::to_string),
+            state: None,
+            is_draft: None,
+            checks: None,
+            review_decision: None,
+            unresolved_threads: None,
+            has_merge_conflicts: None,
+        }
+    }
+
+    /// The case this exists for: six PRs where the third contains the first
+    /// three, and knowing that is what makes "build against the first three"
+    /// answerable.
+    #[test]
+    fn a_stack_is_ordered_bottom_first() {
+        let prs = vec![
+            pr(103, "be-3", Some("be-2")),
+            pr(101, "be-1", Some("master")),
+            pr(102, "be-2", Some("be-1")),
+        ];
+        let chains = order_into_stacks(&prs);
+        assert_eq!(chains.len(), 1, "one chain, got {chains:?}");
+        let numbers: Vec<u32> = chains[0].iter().map(|&i| prs[i].number).collect();
+        assert_eq!(numbers, vec![101, 102, 103]);
+    }
+
+    /// Two independent PRs are two chains, not one arbitrary ordering.
+    #[test]
+    fn unrelated_prs_do_not_chain() {
+        let prs = vec![
+            pr(1, "feat-a", Some("master")),
+            pr(2, "feat-b", Some("master")),
+        ];
+        let chains = order_into_stacks(&prs);
+        assert_eq!(chains.len(), 2);
+        assert!(chains.iter().all(|c| c.len() == 1));
+    }
+
+    /// Separate stacks stay separate — a backend stack and a frontend stack
+    /// must not be spliced into one because both start from master.
+    #[test]
+    fn two_stacks_stay_apart() {
+        let prs = vec![
+            pr(1, "be-1", Some("master")),
+            pr(2, "be-2", Some("be-1")),
+            pr(10, "fe-1", Some("master")),
+            pr(11, "fe-2", Some("fe-1")),
+        ];
+        let mut chains = order_into_stacks(&prs);
+        chains.sort_by_key(|c| prs[c[0]].number);
+        assert_eq!(chains.len(), 2);
+        assert_eq!(
+            chains[0].iter().map(|&i| prs[i].number).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            chains[1].iter().map(|&i| prs[i].number).collect::<Vec<_>>(),
+            vec![10, 11]
+        );
+    }
+
+    /// A PR polled before base_branch existed can't be placed, and must still
+    /// appear rather than being dropped from the listing.
+    #[test]
+    fn a_pr_without_a_base_still_appears() {
+        let mut orphan = pr(7, "mystery", None);
+        orphan.base_branch = None;
+        let prs = vec![orphan];
+        let chains = order_into_stacks(&prs);
+        assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0], vec![0]);
+    }
+
+    /// Every PR has to land in exactly one chain, or the listing silently
+    /// loses one.
+    #[test]
+    fn every_pr_appears_exactly_once() {
+        let prs = vec![
+            pr(1, "be-1", Some("master")),
+            pr(2, "be-2", Some("be-1")),
+            pr(3, "solo", Some("master")),
+        ];
+        let mut seen: Vec<usize> = order_into_stacks(&prs).into_iter().flatten().collect();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![0, 1, 2]);
     }
 }

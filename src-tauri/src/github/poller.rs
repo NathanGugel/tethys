@@ -381,6 +381,7 @@ fn build_query(targets: &[Target]) -> (String, BTreeMap<String, String>) {
           url
           state
           headRefName
+          baseRefName
           isDraft
           mergeable
           reviewDecision
@@ -530,6 +531,11 @@ fn parse_pr_fields(pr: &Value) -> Option<GithubPrStatus> {
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .filter(|s| !s.is_empty());
+    let base_branch = pr
+        .get("baseRefName")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty());
 
     // GitHub's `mergeable` is `MERGEABLE | CONFLICTING | UNKNOWN`. UNKNOWN
     // shows up briefly after a push while GitHub computes the merge — only
@@ -652,6 +658,7 @@ fn parse_pr_fields(pr: &Value) -> Option<GithubPrStatus> {
         unresolved_threads,
         head_sha,
         head_branch,
+        base_branch,
         fetched_at: Utc::now(),
         last_error: None,
     })
@@ -934,6 +941,7 @@ mod tests {
             unresolved_threads: 0,
             head_sha: "sha".into(),
             head_branch: None,
+            base_branch: None,
             fetched_at: Utc::now(),
             last_error: None,
         };
@@ -1230,6 +1238,7 @@ mod tests {
             unresolved_threads: 0,
             head_sha: "sha".into(),
             head_branch: None,
+            base_branch: None,
             fetched_at: Utc::now(),
             last_error: None,
         };

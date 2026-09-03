@@ -38,6 +38,9 @@ export interface GithubPrStatus {
   /** Branch the PR is opened from. Null for statuses polled before the field
    *  existed; they refresh on the next poll tick. */
   head_branch: string | null;
+  /** Branch the PR merges into. With head_branch, this is what chains a
+   *  stack: a PR based on another PR's head sits on top of it. */
+  base_branch: string | null;
   fetched_at: string;
   last_error: string | null;
 }

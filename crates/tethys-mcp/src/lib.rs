@@ -166,6 +166,10 @@ pub struct PrView {
     /// Branch the PR is opened from — what you'd check out to work on it.
     #[serde(default)]
     pub head_branch: Option<String>,
+    /// Branch it merges into. A PR based on another PR's head is stacked on
+    /// top of it, which is how build order is worked out.
+    #[serde(default)]
+    pub base_branch: Option<String>,
     /// `open` / `merged` / `closed`. `None` before the first poll lands.
     #[serde(default)]
     pub state: Option<String>,

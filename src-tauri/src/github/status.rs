@@ -59,6 +59,11 @@ pub struct GithubPrStatus {
     /// before this field existed — they refresh on the next tick.
     #[serde(default)]
     pub head_branch: Option<String>,
+    /// Branch the PR merges into. With `head_branch` this is what chains a
+    /// stack together: a PR based on another PR's head sits on top of it.
+    /// `None` for statuses polled before this field existed.
+    #[serde(default)]
+    pub base_branch: Option<String>,
     pub fetched_at: DateTime<Utc>,
     #[serde(default)]
     pub last_error: Option<String>,
