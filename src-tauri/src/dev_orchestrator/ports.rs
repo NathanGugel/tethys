@@ -20,9 +20,3 @@ pub fn find_free_port_from(start: u16) -> Option<u16> {
     (start..start.saturating_add(200))
         .find(|&port| TcpListener::bind(("0.0.0.0", port)).is_ok())
 }
-
-/// `true` if anything is listening on `port` (any interface). Returns
-/// `false` on the binding-error path (port is bound = our test bind fails).
-pub fn is_port_bound(port: u16) -> bool {
-    TcpListener::bind(("0.0.0.0", port)).is_err()
-}

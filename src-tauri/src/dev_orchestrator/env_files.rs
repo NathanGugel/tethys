@@ -60,7 +60,7 @@ fn register_gitignore(be_dir: &Path, cfg: &OrchestratorConfig) -> std::io::Resul
     // Read existing entries so we don't add duplicates.
     let existing = fs::read_to_string(&exclude).unwrap_or_default();
     let mut existing_lines: std::collections::HashSet<&str> = existing.lines().collect();
-    let want = std::iter::once("docker-compose.override.yml")
+    let want = std::iter::once(super::override_file::FILE_NAME)
         .chain(cfg.env_symlinks.iter().map(String::as_str))
         .collect::<Vec<_>>();
     let mut added: Vec<&str> = Vec::new();

@@ -1,5 +1,5 @@
-//! Sweep stale `docker-compose.override.yml` from worktrees that no
-//! longer exist on disk. Cheap (a few `stat`/`git rev-parse` calls);
+//! Sweep the generated compose file from worktrees that no longer exist
+//! on disk. Cheap (a few `stat`/`git rev-parse` calls);
 //! runs before we add a new one so the worktree-root dir doesn't
 //! accumulate cruft as branches come and go.
 
@@ -10,6 +10,7 @@ use std::process::Command;
 use tracing::info;
 
 use super::config::OrchestratorConfig;
+use super::override_file;
 
 /// Returns the paths that were removed.
 pub fn scrub_orphan_overrides(cfg: &OrchestratorConfig) -> Vec<PathBuf> {
@@ -23,11 +24,11 @@ pub fn scrub_orphan_overrides(cfg: &OrchestratorConfig) -> Vec<PathBuf> {
             continue;
         }
         let be_dir = path.join(&cfg.be_repo_key);
-        let override_file = be_dir.join("docker-compose.override.yml");
-        if !override_file.exists() {
+        let override_file = override_file::override_path(&be_dir);
+        if !override_file.exists() || !is_orphan(&be_dir) {
             continue;
         }
-        if is_orphan(&be_dir) && fs::remove_file(&override_file).is_ok() {
+        if fs::remove_file(&override_file).is_ok() {
             info!(path = %override_file.display(), "scrubbed orphan override");
             removed.push(override_file);
         }

@@ -69,6 +69,9 @@ pub fn stop_worktree(cfg: &OrchestratorConfig, short: &str, fe_dir: &Path, be_di
             report.override_removed = true;
         }
     }
+    if override_file::remove_legacy(be_dir) {
+        report.override_removed = true;
+    }
     report
 }
 
