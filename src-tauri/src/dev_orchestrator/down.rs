@@ -19,12 +19,7 @@ pub struct TeardownReport {
     pub warnings: Vec<String>,
 }
 
-pub fn stop_worktree(
-    cfg: &OrchestratorConfig,
-    short: &str,
-    fe_dir: &Path,
-    be_dir: &Path,
-) -> TeardownReport {
+pub fn stop_worktree(cfg: &OrchestratorConfig, short: &str, fe_dir: &Path, be_dir: &Path) -> TeardownReport {
     let mut report = TeardownReport::default();
     let project = cfg.compose_project(short);
 

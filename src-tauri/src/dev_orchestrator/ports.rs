@@ -17,5 +17,6 @@ use std::net::TcpListener;
 /// First free port >= `start`. Returns `None` if no port in
 /// [start, start+200) is free (effectively never, in our usage).
 pub fn find_free_port_from(start: u16) -> Option<u16> {
-    (start..start.saturating_add(200)).find(|&port| TcpListener::bind(("0.0.0.0", port)).is_ok())
+    (start..start.saturating_add(200))
+        .find(|&port| TcpListener::bind(("0.0.0.0", port)).is_ok())
 }
