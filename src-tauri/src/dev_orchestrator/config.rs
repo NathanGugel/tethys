@@ -13,14 +13,19 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct OrchestratorConfig {
     /// Where the always-on infra stack lives (postgres, redis, mailhog,
-    /// master-branch django on the canonical ports). The orchestrator
-    /// runs `docker compose up -d` here when the health-check ports
-    /// aren't bound.
+    /// master-branch django). The orchestrator runs `docker compose up -d`
+    /// here when the services in `main_stack_health_services` aren't healthy.
     pub main_stack_dir: PathBuf,
 
-    /// Ports that must be listening for the main stack to be considered
-    /// healthy. Newlantern: postgres :5432, redis :6379.
-    pub main_stack_health_ports: Vec<u16>,
+    /// Compose services in the main stack a worktree django can't run
+    /// without. Each must be running, and healthy where it has a healthcheck.
+    pub main_stack_health_services: Vec<String>,
+
+    /// The main stack's compose network. Worktree djangos join it to reach
+    /// those services by name, since the main stack publishes none of them
+    /// on the host. Compose names it `<project>_default`, and the project is
+    /// named after `main_stack_dir`.
+    pub main_stack_network: String,
 
     /// Containers whose names are hardcoded in the base compose file and
     /// thus orphan-leak when prior `docker compose up` runs didn't tear
@@ -56,22 +61,20 @@ pub struct OrchestratorConfig {
     /// spawn time. Runs under a login zsh so direnv/yarn/docker resolve.
     pub fe_command_template: String,
 
-    /// Shell command for the BE dev server. No substitution needed —
-    /// `docker compose up` reads the per-worktree override that has
-    /// the port baked in.
+    /// Shell command for the BE dev server. No substitution needed — the
+    /// generated compose file it names has the port baked in. `--build`
+    /// because each worktree tags its own image, which would otherwise go on
+    /// running whatever dependencies it was first built with.
     pub be_command_template: String,
+
+    /// What the worktree's django container runs, under `sh -c`. `{port}` is
+    /// substituted.
+    pub be_startup_script: String,
 
     /// Compose project name template — `{short}` substituted. The
     /// dotted naming yields per-worktree project isolation while
     /// keeping the prefix as a stable filter for `docker compose ls`.
     pub compose_project_template: String,
-
-    /// Environment the worktree django needs to reach the shared infra.
-    /// Host networking puts it on the host's network namespace, so the main
-    /// stack's postgres and redis are at `localhost` rather than at the
-    /// compose service names the base file uses — which don't resolve, because
-    /// those services are deactivated here.
-    pub be_env: Vec<(String, String)>,
 
     /// django container name template — `{short}` substituted. The
     /// override file applies this to the django service so multiple
@@ -96,9 +99,9 @@ pub struct OrchestratorConfig {
     /// in the worktree wouldn't resolve from inside the container.
     pub bind_mounts: Vec<BindMount>,
 
-    /// Root dir for the orphan-override scrub. The orchestrator
-    /// removes `docker-compose.override.yml` from any subdir of this
-    /// path whose worktree no longer exists on disk.
+    /// Root dir for the orphan-override scrub. The orchestrator removes
+    /// the generated compose file from any subdir of this path whose
+    /// worktree no longer exists on disk.
     pub worktree_root: PathBuf,
 }
 
@@ -118,7 +121,8 @@ impl OrchestratorConfig {
         let main_stack_dir: PathBuf = format!("{home}/newlantern/nl-backend").into();
         Self {
             main_stack_dir: main_stack_dir.clone(),
-            main_stack_health_ports: vec![5432, 6379],
+            main_stack_health_services: vec!["postgres".into(), "redis".into()],
+            main_stack_network: "nl-backend_default".into(),
             main_stack_orphan_container_names: vec![
                 "django".into(),
                 "celery-worker".into(),
@@ -127,22 +131,23 @@ impl OrchestratorConfig {
             fe_repo_key: "frontend".into(),
             be_repo_key: "backend".into(),
             master_branch: "master".into(),
-            be_env: vec![
-                (
-                    "DATABASE_URL".into(),
-                    "postgres://postgres:postgres@localhost/newlantern".into(),
-                ),
-                ("CELERY_BROKER_URL".into(), "redis://localhost:6379/0".into()),
-                ("REDIS_URL".into(), "redis://localhost:6379/0".into()),
-                ("EMAIL_HOST".into(), "localhost".into()),
-            ],
             master_be_url: "http://localhost:8000".into(),
             fe_proxy_env_var: "NL_PROXY_TARGET".into(),
             fe_port_start: 3000,
             // 8000 is reserved for the main stack's django.
             be_port_start: 8001,
             fe_command_template: "yarn install && PORT={port} yarn dev".into(),
-            be_command_template: "docker compose up".into(),
+            be_command_template: format!(
+                "docker compose -f docker-compose.yml -f {} up --build",
+                super::override_file::FILE_NAME
+            ),
+            // The shared database is only as migrated as the last checkout that
+            // migrated it. A failed migrate still starts the server, so the
+            // error stays on screen beside a BE that otherwise works.
+            be_startup_script: "./manage.py migrate --noinput \
+                || echo 'tethys: migrate failed; starting the server anyway' >&2; \
+                exec ./manage.py runserver_plus 0.0.0.0:{port}"
+                .into(),
             compose_project_template: "nl-backend-{short}".into(),
             be_container_template: "django-{short}".into(),
             inactive_services: vec![
@@ -174,6 +179,7 @@ impl OrchestratorConfig {
 
     /// Substitute `{port}` into the FE command.
     pub fn fe_command(&self, port: u16) -> String {
-        self.fe_command_template.replace("{port}", &port.to_string())
+        self.fe_command_template
+            .replace("{port}", &port.to_string())
     }
 }

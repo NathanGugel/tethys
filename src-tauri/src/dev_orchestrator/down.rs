@@ -19,7 +19,12 @@ pub struct TeardownReport {
     pub warnings: Vec<String>,
 }
 
-pub fn stop_worktree(cfg: &OrchestratorConfig, short: &str, fe_dir: &Path, be_dir: &Path) -> TeardownReport {
+pub fn stop_worktree(
+    cfg: &OrchestratorConfig,
+    short: &str,
+    fe_dir: &Path,
+    be_dir: &Path,
+) -> TeardownReport {
     let mut report = TeardownReport::default();
     let project = cfg.compose_project(short);
 
@@ -68,6 +73,9 @@ pub fn stop_worktree(cfg: &OrchestratorConfig, short: &str, fe_dir: &Path, be_di
         } else {
             report.override_removed = true;
         }
+    }
+    if override_file::remove_legacy(be_dir) {
+        report.override_removed = true;
     }
     report
 }
